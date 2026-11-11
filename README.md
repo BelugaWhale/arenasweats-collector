@@ -39,10 +39,4 @@ Unless you've been given an upload key, it does a **15-minute test run**. It col
 back. That file holds the Arena matches it collected and a log of what it did. Nothing is
 uploaded.
 
-## For developers
-
-Everything is in [`collector.py`](collector.py), which uses only Python's standard library.
-The server that receives the data is in [`server/`](server/README.md), and the tests run
-both against a fake League client: `python -m unittest discover tests`.
-
 MIT licence; see [`LICENSE`](LICENSE).
