@@ -1,0 +1,10 @@
+# collected data, keys and local settings never go in the repository
+data/
+server/data/
+config.json
+# build output
+dist/
+build/
+*.spec
+__pycache__/
+.pytest_cache/

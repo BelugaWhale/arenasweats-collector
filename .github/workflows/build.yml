@@ -1,0 +1,66 @@
+# Runs the tests on every push. For a tag like v0.2.0 it also builds ArenaSweatsCollector.exe
+# from that exact code on GitHub's own Windows machine and publishes it as a release, so the
+# download is built from the source you can read here and from nothing else.
+name: test and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install flask
+      - run: python -m unittest discover tests
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check the tag matches VERSION in collector.py
+        shell: bash
+        run: |
+          version=$(python -c "import re; print(re.search(r'^VERSION = \"(.+)\"', open('collector.py').read(), re.M).group(1))")
+          test "v$version" = "$GITHUB_REF_NAME"
+      - run: python -m pip install pyinstaller==6.19.0
+      - run: python -m PyInstaller --onefile --console --name ArenaSweatsCollector collector.py
+      - name: Check the program starts
+        run: dist\ArenaSweatsCollector.exe --help
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sum=$(sha256sum dist/ArenaSweatsCollector.exe | cut -d' ' -f1)
+          cat > notes.md <<EOF
+          Open the League client and log in, then double-click \`ArenaSweatsCollector.exe\` below.
+          Read the [README](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/README.md) first.
+
+          Built by GitHub from the code at this tag: [the build]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID).
+
+          SHA-256 of \`ArenaSweatsCollector.exe\`: \`$sum\`
+
+          If someone sent you the file instead, check it is the same one: in a command prompt in
+          its folder, run \`certutil -hashfile ArenaSweatsCollector.exe SHA256\` and compare.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/ArenaSweatsCollector.exe --title "$GITHUB_REF_NAME" --notes-file notes.md
