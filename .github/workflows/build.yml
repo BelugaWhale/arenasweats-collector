@@ -54,7 +54,7 @@ jobs:
           sum=$(sha256sum dist/ArenaSweatsCollector.exe | cut -d' ' -f1)
           cat > notes.md <<EOF
           Open the League client and log in, then double-click \`ArenaSweatsCollector.exe\` below.
-          Read the [README](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/README.md) first.
+          Read the [README](https://github.com/$GITHUB_REPOSITORY#readme) first.
 
           Built by GitHub from the code at this tag: [the build]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID).
 
