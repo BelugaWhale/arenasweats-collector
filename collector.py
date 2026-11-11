@@ -48,7 +48,7 @@ import zipfile
 import zlib
 from collections import Counter
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # ---------------------------------------------------------------------------
 # Limits. These keep the collector gentle. The upload server can slow it down
