@@ -3,7 +3,7 @@
 `ingest.py` tells collectors what to read and receives the matches they send. It is a
 separate process with its own SQLite file, so load here cannot slow the website.
 
-**Not deployed anywhere yet.**
+Live at `https://arenasweats.lol/collector/` on the website server.
 
 ## How it works
 
@@ -86,28 +86,34 @@ python server/ingest.py serve                 # development only
 
 The database is `server/data/ingest.db`, or the path in `INGEST_DB`.
 
-## Deploying (when approved)
+## Deployment
 
-Run under gunicorn on its own port, behind nginx with its own limits:
+On the website server, as the normal user:
 
 ```
-INGEST_DB=/var/lib/arenasweats-collector/ingest.db gunicorn -w 2 -b 127.0.0.1:8870 --chdir server ingest:app
+git clone https://github.com/BelugaWhale/arenasweats-collector.git ~/arenasweats-collector
+python3 -m venv --without-pip ~/arenasweats-collector-venv
+~/ArenaSweats-webapp/venv/bin/pip --python ~/arenasweats-collector-venv/bin/python install -r ~/arenasweats-collector/server/requirements.txt
+mkdir -m 700 ~/arenasweats-collector-data
 ```
 
-```nginx
-limit_req_zone $binary_remote_addr zone=collector:10m rate=120r/m;
+Then once as root: `sudo bash ~/arenasweats-collector/server/deploy/install.sh`. It installs the
+`arenasweats-collector` service (gunicorn on 127.0.0.1:8870, capped at 600 MB and one CPU core),
+adds an nginx rate limit and a `/collector/` location, and adds one `include` line to the site
+config, which it backs up first and restores if `nginx -t` fails.
 
-location /collector/ {
-    limit_req zone=collector burst=30 nodelay;
-    client_max_body_size 2m;
-    proxy_pass http://127.0.0.1:8870/;
-}
+Admin commands on the server need the database path:
+
+```
+export INGEST_DB=~/arenasweats-collector-data/ingest.db
+~/arenasweats-collector-venv/bin/python ~/arenasweats-collector/server/ingest.py stats
 ```
 
-Collectors then use `"server": "https://arenasweats.lol/collector"`.
+Updating: `git pull --ff-only` in `~/arenasweats-collector`, then `sudo systemctl restart arenasweats-collector`.
 
-The per-key request limit is counted per gunicorn worker, so the nginx limit is the real
-ceiling.
+Collectors use `{"server": "https://arenasweats.lol/collector", "key": "as_…"}` in `config.json`.
+
+The per-key request limit is counted per gunicorn worker, so the nginx limit is the real ceiling.
 
 ## Size
 
