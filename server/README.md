@@ -92,8 +92,8 @@ On the website server, as the normal user:
 
 ```
 git clone https://github.com/BelugaWhale/arenasweats-collector.git ~/arenasweats-collector
-python3 -m venv --without-pip ~/arenasweats-collector-venv
-~/ArenaSweats-webapp/venv/bin/pip --python ~/arenasweats-collector-venv/bin/python install -r ~/arenasweats-collector/server/requirements.txt
+python3.10 -m venv ~/arenasweats-collector-venv        # the server's python3.12 has no venv support installed
+~/arenasweats-collector-venv/bin/pip install -r ~/arenasweats-collector/server/requirements.txt
 mkdir -m 700 ~/arenasweats-collector-data
 ```
 
