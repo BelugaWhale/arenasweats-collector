@@ -314,7 +314,7 @@ class TestRun(CollectorCase):
         original, collector.Collector.own_round = collector.Collector.own_round, explode
         self.addCleanup(setattr, collector.Collector, "own_round", original)
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            code = collector.main(["--minutes", "1", "--league-dir", self.league_dir, "--data-dir", self.data_dir])
+            code = collector.main(["--test-run", "--minutes", "1", "--league-dir", self.league_dir, "--data-dir", self.data_dir])
         self.assertEqual(code, 1)
         self.assertIn("Unexpected error", output.getvalue())
         reports = [name for name in os.listdir(self.data_dir) if name.endswith(".zip")]
@@ -324,7 +324,7 @@ class TestRun(CollectorCase):
     def test_program_entry_point(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            code = collector.main(["--minutes", "0.05", "--league-dir", self.league_dir, "--data-dir", self.data_dir])
+            code = collector.main(["--test-run", "--minutes", "0.05", "--league-dir", self.league_dir, "--data-dir", self.data_dir])
         self.assertEqual(code, 0)
         self.assertIn("test run", output.getvalue())
         with open(os.path.join(self.data_dir, "collector.log"), encoding="utf-8") as handle:

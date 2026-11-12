@@ -34,10 +34,9 @@ client like this are common. Decide for yourself whether you're comfortable runn
 
 ## What happens when you run it
 
-Unless you've been given an upload key, it does a **15-minute test run**. It collects for
-15 minutes, then saves one file in the `data` folder next to the program for you to send
-back. That file holds the Arena matches it collected and a log of what it did. Nothing is
-uploaded.
+It sends the Arena matches it reads to ArenaSweats and keeps going until you close the
+window. The first time, it gets its own upload key from ArenaSweats and saves it in
+`config.json` next to the program.
 
 If it can't find League by itself, it asks you which folder League is installed in.
 

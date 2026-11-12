@@ -7,8 +7,11 @@ Live at `https://arenasweats.lol/collector/` on the website server.
 
 ## How it works
 
-- **Collectors are trusted.** Each has a key. The first copy of a match is kept and the
-  match is never asked for again. There is no second opinion.
+- **Collectors are trusted.** Each install has its own key, which it gets from
+  `POST /v1/register` the first time it runs (at most 3 a day per internet address and 500 a
+  day in all; `policy --signups off` closes sign-ups). Keys can also be made by hand with
+  `add-key`. The first copy of a match is kept and the match is never asked for again. There
+  is no second opinion.
 - **No match is fetched twice.** A collector reports which Arena matches it saw in a
   player's match list. Those not held go on a "wanted" list and are handed out, each to one
   collector at a time for 15 minutes. If that collector disappears, the match goes to
@@ -64,6 +67,7 @@ Trust covers what a match says, not its size or shape:
 
 | | |
 | --- | --- |
+| `POST /v1/register` | No key needed. A new install gets its own key (201 `{"key", "name"}`). |
 | `GET /v1/policy` | Whether to collect, the pace, a short message, the season's start. |
 | `POST /v1/work` | Takes match-list reports; answers with matches to fetch and lists to read. |
 | `POST /v1/games` | `{"games": [...]}`, gzip allowed. Answers with accepted / duplicates / skipped / rejected. |
@@ -78,6 +82,7 @@ python server/ingest.py disable-key NAME
 python server/ingest.py purge NAME
 python server/ingest.py policy --season-start 2026-10-06
 python server/ingest.py policy --off          # every collector pauses within 10 minutes
+python server/ingest.py policy --signups off  # new installs can no longer get a key
 python server/ingest.py policy --on --delay 3 --message "thanks!"
 python server/ingest.py stats                 # per server: matches held, still to fetch, players to read
 python server/ingest.py export out.jsonl.gz --platform HN1
@@ -111,7 +116,7 @@ export INGEST_DB=~/arenasweats-collector-data/ingest.db
 
 Updating: `git pull --ff-only` in `~/arenasweats-collector`, then `sudo systemctl restart arenasweats-collector`.
 
-Collectors use `{"server": "https://arenasweats.lol/collector", "key": "as_…"}` in `config.json`.
+Collectors send to `https://arenasweats.lol/collector` unless their `config.json` says otherwise.
 
 The per-key request limit is counted per gunicorn worker, so the nginx limit is the real ceiling.
 

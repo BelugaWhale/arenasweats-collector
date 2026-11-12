@@ -43,6 +43,8 @@ MAX_REPORTS = 20                 # match lists reported per work request
 MAX_REPORT_IDS = 3000            # matches named in one match-list report
 REQUESTS_PER_MINUTE = 60         # per key
 GAMES_PER_DAY = 60000            # per key; an honest collector cannot read more than ~45k a day
+SIGNUPS_PER_ADDRESS = 3          # new installs one internet address can sign up a day
+SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close with: policy --signups off)
 ARENA_MODES = {"CHERRY"}
 DEFAULT_SEASON_START = "2026-10-06"   # UTC. Change with: ingest.py policy --season-start YYYY-MM-DD
 
@@ -66,6 +68,8 @@ PLATFORM_RE = re.compile(r"[A-Z0-9_]{2,12}")
 PUUID_RE = re.compile(r"[0-9A-Za-z_-]{20,100}")
 
 SCHEMA = """
+-- Sign-ups of the last day, for the daily limits. The address is stored only as a hash.
+CREATE TABLE IF NOT EXISTS signups(at INTEGER NOT NULL, address TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS contributors(
     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, key_hash TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0);
@@ -251,6 +255,9 @@ def check_key():
     """Every request except the health check needs a valid key. Runs before any body is read."""
     if request.path == "/healthz":
         return None
+    if request.path == "/v1/register":       # a new install asking for its own key
+        g.db = connect()
+        return None
     header = request.headers.get("Authorization", "")
     key = header[7:] if header.startswith("Bearer ") else ""
     g.db = connect()
@@ -303,6 +310,37 @@ def read_body():
 @app.get("/healthz")
 def healthz():
     return "ok\n"
+
+
+def client_address():
+    """The sender's internet address. nginx on this machine passes it on in X-Real-IP."""
+    if request.remote_addr in ("127.0.0.1", "::1"):
+        return request.headers.get("X-Real-IP", "")[:64] or request.remote_addr
+    return request.remote_addr or ""
+
+
+def signups_open(db):
+    return dict(db.execute("SELECT name, value FROM settings")).get("signups", "1") == "1"
+
+
+@app.post("/v1/register")
+def register():
+    """A new install asks for its own upload key. No key is needed for this; it is limited per
+    internet address and per day, and can be closed with: policy --signups off."""
+    db, now = g.db, int(clock())
+    if not signups_open(db):
+        return fail(403, "ArenaSweats is not taking new collectors right now")
+    address = hashlib.sha256(("signup:" + client_address()).encode()).hexdigest()[:32]
+    with db:
+        db.execute("DELETE FROM signups WHERE at < ?", (now - 86400,))
+        mine = db.execute("SELECT COUNT(*) FROM signups WHERE address = ?", (address,)).fetchone()[0]
+        total = db.execute("SELECT COUNT(*) FROM signups").fetchone()[0]
+        if mine >= SIGNUPS_PER_ADDRESS or total >= SIGNUPS_PER_DAY:
+            return fail(429, "too many new collectors today", **{"Retry-After": "3600"})
+        key, name = "as_" + secrets.token_urlsafe(24), "auto-" + secrets.token_hex(4)
+        db.execute("INSERT INTO contributors(name, key_hash, created_at) VALUES(?, ?, ?)", (name, hash_key(key), now))
+        db.execute("INSERT INTO signups VALUES(?, ?)", (now, address))
+    return jsonify({"key": key, "name": name}), 201
 
 
 @app.get("/v1/policy")
@@ -604,8 +642,9 @@ def cmd_policy(db, args):
     season = date_ms(args.season_start) if args.season_start else None
     with db:
         before = get_policy(db)["season_start"]
+        signups = {"on": 1, "off": 0}.get(args.signups)
         for name, value in (("enabled", args.enabled), ("delay", args.delay), ("message", args.message),
-                            ("season_start", season)):
+                            ("season_start", season), ("signups", signups)):
             if value is not None:
                 db.execute("INSERT OR REPLACE INTO settings VALUES(?, ?)", (name, str(value)))
         if season is not None and season < before:
@@ -614,7 +653,7 @@ def cmd_policy(db, args):
             changed = db.execute("UPDATE players SET resume = 0, resume_floor = ? WHERE checked_at > 0",
                                  (season,)).rowcount
             print("The season now starts earlier: %d match lists will be read again back to the new date." % changed)
-    print("Policy: %s" % get_policy(db))
+    print("Policy: %s, new installs %s" % (get_policy(db), "can sign up" if signups_open(db) else "cannot sign up"))
 
 
 def cmd_export(db, args):
@@ -647,6 +686,8 @@ def main(argv=None):
     policy_parser.add_argument("--off", dest="enabled", action="store_const", const=0, help="all collectors pause")
     policy_parser.add_argument("--delay", type=float, help="slowest pace to ask for, in seconds per request")
     policy_parser.add_argument("--message", help="short message shown to every collector ('' to clear)")
+    policy_parser.add_argument("--signups", choices=("on", "off"),
+                               help="whether new installs can get their own key automatically")
     policy_parser.add_argument("--season-start", metavar="YYYY-MM-DD",
                                help="nothing from before this UTC date is asked for or kept")
     export_parser = commands.add_parser("export", help="write the held matches to a .jsonl.gz file")

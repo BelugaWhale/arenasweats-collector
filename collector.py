@@ -7,11 +7,12 @@ WHAT IT DOES
      the client was started with (what Task Manager shows for it).
   2. While you are not playing, slowly asks that client for this season's Arena
      match history: match lists of players, and the full record of Arena matches.
-  3. With an upload address and key set, ArenaSweats tells it which players and
-     matches to read next (so no two collectors read the same thing) and it
-     sends the matches there. Without one, it starts from your own matches,
-     moves on to the players you met, and saves everything in the "data" folder
-     beside this program.
+  3. Sends the matches to ArenaSweats (DEFAULT_SERVER below), which tells it which
+     players and matches to read next, so no two collectors read the same thing.
+     The first time, it asks ArenaSweats for this install's own upload key and
+     keeps it in config.json beside the program. With --test-run it uploads
+     nothing: it starts from your own matches, moves on to the players you met,
+     and after 15 minutes saves everything in one file in the "data" folder.
 
 WHAT IT NEVER DOES
   - It never changes anything. Every request to the League client is a GET to
@@ -53,7 +54,9 @@ import zipfile
 import zlib
 from collections import Counter
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
+DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
+KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
 # ---------------------------------------------------------------------------
 # Limits. These keep the collector gentle. The upload server can slow it down
@@ -703,15 +706,14 @@ class Server:
         local_test = re.match(r"http://(127\.0\.0\.1|localhost)(:\d+)?(/|$)", self.url)
         if not (self.url.startswith("https://") or local_test):
             raise Fatal("The upload address must start with https://")
-        if not key:
-            raise Fatal("An upload address is set but there is no upload key.")
-        self.key = key
+        self.key = key or None      # None until this install has signed up (Collector.sign_up)
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def call(self, method, path, payload=None):
         """Returns (status, parsed JSON or None, seconds the server asked us to wait). Status 0 = unreachable."""
-        headers = {"Authorization": "Bearer " + self.key, "Accept": "application/json",
-                   "User-Agent": "arenasweats-collector/" + VERSION}
+        headers = {"Accept": "application/json", "User-Agent": "arenasweats-collector/" + VERSION}
+        if self.key:
+            headers["Authorization"] = "Bearer " + self.key
         body = None
         if payload is not None:
             body = gzip.compress(json.dumps(payload, separators=(",", ":")).encode())
@@ -784,6 +786,12 @@ class Collector:
 
     # -- main loop -----------------------------------------------------------
     def run(self):
+        if self.server and not self.server.key:
+            try:
+                self.sign_up()
+            except Done:
+                self.say("Time limit reached.")
+                return
         if self.server:
             self.refresh_policy(first=True)     # a wrong key stops here, before anything is read
         try:
@@ -1228,6 +1236,23 @@ class Collector:
         self.server = None
         return Fatal("ArenaSweats did not accept the upload key. Check the key in config.json.")
 
+    def sign_up(self):
+        """A new install asks ArenaSweats for its own upload key, once, and keeps it in config.json."""
+        while True:
+            status, data, wait = self.server.call("POST", "/v1/register", {"version": VERSION})
+            key = as_dict(data).get("key")
+            if status == 201 and isinstance(key, str) and KEY_RE.fullmatch(key):
+                self.server.key = key
+                save_config(key=key)
+                log.info("signed up with ArenaSweats as %.40s", as_dict(data).get("name"))
+                self.say("Signed up with ArenaSweats.")
+                return
+            if status == 403:
+                raise Fatal("ArenaSweats is not taking new collectors right now. Please try again another day.")
+            log.info("sign-up answered %s", status)
+            self.say("Cannot reach ArenaSweats yet. Trying again in a minute.", once=True)
+            self.sleep(max(60, wait))
+
     def refresh_policy(self, first=False):
         self.policy_at = self.now()
         status, data, _ = self.server.call("GET", "/v1/policy")
@@ -1396,8 +1421,10 @@ def main(argv=None):
                         help="stop after this many minutes; 0 = run until closed "
                              "(default: %d for a test run, otherwise until closed)" % TEST_MINUTES)
     parser.add_argument("--league-dir", help="folder where League is installed, if it is not found automatically")
-    parser.add_argument("--server", help="ArenaSweats upload address (default: from config.json; none = test run)")
-    parser.add_argument("--key", help="your upload key (default: from config.json)")
+    parser.add_argument("--test-run", action="store_true",
+                        help="upload nothing: collect for %d minutes, then write one file to send back" % TEST_MINUTES)
+    parser.add_argument("--server", help="upload address (default: from config.json, else %s)" % DEFAULT_SERVER)
+    parser.add_argument("--key", help="upload key (default: from config.json; a new install gets its own)")
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY,
                         help="seconds between match-history requests (default %.0f, never below %.0f)"
                              % (DEFAULT_DELAY, MIN_DELAY))
@@ -1434,16 +1461,19 @@ def main(argv=None):
             opts.since = date_ms(opts.since)
         except ValueError:
             raise Fatal("--since must be a date like 2026-10-06")
-        server_url = opts.server or config.get("server")
+        server_url = None if opts.test_run else (opts.server or config.get("server", DEFAULT_SERVER))
         server = Server(server_url, opts.key or config.get("key")) if server_url else None
         if opts.minutes is None:
             opts.minutes = 0 if server else TEST_MINUTES
         lock = lock_single_instance()
         print("ArenaSweats collector %s - reads Arena match history from your League client. Read-only." % VERSION)
         if server is None:
-            print("No upload address is set, so this is a test run: it collects for up to %g min,\n"
-                  "then writes one file for you to send back. Nothing is uploaded." % opts.minutes
-                  if opts.minutes else "No upload address is set: matches are only saved on this computer.")
+            print("This is a test run: it collects for up to %g min, then writes one file\n"
+                  "for you to send back. Nothing is uploaded." % opts.minutes
+                  if opts.minutes else "Nothing is uploaded: matches are only saved on this computer.")
+        else:
+            print("It sends the Arena matches it reads to ArenaSweats%s. Close this window to stop."
+                  % (", for up to %g min" % opts.minutes if opts.minutes else ""))
         made = Collector(opts, data_dir, server)
         made.run()
     except KeyboardInterrupt:

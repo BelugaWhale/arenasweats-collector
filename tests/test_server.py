@@ -534,6 +534,41 @@ class Policy(ServerCase):
         self.assertIn("season starts 2027-01-15", self.admin("stats"))
 
 
+class Signups(ServerCase):
+    def register(self, address="203.0.113.5"):
+        return self.client.post("/v1/register", headers={"X-Real-IP": address})
+
+    def test_a_new_install_gets_its_own_working_key(self):
+        answer = self.register()
+        self.assertEqual(answer.status_code, 201)
+        key, name = answer.get_json()["key"], answer.get_json()["name"]
+        self.assertEqual(self.client.get("/v1/policy", headers={"Authorization": "Bearer " + key}).status_code, 200)
+        self.assertEqual(self.post(self.games[:1], key=key).get_json()["accepted"], 1)
+        listed = self.admin("keys")
+        self.assertIn(name, listed)
+        self.assertNotIn(key, listed)
+        with open(os.environ["INGEST_DB"], "rb") as handle:
+            self.assertNotIn(key, handle.read().decode("latin-1"))     # only its hash is kept
+
+    def test_sign_ups_are_limited_per_address_and_per_day(self):
+        for _ in range(ingest.SIGNUPS_PER_ADDRESS):
+            self.assertEqual(self.register().status_code, 201)
+        self.assertEqual(self.register().status_code, 429)
+        self.assertEqual(self.register("198.51.100.7").status_code, 201)       # someone else
+        self.addCleanup(setattr, ingest, "SIGNUPS_PER_DAY", ingest.SIGNUPS_PER_DAY)
+        ingest.SIGNUPS_PER_DAY = ingest.SIGNUPS_PER_ADDRESS + 1
+        self.assertEqual(self.register("192.0.2.9").status_code, 429)          # the day's limit is reached
+        self.now += 86400 + 1
+        self.assertEqual(self.register().status_code, 201)                      # a day later
+
+    def test_sign_ups_can_be_closed_without_affecting_existing_keys(self):
+        self.admin("policy", "--signups", "off")
+        self.assertEqual(self.register().status_code, 403)
+        self.assertEqual(self.post(self.games[:1]).status_code, 200)
+        self.admin("policy", "--signups", "on")
+        self.assertEqual(self.register().status_code, 201)
+
+
 class WithServer(CollectorCase):
     """The real collector, the fake League client and the real ingest application together."""
 
@@ -570,6 +605,24 @@ class WithServer(CollectorCase):
 
 
 class EndToEnd(WithServer):
+    def test_a_new_install_signs_up_and_uploads(self):
+        saved = {}
+        self.addCleanup(setattr, collector, "save_config", collector.save_config)
+        collector.save_config = lambda **values: saved.update(values)
+        self.run_collector(minutes=30, server=collector.Server(self.url, None))
+        self.assertIn("Signed up with ArenaSweats.", self.output.getvalue())
+        self.assertTrue(collector.KEY_RE.fullmatch(saved["key"]))
+        row = self.db.execute("SELECT id, name FROM contributors WHERE key_hash = ?",
+                              (ingest.hash_key(saved["key"]),)).fetchone()
+        self.assertTrue(row[1].startswith("auto-"))
+        self.assertTrue(self.server_ids())
+        self.assertEqual({r[0] for r in self.db.execute("SELECT DISTINCT contributor_id FROM games")}, {row[0]})
+
+    def test_nothing_is_read_until_signed_up(self):
+        self.run_collector(minutes=3, server=collector.Server("http://127.0.0.1:9", None))   # nothing listens there
+        self.assertIn("Cannot reach ArenaSweats yet", self.output.getvalue())
+        self.assertEqual([path for _, path, _ in self.fake.requests if "match-history" in path], [])
+
     def test_everything_reaches_the_server_and_nothing_is_fetched_twice(self):
         made = self.run_collector(server=self.server())
         self.assertEqual(self.server_ids(), self.fake.arena_ids())
@@ -754,8 +807,7 @@ class EndToEnd(WithServer):
             with self.assertRaises(collector.Fatal):
                 collector.Server(url, "k")
         collector.Server("https://arenasweats.lol/collector", "k")
-        with self.assertRaises(collector.Fatal):
-            collector.Server("https://arenasweats.lol/collector", "")
+        self.assertIsNone(collector.Server("https://arenasweats.lol/collector", "").key)    # it signs up instead
 
 
 class HostileServer(CollectorCase):
