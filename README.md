@@ -39,4 +39,6 @@ Unless you've been given an upload key, it does a **15-minute test run**. It col
 back. That file holds the Arena matches it collected and a log of what it did. Nothing is
 uploaded.
 
+If it can't find League by itself, it asks you which folder League is installed in.
+
 MIT licence; see [`LICENSE`](LICENSE).

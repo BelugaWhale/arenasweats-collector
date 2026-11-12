@@ -1,6 +1,7 @@
 """Tests for collector.py against the fake League client.  Run:  python -m unittest discover tests"""
 
 import argparse
+import builtins
 import contextlib
 import io
 import json
@@ -352,6 +353,12 @@ class Lockfile(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     collector.read_lockfile(path)
 
+    def setUp(self):
+        for name in ("running_client_dirs", "installer_dirs", "installed_dirs"):     # this computer's own League, if any
+            original = getattr(collector, name)
+            setattr(collector, name, lambda: [])
+            self.addCleanup(setattr, collector, name, original)
+
     def test_accepts_the_folder_its_subfolder_or_the_file(self):
         with tempfile.TemporaryDirectory() as folder:
             inner = os.path.join(folder, "LeagueClient")
@@ -359,7 +366,111 @@ class Lockfile(unittest.TestCase):
             path = os.path.join(inner, "lockfile")
             open(path, "w").close()
             for given in (folder, inner, path, '"%s"' % folder):
-                self.assertEqual(collector.lockfile_paths(given), ([path], False))
+                self.assertEqual(collector.lockfile_paths(given), ([path], False, False))
+
+    def test_a_folder_inside_the_install_is_enough(self):
+        with tempfile.TemporaryDirectory() as folder:
+            install = os.path.join(folder, "WeGameApps", "英雄联盟")
+            os.makedirs(os.path.join(install, "LeagueClient"))
+            os.makedirs(os.path.join(install, "TCLS"))
+            path = os.path.join(install, "LeagueClient", "lockfile")
+            open(path, "w").close()
+            launcher = os.path.join(install, "TCLS", "Client.exe")
+            open(launcher, "w").close()
+            for given in (install, os.path.join(install, "TCLS"), launcher, os.path.join(install, "Game")):
+                self.assertEqual(collector.lockfile_paths(given)[0], [path], given)
+
+    def test_installer_entries_are_read_as_folders(self):
+        cases = {'"D:\\WeGameApps\\英雄联盟\\TCLS\\Client.exe",0': "D:\\WeGameApps\\英雄联盟\\TCLS",
+                 "D:\\Games\\英雄联盟\\uninst.exe /S": "D:\\Games\\英雄联盟",
+                 '"D:\\Program Files\\英雄联盟\\uninst.exe" /S': "D:\\Program Files\\英雄联盟",
+                 "D:\\英雄联盟\\": "D:\\英雄联盟",
+                 "C:\\Riot Games\\League of Legends\\icon.ico,-101": "C:\\Riot Games\\League of Legends",
+                 "": None, "  ": None}
+        for value, folder in cases.items():
+            self.assertEqual(collector.folder_in(value), folder, value)
+
+    def test_drive_search_finds_installs_by_name_or_by_the_client(self):
+        with tempfile.TemporaryDirectory() as root:
+            def make(*parts, program=False):
+                folder = os.path.join(root, *parts)
+                os.makedirs(os.path.join(folder, "LeagueClient") if program else folder, exist_ok=True)
+                if program:
+                    open(os.path.join(folder, "LeagueClient", "LeagueClient.exe"), "w").close()
+                return folder
+            wanted = {make("Games", "英雄联盟"),
+                      make("Program Files (x86)", "WeGameApps", "英雄联盟"),
+                      make("Stuff", "MyLoL", program=True),
+                      make("Riot Games", "League of Legends")}
+            make("Users", "me", "英雄联盟")                  # people's own folders are not looked in
+            make("Other", "Deep", "英雄联盟")                # too deep, and not in a games folder
+            self.assertEqual(set(collector.scan_drives(roots=[root])), wanted)
+
+    def test_reads_the_port_and_password_from_the_command_line(self):
+        line = ('"D:\\WeGameApps\\英雄联盟\\LeagueClient\\LeagueClientUx.exe" "--riotclient-auth-token=xyz" '
+                '"--riotclient-app-port=50000" "--app-port=50123" "--remoting-auth-token=Zx_9-q" "--region=TENCENT"')
+        self.assertEqual(collector.login_from_command_line(line), (50123, "Zx_9-q"))
+        for bad in (None, "", "--app-port=50123", "--remoting-auth-token=abc", "--app-port=99999 --remoting-auth-token=a"):
+            self.assertIsNone(collector.login_from_command_line(bad), bad)
+
+    @unittest.skipUnless(os.name == "nt", "asks Windows about a running program")
+    def test_windows_gives_a_programs_path_and_command_line(self):
+        import subprocess
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+                                  "--app-port=50123", "--remoting-auth-token=abc_DEF-1"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertIn(child.pid, [pid for pid, _ in collector.running_programs()])
+        path, line, error = collector.query_program(child.pid, command_line=True)
+        self.assertEqual(os.path.normcase(path), os.path.normcase(sys.executable))
+        self.assertEqual(collector.login_from_command_line(line), (50123, "abc_DEF-1"))
+        self.assertEqual(error, 0)
+        self.assertIn("C:\\", collector.fixed_drives())
+
+
+class HiddenClient(CollectorCase):
+    """The client runs as administrator, so Windows will not say where it is."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(self.league_dir, "lockfile"))
+        self.logins = []
+        for name, value in (("running_client_dirs", lambda: [None]), ("installer_dirs", lambda: []),
+                            ("installed_dirs", lambda: []), ("scan_drives", lambda: []),
+                            ("command_line_logins", lambda: self.logins)):
+            original = getattr(collector, name)
+            setattr(collector, name, value)
+            self.addCleanup(setattr, collector, name, original)
+
+    def test_connects_through_the_command_line_when_no_lockfile_is_found(self):
+        self.logins = [(self.fake.port, self.fake.token, "http")]
+        made = self.run_collector(minutes=10, league_dir=None)
+        self.assertIn("Connected to the League client.", self.output.getvalue())
+        self.assertTrue(self.stored_ids(made))
+
+    def test_says_the_client_is_open_but_out_of_reach(self):
+        made = self.run_collector(minutes=2, league_dir=None)
+        self.assertIn("The League client is open, but the collector cannot reach it yet.", self.output.getvalue())
+        self.assertNotIn("Waiting for the League client", self.output.getvalue())
+        self.assertEqual(self.stored_ids(made) if made.store else set(), set())
+
+    def test_the_folder_typed_in_is_used_and_remembered(self):
+        install = os.path.join(self.tmp.name, "WeGameApps", "英雄联盟")
+        self.fake.write_lockfile(os.path.join(install, "LeagueClient"))
+        saved = {}
+        self.addCleanup(setattr, collector, "save_config", collector.save_config)
+        collector.save_config = lambda **values: saved.update(values)
+        self.addCleanup(setattr, builtins, "input", builtins.input)
+        builtins.input = lambda prompt: '"%s"' % os.path.join(install, "TCLS")      # the shortcut's folder
+        made = self.collector(league_dir=None)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            made.ask_for_folder(hidden=True)
+        self.assertIn("Run as administrator", output.getvalue())
+        self.assertEqual(saved, {"league_dir": os.path.join(install, "TCLS")})
+        self.assertEqual(made.opts.league_dir, os.path.join(install, "TCLS"))
+        self.assertEqual(collector.lockfile_paths(made.opts.league_dir)[0],
+                         [os.path.join(install, "LeagueClient", "lockfile")])
 
 
 if __name__ == "__main__":

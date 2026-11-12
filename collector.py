@@ -2,7 +2,9 @@
 """ArenaSweats collector: reads Arena match history from your own League client.
 
 WHAT IT DOES
-  1. Finds the League client that is running on this computer.
+  1. Finds the League client that is running on this computer, through the
+     "lockfile" in its folder or, when that cannot be found, the command line
+     the client was started with (what Task Manager shows for it).
   2. While you are not playing, slowly asks that client for this season's Arena
      match history: match lists of players, and the full record of Arena matches.
   3. With an upload address and key set, ArenaSweats tells it which players and
@@ -20,7 +22,9 @@ WHAT IT NEVER DOES
     records, which Arena matches a player's list contains, and your own player
     id (the same id that is in your match records; a server with no players
     yet starts from it).
-  - It needs no administrator rights and installs nothing.
+  - It needs no administrator rights and installs nothing. (When the League
+    client runs as administrator, Windows hides where it is installed; the
+    collector then looks in the usual places and, failing that, asks.)
 
 Only the Python standard library is used, so this one file is the whole program.
 """
@@ -33,6 +37,7 @@ import http.client
 import json
 import logging
 import logging.handlers
+import ntpath
 import os
 import random
 import re
@@ -48,7 +53,7 @@ import zipfile
 import zlib
 from collections import Counter
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # ---------------------------------------------------------------------------
 # Limits. These keep the collector gentle. The upload server can slow it down
@@ -189,7 +194,12 @@ def read_lockfile(path):
 
 
 CLIENT_NAMES = ("leagueclient.exe", "leagueclientux.exe")
+WINDOW_PROGRAM = "leagueclientux.exe"     # the client's window program, started with its port and password
 RELATED_WORDS = ("league", "lol", "riot", "wegame", "tcls", "tencent")   # program names worth noting in the log
+LEAGUE_FOLDER_WORDS = ("英雄联盟", "league of legends")
+GAME_FOLDER_WORDS = ("game", "游戏", "tencent", "腾讯", "riot", "lol")   # folders worth looking one level deeper in
+SKIP_FOLDERS = {"windows", "users", "programdata", "recovery", "system volume information", "perflogs"}
+SCAN_SECONDS = 20
 noted = {}
 
 
@@ -200,61 +210,185 @@ def note(topic, text):
         log.info("%s: %s", topic, text)
 
 
-def running_client_dirs(names=CLIENT_NAMES):
-    """Folders of the running League client programs (Windows only).
+_windows = None
 
-    Asks Windows for the list of running programs and for the file path of the
-    League client. It reads nothing inside any program and never looks at the
-    game itself. A folder is None when Windows would not give the path.
-    """
+
+def windows_api():
+    """The few Windows functions used below, set up once (Windows only)."""
+    global _windows
+    if _windows is None:
+        import ctypes
+        from ctypes import wintypes
+
+        class Entry(ctypes.Structure):      # one program in Windows' list of running programs
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+        class Text(ctypes.Structure):       # how Windows hands back a command line
+            _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        k32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(Entry))
+        k32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(Entry))
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k32.GetDriveTypeW.argtypes = (wintypes.LPCWSTR,)
+        nt = ctypes.WinDLL("ntdll")
+        nt.NtQueryInformationProcess.restype = ctypes.c_long
+        nt.NtQueryInformationProcess.argtypes = (
+            wintypes.HANDLE, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong))
+        _windows = (ctypes, wintypes, k32, nt, Entry, Text)
+    return _windows
+
+
+def running_programs():
+    """(process id, program name) of every running program, from Windows' list (Windows only)."""
     if os.name != "nt":
         return []
-    import ctypes
-    from ctypes import wintypes
-
-    class Entry(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
-                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
-                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
-
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    k32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
-    k32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(Entry))
-    k32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(Entry))
-    k32.OpenProcess.restype = wintypes.HANDLE
-    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    k32.QueryFullProcessImageNameW.argtypes = (
-        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
-    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
-
+    ctypes, _, k32, _, Entry, _ = windows_api()
     snapshot = k32.CreateToolhelp32Snapshot(0x2, 0)      # 0x2 = the list of running programs
     if not snapshot or snapshot == ctypes.c_void_p(-1).value:
         return []
-    dirs, related = [], set()
+    programs = []
     entry = Entry()
     entry.dwSize = ctypes.sizeof(Entry)
     more = k32.Process32FirstW(snapshot, ctypes.byref(entry))
     while more:
-        if any(word in entry.szExeFile.lower() for word in RELATED_WORDS):
-            related.add(entry.szExeFile)
-        if entry.szExeFile.lower() in names:
-            folder = None
-            handle = k32.OpenProcess(0x1000, False, entry.th32ProcessID)   # 0x1000 = "limited information"
-            if handle:
-                buffer = ctypes.create_unicode_buffer(32768)
-                size = wintypes.DWORD(32768)
-                if k32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-                    folder = os.path.dirname(buffer.value)
-                k32.CloseHandle(handle)
-            if folder not in dirs:
-                dirs.append(folder)
+        programs.append((entry.th32ProcessID, entry.szExeFile))
         more = k32.Process32NextW(snapshot, ctypes.byref(entry))
     k32.CloseHandle(snapshot)
+    return programs
+
+
+def query_program(pid, command_line=False):
+    """Ask Windows for one running program's file path and, if asked, the command line it was
+    started with (what Task Manager shows in its "Command line" column). Nothing inside the
+    program is read. Returns (path, command line, Windows error code); a value is None when
+    Windows will not say, which happens when that program runs as administrator and this one
+    does not."""
+    ctypes, wintypes, k32, nt, _, Text = windows_api()
+    handle = k32.OpenProcess(0x1000, False, pid)        # 0x1000 = "limited information" only
+    if not handle:
+        return None, None, ctypes.get_last_error()
+    try:
+        path = line = None
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(32768)
+        if k32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            path = buffer.value
+        if command_line:
+            raw = ctypes.create_string_buffer(65536)
+            if nt.NtQueryInformationProcess(handle, 60, raw, len(raw), None) == 0:   # 60 = its command line
+                text = Text.from_buffer(raw)
+                start = ctypes.addressof(raw)
+                if text.Buffer and start <= text.Buffer and text.Buffer + text.Length <= start + len(raw):
+                    line = ctypes.wstring_at(text.Buffer, text.Length // 2)
+        return path, line, 0
+    finally:
+        k32.CloseHandle(handle)
+
+
+def running_client_dirs(names=CLIENT_NAMES):
+    """Folders of the running League client programs (Windows only). A folder is None when
+    Windows would not say where the program is."""
+    dirs, related, errors = [], set(), set()
+    for pid, name in running_programs():
+        if any(word in name.lower() for word in RELATED_WORDS):
+            related.add(name)
+        if name.lower() in names:
+            path, _, error = query_program(pid)
+            folder = os.path.dirname(path) if path else None
+            if folder is None:
+                errors.add(str(error))
+            if folder not in dirs:
+                dirs.append(folder)
     note("related programs running", ", ".join(sorted(related)) or "none")
-    note("League client folders", ", ".join(folder or "(path not available)" for folder in dirs) or "client not running")
+    note("League client folders", ", ".join(
+        folder or "(Windows would not say: error %s)" % "/".join(sorted(errors)) for folder in dirs)
+        or "client not running")
+    return dirs
+
+
+def login_from_command_line(line):
+    """(port, password) from the client's command line, or None."""
+    port = re.search(r"--app-port=([0-9]{1,5})\b", line or "")
+    token = re.search(r"--remoting-auth-token=([A-Za-z0-9_-]{1,200})", line or "")
+    if port and token and 0 < int(port.group(1)) < 65536:
+        return int(port.group(1)), token.group(1)
+    return None
+
+
+def command_line_logins():
+    """(port, password, protocol) of the running client, taken from the command line its window
+    program was started with. Used only when no lockfile works. Windows gives this only when it
+    lets this program see the client. The password is never written anywhere."""
+    logins = []
+    for pid, name in running_programs():
+        if name.lower() == WINDOW_PROGRAM:
+            login = login_from_command_line(query_program(pid, command_line=True)[1])
+            if login:
+                logins.append(login + ("https",))
+    note("client command line", "%d usable" % len(logins))
+    return logins
+
+
+def registry_text(key, name):
+    import winreg
+    try:
+        value = winreg.QueryValueEx(key, name)[0]
+    except OSError:
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def folder_in(value):
+    """The folder named in an installer's registry value: a folder, or a program or icon path
+    with quotes, ",0" or " /S" around it."""
+    value = (value or "").strip()
+    if value.startswith('"'):
+        value = value[1:].split('"', 1)[0]
+    else:
+        value = re.split(r",-?[0-9]+$| +/", value)[0]
+    value = value.strip()
+    if re.search(r"\.(exe|ico|dll)$", value, re.I):
+        value = ntpath.dirname(value)
+    return ntpath.normpath(value) if value else None
+
+
+def installer_dirs():
+    """Folders League's installers recorded in Windows' list of installed programs. They can
+    point at a folder inside the install, such as its launcher's."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    dirs = []
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for path in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                     r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
+            try:
+                key = winreg.OpenKey(root, path)
+            except OSError:
+                continue
+            with key:
+                for index in range(winreg.QueryInfoKey(key)[0]):
+                    try:
+                        with winreg.OpenKey(key, winreg.EnumKey(key, index)) as entry:
+                            if any(word in registry_text(entry, "DisplayName").lower() for word in LEAGUE_FOLDER_WORDS):
+                                for field in ("InstallLocation", "DisplayIcon", "UninstallString"):
+                                    folder = folder_in(registry_text(entry, field))
+                                    if folder and folder not in dirs:
+                                        dirs.append(folder)
+                    except OSError:
+                        continue
     return dirs
 
 
@@ -296,23 +430,96 @@ def installed_dirs():
     return dirs
 
 
-def lockfile_paths(league_dir=None):
-    """Existing lockfiles, most likely first. Returns (paths, client_running_but_not_located)."""
-    unlocated = False
-    if league_dir:
-        league_dir = league_dir.strip().strip('"')
-        bases = [os.path.dirname(league_dir) if os.path.basename(league_dir).lower() == "lockfile" else league_dir]
-    else:
-        running = running_client_dirs()
-        unlocated = None in running
-        bases = [folder for folder in running if folder] + installed_dirs()
+def fixed_drives():
+    """The computer's own drives (not network or removable ones)."""
+    if os.name != "nt":
+        return []
+    k32 = windows_api()[2]
+    return [letter + ":\\" for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ" if k32.GetDriveTypeW(letter + ":\\") == 3]
+
+
+def looks_like_league(folder):
+    name = os.path.basename(folder).lower()
+    return (any(word in name for word in LEAGUE_FOLDER_WORDS)
+            or os.path.isfile(os.path.join(folder, "LeagueClient", "LeagueClient.exe"))
+            or os.path.isfile(os.path.join(folder, "LeagueClient.exe")))
+
+
+scanned = None
+
+
+def scan_drives(roots=None, seconds=SCAN_SECONDS):
+    """League installs anywhere in the top levels of the computer's drives, found by folder
+    name or by the client program inside. Only folder names are looked at. Done once, and only
+    when the client is running but could not be found any other way."""
+    global scanned
+    if roots is None and scanned is not None:
+        return scanned
+    end = time.monotonic() + seconds
+    found, waiting = [], [(root, 0) for root in (fixed_drives() if roots is None else roots)]
+    while waiting and time.monotonic() < end:
+        folder, depth = waiting.pop(0)
+        try:
+            with os.scandir(folder) as entries:
+                children = sorted(entry.path for entry in entries if entry.is_dir(follow_symlinks=False))
+        except OSError:
+            continue
+        for child in children[:2000]:
+            name = os.path.basename(child).lower()
+            if name in SKIP_FOLDERS or name[:1] in ("$", "."):
+                continue
+            if looks_like_league(child):
+                found.append(child)
+            elif depth < 1 or (depth < 2 and any(word in name for word in GAME_FOLDER_WORDS)):
+                waiting.append((child, depth + 1))
+    note("League folders found on the drives", ", ".join(found) or "none")
+    if roots is None:
+        scanned = found
+    return found
+
+
+def lockfile_candidates(folder, parents=0):
+    """Where the lockfile can be for a folder that is, or is up to `parents` levels inside, the install."""
     paths = []
-    for base in bases:
-        for path in (os.path.join(base, "lockfile"), os.path.join(base, "LeagueClient", "lockfile")):
-            if path not in paths and os.path.isfile(path):
-                paths.append(path)
-    note("lockfile search", "%d folders tried, found: %s" % (len(bases), paths or "none"))
-    return paths, unlocated and not paths
+    for _ in range(parents + 1):
+        paths += [os.path.join(folder, "lockfile"), os.path.join(folder, "LeagueClient", "lockfile")]
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    return paths
+
+
+def existing_lockfiles(*groups):
+    """The lockfiles that exist, from groups of (folders, parents), without repeats."""
+    paths = []
+    for folders, parents in groups:
+        for folder in folders:
+            for path in lockfile_candidates(folder, parents):
+                if path not in paths and os.path.isfile(path):
+                    paths.append(path)
+    return paths
+
+
+def given_folder(league_dir):
+    """A folder typed in by the user: quotes removed, and a file path turned into its folder."""
+    league_dir = (league_dir or "").strip().strip('"')
+    return os.path.dirname(league_dir) if os.path.isfile(league_dir) else league_dir
+
+
+def lockfile_paths(league_dir=None):
+    """Existing lockfiles, most likely first.
+
+    Returns (paths, client_running, hidden): whether a League client program is running,
+    and whether Windows would not say where it is installed."""
+    running = running_client_dirs()
+    given = [given_folder(league_dir)] if league_dir else []
+    groups = [(given, 2), ([folder for folder in running if folder], 0), (installer_dirs(), 2), (installed_dirs(), 0)]
+    paths = existing_lockfiles(*groups)
+    if running and not paths:
+        paths = existing_lockfiles((scan_drives(), 0))
+    note("lockfile search", "found: %s" % (paths or "none"))
+    return paths, bool(running), None in running
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +757,7 @@ class Collector:
         self.wrong_records, self.failed_fetches, self.rests = Counter(), Counter(), Counter()   # per match id
         self.rest_until = {}               # match id -> when a match that keeps failing may be tried again
         self.owed = {}                     # match id -> list entry, for matches still to be fetched after a failure
-        self.last_said, self.last_status, self.asked_folder, self.described = None, now(), False, False
+        self.last_said, self.last_status, self.folder_asks, self.described = None, now(), 0, False
 
     # -- small helpers -------------------------------------------------------
     @property
@@ -604,33 +811,66 @@ class Collector:
         """Wait for a running, logged-in League client."""
         rounds = 0
         while True:
-            paths, unlocated = lockfile_paths(self.opts.league_dir)
+            paths, running, hidden = lockfile_paths(self.opts.league_dir)
+            results = []
             for path in paths:
-                try:
-                    lcu = read_lockfile(path)
-                    status, me = lcu.get("/lol-summoner/v1/current-summoner")
-                except (OSError, ValueError, ClientGone) as error:
-                    log.info("lockfile %s not usable: %s", path, error)
-                    continue
-                puuid = me.get("puuid") if isinstance(me, dict) else None
-                if status == 200 and isinstance(puuid, str) and PUUID_RE.fullmatch(puuid):
-                    self.use_client(lcu, puuid, path)
+                results.append(self.try_client(path, lambda path=path: read_lockfile(path)))
+                if results[-1] == "connected":
                     return
-                log.info("client at %s not ready: status %s, player id %s", path, status,
-                         "missing" if not puuid else "in an unexpected format")
+            if running and "answered" not in results:
+                for port, token, scheme in command_line_logins():
+                    results.append(self.try_client("the client's command line",
+                                                   lambda port=port, token=token, scheme=scheme: Lcu(port, token, scheme)))
+                    if results[-1] == "connected":
+                        return
             rounds += 1
-            if unlocated and rounds >= 2 and not self.asked_folder and sys.stdin and sys.stdin.isatty():
-                self.asked_folder = True
-                print("The League client is running but its folder could not be found automatically.")
-                given = input("Paste the folder where League is installed and press Enter: ").strip().strip('"')
-                if given and lockfile_paths(given)[0]:
-                    self.opts.league_dir = given
-                    save_config(league_dir=given)
-                elif given:
-                    print("No running League client was found in that folder.")
-                continue
-            self.say("Waiting for the League client. Open it and log in.", once=True)
+            if "answered" in results:
+                self.say("Found the League client. Waiting for you to log in.", once=True)
+            elif running:
+                self.say("The League client is open, but the collector cannot reach it yet.", once=True)
+                if rounds >= 2 and self.folder_asks < 3 and sys.stdin and sys.stdin.isatty():
+                    self.ask_for_folder(hidden)
+                    continue
+            else:
+                self.say("Waiting for the League client. Open it and log in.", once=True)
             self.sleep(10)
+
+    def try_client(self, where, make):
+        """Try one way of reaching the client: "connected" (and in use), "answered" (reachable
+        but nobody logged in yet) or "unreachable"."""
+        try:
+            lcu = make()
+            status, me = lcu.get("/lol-summoner/v1/current-summoner")
+        except (OSError, ValueError, ClientGone) as error:
+            log.info("client via %s not usable: %s", where, error)
+            return "unreachable"
+        puuid = me.get("puuid") if isinstance(me, dict) else None
+        if status == 200 and isinstance(puuid, str) and PUUID_RE.fullmatch(puuid):
+            self.use_client(lcu, puuid, where)
+            return "connected"
+        log.info("client via %s not ready: status %s, player id %s", where, status,
+                 "missing" if not puuid else "in an unexpected format")
+        return "answered"
+
+    def ask_for_folder(self, hidden):
+        """Ask where League is installed, when the client is open but cannot be found."""
+        self.folder_asks += 1
+        if hidden:
+            print("Windows does not let the collector see where League is installed. This happens when\n"
+                  "the League client runs as administrator. Either tell the collector the folder below, or\n"
+                  "close this window and start the collector with right-click > 'Run as administrator'.")
+        print("To find the folder, right-click your League shortcut and choose 'Open file location'.")
+        try:
+            folder = given_folder(input("Paste the folder where League is installed and press Enter: "))
+        except EOFError:
+            self.folder_asks = 3
+            return
+        if folder and existing_lockfiles(([folder], 2)):
+            log.info("folder given: %s", folder)
+            self.opts.league_dir = folder
+            save_config(league_dir=folder)
+        elif folder:
+            print("No League client was found in or near that folder. Check the client is open and logged in.")
 
     def use_client(self, lcu, puuid, path):
         self.lcu = lcu
@@ -642,7 +882,7 @@ class Collector:
             self.store.retry_refused()       # offer matches the server refused before once more
         status, region = lcu.get("/riotclient/region-locale")
         log.info("connected via %s, account %s..., region-locale: %s %s", path, puuid[:8], status, region)
-        self.say("Found the League client in %s" % os.path.dirname(path))
+        self.say("Connected to the League client%s." % (" in " + os.path.dirname(path) if os.path.isabs(path) else ""))
         self.say("Collecting only while you are not playing, one request every %.1f seconds, matches since %s."
                  % (self.delay, time.strftime("%Y-%m-%d", time.gmtime(self.season_start / 1000))))
 
