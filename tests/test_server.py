@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -122,6 +123,68 @@ class Keys(ServerCase):
 
     def test_health_check_needs_no_key(self):
         self.assertEqual(self.client.get("/healthz").status_code, 200)
+
+
+class Relay(ServerCase):
+    # The relay empties records on this server: a bug here would lose collected matches for good.
+    def relay(self, *request, stdin=None):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), unittest.mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
+            ingest.main(["relay", *request])
+        return output.getvalue()
+
+    def exported(self, limit=100):
+        return [json.loads(line) for line in self.relay("export", str(limit)).splitlines()]
+
+    def test_matches_held_before_the_outbox_existed_are_queued_once(self):
+        self.post(self.games[:5])
+        self.db.execute("DROP TRIGGER games_to_outbox")
+        self.db.execute("DELETE FROM outbox")
+        self.db.commit()
+        self.post(self.games[5:8])                  # received while an older version ran: no trigger
+        ingest.prepared.clear()
+        ingest.connect().close()                     # the new version starts
+        ingest.connect().close()
+        self.post(self.games[8:])
+        self.assertEqual(sorted(row["game_id"] for row in self.exported()), sorted(g["gameId"] for g in self.games))
+
+    def test_only_confirmed_matches_leave_the_queue_and_are_emptied_days_later(self):
+        self.post(self.games)
+        first = self.exported(5)
+        self.assertEqual(len(first), 5)
+        self.assertEqual(ingest.zlib.decompress(ingest.base64.b64decode(first[0]["payload"])),
+                         json.dumps(self.games[0], separators=(",", ":"), sort_keys=True).encode())
+        self.assertEqual(len(self.exported()), 12)  # nothing leaves the queue before it is confirmed
+        self.assertEqual(json.loads(self.relay("ack", stdin=json.dumps({"seqs": [row["seq"] for row in first]}))),
+                         {"taken": 5, "emptied": 0})
+        self.assertEqual([row["seq"] for row in self.exported()], [row["seq"] for row in self.exported()][:7])
+        self.assertEqual(len(self.exported()), 7)
+        self.now += ingest.KEEP_SHIPPED_DAYS * 86400 + 1
+        self.assertEqual(json.loads(self.relay("ack", stdin='{"seqs": []}')), {"taken": 0, "emptied": 5})
+        empty = {row[0] for row in self.db.execute("SELECT game_id FROM games WHERE payload = x''")}
+        self.assertEqual(empty, {row["game_id"] for row in first})
+        self.assertEqual(self.count("games"), 12)
+        again = self.post(self.games, key=self.add_key("bob")).get_json()   # still known: never kept twice
+        self.assertEqual((again["accepted"], again["duplicates"]), (0, 12))
+        self.assertIn("Wrote 7 matches", self.admin("export", os.path.join(self.tmp.name, "out.jsonl.gz")))
+
+    def test_uploads_wait_while_the_queue_is_full(self):
+        self.post(self.games[:6])
+        with unittest.mock.patch.object(ingest, "MAX_BACKLOG", 5):
+            refused = self.post(self.games[6:])
+        self.assertEqual(refused.status_code, 503)
+        self.assertEqual(self.count("games"), 6)
+        self.assertEqual(self.post(self.games[6:]).get_json()["accepted"], 6)
+
+    def test_status_counts_what_arrived(self):
+        self.post(self.games)
+        status = json.loads(self.relay("status"))
+        self.assertEqual((status["waiting"], status["platforms"]["OC1"]["held"]), (12, 12))
+        self.assertEqual(status["platforms"]["OC1"]["hourly_newest_first"][0], 12)
+
+    def test_unknown_requests_are_refused(self):
+        with unittest.mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": "rm -rf /"}):
+            self.assertIn("Not understood", self.relay())
 
 
 class Uploads(ServerCase):

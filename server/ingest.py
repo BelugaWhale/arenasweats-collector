@@ -15,6 +15,7 @@ Manage keys / policy:  python server/ingest.py --help
 """
 
 import argparse
+import base64
 import calendar
 import gzip
 import hashlib
@@ -43,10 +44,16 @@ MAX_REPORTS = 20                 # match lists reported per work request
 MAX_REPORT_IDS = 3000            # matches named in one match-list report
 REQUESTS_PER_MINUTE = 60         # per key
 GAMES_PER_DAY = 60000            # per key; an honest collector cannot read more than ~45k a day
-SIGNUPS_PER_ADDRESS = 3          # new installs one internet address can sign up a day
+SIGNUPS_PER_ADDRESS = 10         # new installs one internet address can sign up a day (many homes in China share one)
 SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close with: policy --signups off)
 ARENA_MODES = {"CHERRY"}
 DEFAULT_SEASON_START = "2026-10-06"   # UTC. Change with: ingest.py policy --season-start YYYY-MM-DD
+
+# ---- passing matches on to the rankings server (it pulls them over SSH: see `relay` below)
+RELAY_BATCH = 5000               # most matches handed over in one pull
+KEEP_SHIPPED_DAYS = 3            # a record is kept here this long after the rankings server confirmed it holds it
+MAX_BACKLOG = 300000             # matches not passed on yet (about 2 GB); above this, uploads wait
+MIN_FREE_BYTES = 5 * 1024 ** 3   # uploads also wait when the disk has less free than this
 
 # ---- handing out work
 LEASE_SECONDS = 15 * 60          # a collector has this long to do what it was given
@@ -110,6 +117,15 @@ CREATE INDEX IF NOT EXISTS players_older_part ON players(platform, games) WHERE 
 CREATE INDEX IF NOT EXISTS players_unread ON players(platform) WHERE checked_at = 0;
 CREATE INDEX IF NOT EXISTS games_by_time ON games(created_ms);
 CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS games_by_arrival ON games(received_at, platform, contributor_id);
+-- Matches not passed on to the rankings server yet, in the order they arrived. A trigger on games fills it
+-- (see add_outbox), so every match is queued whatever version of this program received it. seq is never reused.
+CREATE TABLE IF NOT EXISTS outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, game_id INTEGER NOT NULL);
+-- Matches the rankings server confirmed it holds. After KEEP_SHIPPED_DAYS their record here is emptied; the row
+-- in games stays, so the match is still known and never asked for again.
+CREATE TABLE IF NOT EXISTS shipped(
+    platform TEXT NOT NULL, game_id INTEGER NOT NULL, shipped_at INTEGER NOT NULL, PRIMARY KEY(platform, game_id));
+CREATE INDEX IF NOT EXISTS shipped_by_time ON shipped(shipped_at);
 """
 
 
@@ -122,15 +138,31 @@ prepared = set()     # database files this process has already set up
 
 def connect():
     path = os.path.abspath(db_path())
-    db = sqlite3.connect(path, timeout=5) if path in prepared else None
+    db = sqlite3.connect(path, timeout=10) if path in prepared else None
     if db is None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        db = sqlite3.connect(path, timeout=5)
+        db = sqlite3.connect(path, timeout=10)
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(SCHEMA)
+        add_outbox(db)
         prepared.add(path)
     db.execute("PRAGMA synchronous=NORMAL")
     return db
+
+
+def add_outbox(db):
+    """Queue every match for the rankings server: the ones held already (once), and from now on each new one.
+
+    Done in one transaction with the trigger, so no match is queued twice or missed, even while an older
+    version of this program is still receiving uploads.
+    """
+    db.execute("BEGIN IMMEDIATE")
+    with db:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'games_to_outbox'").fetchone():
+            return
+        db.execute("INSERT INTO outbox(platform, game_id) SELECT platform, game_id FROM games ORDER BY rowid")
+        db.execute("CREATE TRIGGER games_to_outbox AFTER INSERT ON games BEGIN "
+                   "INSERT INTO outbox(platform, game_id) VALUES(NEW.platform, NEW.game_id); END")
 
 
 def hash_key(key):
@@ -348,6 +380,19 @@ def policy():
     return jsonify(get_policy(g.db))
 
 
+def backlog_full(db):
+    """Why uploads must wait, or None. Matches pile up here only while the rankings server is not taking
+    them; this keeps that pile (and the disk it shares with the website) bounded. Collectors keep what
+    they hold and send it later."""
+    first, last = db.execute("SELECT MIN(seq), MAX(seq) FROM outbox").fetchone()
+    if first is not None and last - first + 1 > MAX_BACKLOG:
+        return "ArenaSweats is catching up; matches are kept and sent later"
+    disk = os.statvfs(os.path.dirname(os.path.abspath(db_path())))
+    if disk.f_bavail * disk.f_frsize < MIN_FREE_BYTES:
+        return "ArenaSweats is low on space; matches are kept and sent later"
+    return None
+
+
 @app.post("/v1/games")
 def games():
     """Receive match records. New ones are kept; their players join the list of players to read."""
@@ -362,36 +407,43 @@ def games():
 
     now = int(clock())
     accepted = duplicates = skipped = 0
-    rejected = []
+    rejected, ready = [], []
     db = g.db
     rules = get_policy(db)
+    busy = backlog_full(db)
+    if busy:
+        return fail(503, busy, **{"Retry-After": "1800"})
+    # Checked and packed before the write lock is taken, so other requests wait only for the inserts.
+    for game in batch:
+        reason = validate_game(game, now)
+        if reason is None:
+            try:
+                payload = json.dumps(game, separators=(",", ":"), sort_keys=True).encode()
+            except (ValueError, RecursionError):
+                reason = "record cannot be stored"
+            else:
+                if len(payload) > MAX_GAME_BYTES:
+                    reason = "record is too large"
+        if reason:
+            game_id = game.get("gameId") if isinstance(game, dict) else None
+            rejected.append({"gameId": game_id if is_int(game_id, 0, 2 ** 53) else None, "reason": reason})
+            continue
+        ready.append((game["platformId"], game["gameId"], game["gameCreation"], human_players(game),
+                      zlib.compress(payload)))
     db.execute("BEGIN IMMEDIATE")       # one writer at a time, one transaction for the whole batch
     with db:
         today = db.execute("SELECT COUNT(*) FROM games WHERE contributor_id = ? AND received_at > ?",
                            (g.contributor, now - 86400)).fetchone()[0]
         if today + len(batch) > GAMES_PER_DAY:      # refuse the whole batch, so the collector keeps it and waits
             return fail(429, "daily limit reached", **{"Retry-After": "3600"})
-        for game in batch:
-            reason = validate_game(game, now)
-            if reason is None:
-                try:
-                    payload = json.dumps(game, separators=(",", ":"), sort_keys=True).encode()
-                except (ValueError, RecursionError):
-                    reason = "record cannot be stored"
-                else:
-                    if len(payload) > MAX_GAME_BYTES:
-                        reason = "record is too large"
-            if reason:
-                game_id = game.get("gameId") if isinstance(game, dict) else None
-                rejected.append({"gameId": game_id if is_int(game_id, 0, 2 ** 53) else None, "reason": reason})
-                continue
-            key = (game["platformId"], game["gameId"])
+        for platform, game_id, created, players, packed in ready:
+            key = (platform, game_id)
             db.execute("DELETE FROM wanted WHERE platform = ? AND game_id = ?", key)
-            if game["gameCreation"] < rules["season_start"]:
+            if created < rules["season_start"]:
                 skipped += 1            # from before this season: not kept
                 continue
             new = db.execute("INSERT OR IGNORE INTO games VALUES(?, ?, ?, ?, ?, ?)",
-                             key + (game["gameCreation"], now, g.contributor, zlib.compress(payload))).rowcount
+                             key + (created, now, g.contributor, packed)).rowcount
             if not new:
                 duplicates += 1         # already held: the first copy stays
                 continue
@@ -402,7 +454,7 @@ def games():
                 INSERT INTO players(platform, puuid, games, due_at) VALUES(?, ?, 1, ?)
                 ON CONFLICT(platform, puuid) DO UPDATE SET games = games + 1,
                     due_at = CASE WHEN checked_at = 0 AND fails = 0 THEN due_at - ? ELSE due_at END""",
-                           [(key[0], puuid, now, NEW_PLAYER_BONUS) for puuid in human_players(game)])
+                           [(platform, puuid, now, NEW_PLAYER_BONUS) for puuid in players])
     return jsonify({"accepted": accepted, "duplicates": duplicates, "skipped": skipped, "rejected": rejected,
                     "policy": rules})
 
@@ -632,6 +684,11 @@ def cmd_stats(db, _args):
             one("SELECT COUNT(*) FROM players WHERE platform = ? AND resume IS NOT NULL")))
     if not platforms:
         print("Nothing received yet.")
+    relay = relay_status(db, now)
+    print("Relay: %d matches waiting for the rankings server; last pull %s, last confirmed %s%s" % (
+        relay["waiting"], *(time.strftime("%Y-%m-%d %H:%M", time.localtime(relay[name])) if relay[name] else "never"
+                            for name in ("last_export_at", "last_ack_at")),
+        "; UPLOADS PAUSED: " + relay["uploads_paused"] if relay["uploads_paused"] else ""))
     rules = get_policy(db)
     print("Policy: %s, season starts %s UTC" % (
         {name: rules[name] for name in ("enabled", "delay", "message")},
@@ -657,16 +714,116 @@ def cmd_policy(db, args):
 
 
 def cmd_export(db, args):
-    """Write the held matches as JSON lines, oldest first."""
-    count = 0
+    """Write the held matches as JSON lines, oldest first. Records already passed on to the rankings server
+    and emptied here are not included: the rankings server keeps every match (ClickHouse collector_matches)."""
+    count = emptied = 0
     sql, values = "SELECT payload FROM games", []
     if args.platform:
         sql, values = sql + " WHERE platform = ?", [args.platform]
     with gzip.open(args.out, "wt", encoding="ascii") as out:
         for (payload,) in db.execute(sql + " ORDER BY created_ms", values):
+            if not payload:
+                emptied += 1
+                continue
             out.write(zlib.decompress(payload).decode() + "\n")
             count += 1
-    print("Wrote %d matches to %s" % (count, args.out))
+    print("Wrote %d matches to %s" % (count, args.out) +
+          (" (%d more are held only by the rankings server)" % emptied if emptied else ""))
+
+
+def relay_export(db, limit, out, now):
+    """Write the next `limit` matches waiting for the rankings server, oldest first, one JSON object a line.
+    Nothing is taken off the queue here: that waits for the rankings server's `ack`."""
+    rows = db.execute("SELECT o.seq, o.platform, o.game_id, g.created_ms, g.received_at, g.contributor_id, g.payload "
+                      "FROM outbox o JOIN games g ON g.platform = o.platform AND g.game_id = o.game_id "
+                      "ORDER BY o.seq LIMIT ?", (limit,))
+    count = 0
+    for seq, platform, game_id, created, received, contributor, payload in rows:
+        if not payload:
+            raise RuntimeError("queued match %s %s has no record" % (platform, game_id))
+        out.write(json.dumps({"seq": seq, "platform": platform, "game_id": game_id, "created_ms": created,
+                              "received_at": received, "contributor": contributor,
+                              "payload": base64.b64encode(payload).decode("ascii")}) + "\n")
+        count += 1
+    with db:
+        db.execute("INSERT OR REPLACE INTO settings VALUES('relay_export_at', ?)", (str(now),))
+    return count
+
+
+def relay_ack(db, seqs, now):
+    """The rankings server holds these matches (it checked them after storing them). Take them off the queue,
+    then empty the records confirmed more than KEEP_SHIPPED_DAYS ago. Returns (taken off, emptied)."""
+    taken = 0
+    db.execute("BEGIN IMMEDIATE")
+    with db:
+        for start in range(0, len(seqs), 500):
+            chunk = seqs[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            keys = db.execute("SELECT platform, game_id FROM outbox WHERE seq IN (%s)" % marks, chunk).fetchall()
+            db.executemany("INSERT OR REPLACE INTO shipped VALUES(?, ?, ?)", [key + (now,) for key in keys])
+            taken += db.execute("DELETE FROM outbox WHERE seq IN (%s)" % marks, chunk).rowcount
+        if seqs:
+            # Queued matches whose record was purged since (see `purge`) can never be sent; drop them too.
+            db.execute("DELETE FROM outbox WHERE seq <= ? AND NOT EXISTS (SELECT 1 FROM games g "
+                       "WHERE g.platform = outbox.platform AND g.game_id = outbox.game_id)", (max(seqs),))
+        db.execute("INSERT OR REPLACE INTO settings VALUES('relay_ack_at', ?)", (str(now),))
+    emptied = 0
+    while True:
+        db.execute("BEGIN IMMEDIATE")   # in small steps, so uploads never wait long
+        with db:
+            keys = db.execute("SELECT platform, game_id FROM shipped WHERE shipped_at < ? LIMIT 2000",
+                              (now - KEEP_SHIPPED_DAYS * 86400,)).fetchall()
+            db.executemany("UPDATE games SET payload = x'' WHERE platform = ? AND game_id = ?", keys)
+            db.executemany("DELETE FROM shipped WHERE platform = ? AND game_id = ?", keys)
+        emptied += len(keys)
+        if len(keys) < 2000:
+            return taken, emptied
+
+
+def relay_status(db, now):
+    """How the relay and the collectors are doing, for the health check."""
+    values = dict(db.execute("SELECT name, value FROM settings WHERE name LIKE 'relay_%'"))
+    first = db.execute("SELECT g.received_at FROM outbox o JOIN games g ON g.platform = o.platform "
+                       "AND g.game_id = o.game_id ORDER BY o.seq LIMIT 1").fetchone()
+    platforms = {}
+    for platform, held, newest in db.execute("SELECT platform, COUNT(*), MAX(received_at) FROM games GROUP BY platform"):
+        hourly = [0] * 24
+        for hours_ago, count in db.execute(
+                "SELECT (? - received_at) / 3600, COUNT(*) FROM games WHERE received_at > ? AND platform = ? "
+                "GROUP BY 1", (now, now - 86400, platform)):
+            hourly[min(23, int(hours_ago))] += count
+        senders = [db.execute("SELECT COUNT(DISTINCT contributor_id) FROM games WHERE received_at > ? AND platform = ?",
+                              (now - seconds, platform)).fetchone()[0] for seconds in (3600, 86400)]
+        platforms[platform] = {"held": held, "last_received_at": newest, "hourly_newest_first": hourly,
+                               "senders_last_hour": senders[0], "senders_last_day": senders[1]}
+    return {"now": now, "waiting": db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],
+            "oldest_waiting_received_at": first[0] if first else None,
+            "last_export_at": int(values["relay_export_at"]) if "relay_export_at" in values else None,
+            "last_ack_at": int(values["relay_ack_at"]) if "relay_ack_at" in values else None,
+            "uploads_paused": backlog_full(db), "platforms": platforms}
+
+
+def cmd_relay(db, args):
+    """The rankings server pulls matches with this, over SSH, using a key that may run nothing else
+    (see server/README.md). The request is the arguments, or else SSH_ORIGINAL_COMMAND:
+      export N   the next N matches waiting (at most RELAY_BATCH), oldest first, one JSON object a line
+      ack        standard input is {"seqs": [...]}: those matches are safely held by the rankings server
+      status     how the relay and the collectors are doing, as JSON
+    """
+    words = args.request or os.environ.get("SSH_ORIGINAL_COMMAND", "").split()
+    now = int(clock())
+    if len(words) == 2 and words[0] == "export" and words[1].isdigit() and 1 <= int(words[1]) <= RELAY_BATCH:
+        relay_export(db, int(words[1]), sys.stdout, now)
+    elif words == ["ack"]:
+        seqs = json.loads(sys.stdin.read(10 * 1024 * 1024)).get("seqs")
+        if not isinstance(seqs, list) or len(seqs) > RELAY_BATCH or not all(is_int(seq, 1, 2 ** 62) for seq in seqs):
+            raise ValueError("ack expects {\"seqs\": [up to %d numbers]}" % RELAY_BATCH)
+        taken, emptied = relay_ack(db, sorted(set(seqs)), now)
+        print(json.dumps({"taken": taken, "emptied": emptied}))
+    elif words == ["status"]:
+        print(json.dumps(relay_status(db, now)))
+    else:
+        raise ValueError("relay expects: export N | ack | status")
 
 
 def main(argv=None):
@@ -690,6 +847,8 @@ def main(argv=None):
                                help="whether new installs can get their own key automatically")
     policy_parser.add_argument("--season-start", metavar="YYYY-MM-DD",
                                help="nothing from before this UTC date is asked for or kept")
+    relay_parser = commands.add_parser("relay", help="for the rankings server's SSH key: export N | ack | status")
+    relay_parser.add_argument("request", nargs="*")
     export_parser = commands.add_parser("export", help="write the held matches to a .jsonl.gz file")
     export_parser.add_argument("out")
     export_parser.add_argument("--platform", help="only this server's matches, for example OC1")
@@ -700,7 +859,7 @@ def main(argv=None):
         return 0
     db = connect()
     handlers = {"add-key": cmd_add_key, "keys": cmd_keys, "purge": cmd_purge, "stats": cmd_stats,
-                "policy": cmd_policy, "export": cmd_export,
+                "policy": cmd_policy, "export": cmd_export, "relay": cmd_relay,
                 "disable-key": lambda d, a: cmd_set_key(d, a, 1), "enable-key": lambda d, a: cmd_set_key(d, a, 0)}
     try:
         handlers[args.command](db, args)

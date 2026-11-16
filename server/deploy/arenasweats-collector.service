@@ -7,7 +7,7 @@ User=admin-website-vps1
 Group=admin-website-vps1
 WorkingDirectory=/home/admin-website-vps1/arenasweats-collector/server
 Environment=INGEST_DB=/home/admin-website-vps1/arenasweats-collector-data/ingest.db
-ExecStart=/home/admin-website-vps1/arenasweats-collector-venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8870 --timeout 60 ingest:app
+ExecStart=/home/admin-website-vps1/arenasweats-collector-venv/bin/gunicorn --workers 4 --bind 127.0.0.1:8870 --timeout 60 ingest:app
 Restart=always
 RestartSec=5
 # Fenced in so it can never take memory or CPU from the website.

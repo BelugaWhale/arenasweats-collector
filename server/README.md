@@ -8,8 +8,8 @@ Live at `https://arenasweats.lol/collector/` on the website server.
 ## How it works
 
 - **Collectors are trusted.** Each install has its own key, which it gets from
-  `POST /v1/register` the first time it runs (at most 3 a day per internet address and 500 a
-  day in all; `policy --signups off` closes sign-ups). Keys can also be made by hand with
+  `POST /v1/register` the first time it runs (at most 10 a day per internet address, as many homes
+  in China share one, and 500 a day in all; `policy --signups off` closes sign-ups). Keys can also be made by hand with
   `add-key`. The first copy of a match is kept and the match is never asked for again. There
   is no second opinion.
 - **No match is fetched twice.** A collector reports which Arena matches it saw in a
@@ -58,6 +58,9 @@ Trust covers what a match says, not its size or shape:
 - The key is checked before the body is read. Keys are stored only as hashes.
 - Limits: 2 MB per request (4 MB after decompression), 50 matches per upload, 300 KB per
   match, 60 requests a minute and 60,000 matches a day per key.
+- Uploads wait (503, collectors keep their matches and retry) while more than 300,000 matches are
+  waiting for the rankings server or the disk has less than 5 GB free, so a stalled relay or a
+  flood cannot fill the disk the website uses.
 - Every match must be an Arena record with sane ids, times and participant lists. Others
   are refused with a reason; the collector keeps them and offers them again on its next run.
 - `disable-key` stops a contributor. `purge` deletes everything they sent and puts those
@@ -85,7 +88,8 @@ python server/ingest.py policy --off          # every collector pauses within 10
 python server/ingest.py policy --signups off  # new installs can no longer get a key
 python server/ingest.py policy --on --delay 3 --message "thanks!"
 python server/ingest.py stats                 # per server: matches held, still to fetch, players to read
-python server/ingest.py export out.jsonl.gz --platform HN1
+python server/ingest.py export out.jsonl.gz --platform HN1   # records still held here
+python server/ingest.py relay status          # what is waiting for the rankings server, uploads per hour
 python server/ingest.py serve                 # development only
 ```
 
@@ -114,20 +118,34 @@ export INGEST_DB=~/arenasweats-collector-data/ingest.db
 ~/arenasweats-collector-venv/bin/python ~/arenasweats-collector/server/ingest.py stats
 ```
 
-Updating: `git pull --ff-only` in `~/arenasweats-collector`, then `sudo systemctl restart arenasweats-collector`.
+Updating: `git pull --ff-only` in `~/arenasweats-collector`, then
+`sudo bash ~/arenasweats-collector/server/deploy/update.sh` (reinstalls the service and nginx files,
+restarts the service, reloads nginx, and puts the nginx files back if nginx rejects them).
 
 Collectors send to `https://arenasweats.lol/collector` unless their `config.json` says otherwise.
 
 The per-key request limit is counted per gunicorn worker, so the nginx limit is the real ceiling.
 
+## Relay to the rankings server
+
+This server is only a buffer. The rankings server (Eagle) pulls every match from here and keeps it;
+its address is never given to collectors.
+
+- Every match received goes into the `outbox` table, filled by a trigger on `games` (the matches held
+  before the relay existed were queued once, when it was added).
+- Eagle logs in over SSH with a key that may only run `ingest.py relay` (the `command=`, `from=` and
+  `restrict` options on its line in `~/.ssh/authorized_keys`). It asks for `export N`, stores the
+  matches, reads them back to check them, then sends `ack` with their numbers. Only then do they
+  leave the queue. A match handed out but never confirmed is simply handed out again.
+- A confirmed match's record is emptied here 3 days later. The row in `games` stays (with an empty
+  record), so the match is still known, never asked for again, and duplicates are still recognised.
+- `relay status` gives what is waiting, the last pull and confirmation, and uploads per hour per
+  server, for the health check.
+
+The code on Eagle is `collector_ingest.py` in ArenaSweats-database.
+
 ## Size
 
-A real OCE match record is about 6 KB compressed (54 KB raw). At 100,000 matches a day
-that is about 600 MB a day in `games`, so records should be deleted once they have been turned into
-ArenaSweats' own format. That step does not exist yet.
-
-## Not built yet
-
-- Turning the held records (the client's format) into ArenaSweats' own match format and
-  feeding rankings.
-- Deleting held records after that.
+A real match record is about 6 KB compressed (54 KB raw). Records are emptied 3 days after Eagle
+confirmed them, so `games` holds about 3 days of records plus a small row per match ever received.
+The freed space is reused by SQLite; the file does not shrink.
