@@ -35,7 +35,7 @@ client like this are common. Decide for yourself whether you're comfortable runn
 ## What happens when you run it
 
 It sends the Arena matches it reads to ArenaSweats and keeps going until you close the
-window. The first time, it gets its own upload key from ArenaSweats and saves it in
+window. While it runs it keeps your PC from going to sleep; the screen can still turn off. The first time, it gets its own upload key from ArenaSweats and saves it in
 `config.json` next to the program.
 
 If it can't find League by itself, it asks you which folder League is installed in.

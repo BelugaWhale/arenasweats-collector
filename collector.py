@@ -23,6 +23,8 @@ WHAT IT NEVER DOES
     records, which Arena matches a player's list contains, and your own player
     id (the same id that is in your match records; a server with no players
     yet starts from it).
+  - It keeps the computer awake while it runs (the screen can still turn off),
+    and stops a click in its window from freezing it.
   - It needs no administrator rights and installs nothing. (When the League
     client runs as administrator, Windows hides where it is installed; the
     collector then looks in the usual places and, failing that, asks.)
@@ -54,7 +56,7 @@ import zipfile
 import zlib
 from collections import Counter
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
 KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
@@ -868,11 +870,14 @@ class Collector:
                   "the League client runs as administrator. Either tell the collector the folder below, or\n"
                   "close this window and start the collector with right-click > 'Run as administrator'.")
         print("To find the folder, right-click your League shortcut and choose 'Open file location'.")
+        set_quick_edit(True)            # so the folder can be pasted with a right-click
         try:
             folder = given_folder(input("Paste the folder where League is installed and press Enter: "))
         except EOFError:
             self.folder_asks = 3
             return
+        finally:
+            set_quick_edit(False)
         if folder and existing_lockfiles(([folder], 2)):
             log.info("folder given: %s", folder)
             self.opts.league_dir = folder
@@ -1383,6 +1388,37 @@ def save_config(**values):
         log.info("could not save config.json: %s", error)
 
 
+def set_quick_edit(on):
+    """Clicking in a console window normally freezes the program until Enter is pressed
+    (Windows' "QuickEdit" selection). It is off while collecting, so a stray click cannot
+    stop collection, and on only while the user is asked to paste something."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32")
+        k32.GetStdHandle.restype = ctypes.c_void_p
+        handle = ctypes.c_void_p(k32.GetStdHandle(-10))        # the console's input
+        mode = ctypes.c_uint32()
+        if handle.value and k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            mode = (mode.value | 0x0040) if on else (mode.value & ~0x0040)    # 0x40 = QuickEdit
+            k32.SetConsoleMode(handle, mode | 0x0080)                         # 0x80 = apply it
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+def keep_awake():
+    """Keep the computer from going to sleep while this program runs (the screen can still
+    turn off). Windows lifts this by itself when the program closes."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.WinDLL("kernel32").SetThreadExecutionState(0x80000000 | 0x00000001)   # continuous, system needed
+    except (OSError, AttributeError):
+        pass
+
+
 def lock_single_instance():
     """Refuse to start twice: two copies would double the request rate."""
     handle = open(os.path.join(tempfile.gettempdir(), "arenasweats-collector.lock"), "w")
@@ -1474,6 +1510,8 @@ def main(argv=None):
         else:
             print("It sends the Arena matches it reads to ArenaSweats%s. Close this window to stop."
                   % (", for up to %g min" % opts.minutes if opts.minutes else ""))
+        set_quick_edit(False)
+        keep_awake()
         made = Collector(opts, data_dir, server)
         made.run()
     except KeyboardInterrupt:

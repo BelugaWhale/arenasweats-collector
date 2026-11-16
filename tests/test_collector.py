@@ -413,6 +413,11 @@ class Lockfile(unittest.TestCase):
         for bad in (None, "", "--app-port=50123", "--remoting-auth-token=abc", "--app-port=99999 --remoting-auth-token=a"):
             self.assertIsNone(collector.login_from_command_line(bad), bad)
 
+    def test_console_and_sleep_settings_never_fail(self):
+        for on in (False, True):
+            collector.set_quick_edit(on)      # no console here: must quietly do nothing
+        collector.keep_awake()
+
     @unittest.skipUnless(os.name == "nt", "asks Windows about a running program")
     def test_windows_gives_a_programs_path_and_command_line(self):
         import subprocess
