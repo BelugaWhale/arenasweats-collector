@@ -796,7 +796,9 @@ def relay_status(db, now):
                               (now - seconds, platform)).fetchone()[0] for seconds in (3600, 86400)]
         platforms[platform] = {"held": held, "last_received_at": newest, "hourly_newest_first": hourly,
                                "senders_last_hour": senders[0], "senders_last_day": senders[1]}
-    return {"now": now, "waiting": db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],
+    policy = get_policy(db)
+    return {"now": now, "season_start": policy["season_start"], "collecting": policy["enabled"],
+            "signups": signups_open(db), "waiting": db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],
             "oldest_waiting_received_at": first[0] if first else None,
             "last_export_at": int(values["relay_export_at"]) if "relay_export_at" in values else None,
             "last_ack_at": int(values["relay_ack_at"]) if "relay_ack_at" in values else None,

@@ -180,6 +180,7 @@ class Relay(ServerCase):
         self.post(self.games)
         status = json.loads(self.relay("status"))
         self.assertEqual((status["waiting"], status["platforms"]["OC1"]["held"]), (12, 12))
+        self.assertEqual(status["season_start"], self.season)
         self.assertEqual(status["platforms"]["OC1"]["hourly_newest_first"][0], 12)
 
     def test_unknown_requests_are_refused(self):
