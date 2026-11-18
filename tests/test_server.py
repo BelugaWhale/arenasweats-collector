@@ -37,6 +37,7 @@ class ServerCase(unittest.TestCase):
         os.environ["INGEST_DB"] = os.path.join(self.tmp.name, "ingest.db")
         self.addCleanup(os.environ.pop, "INGEST_DB", None)
         ingest.recent.clear()
+        ingest.seen_written.clear()
         self.now = time.time()                       # the server's clock, moved by hand in these tests
         ingest.clock = lambda: self.now
         self.addCleanup(setattr, ingest, "clock", time.time)
@@ -104,6 +105,18 @@ class ServerCase(unittest.TestCase):
 
 
 class Keys(ServerCase):
+    def test_last_seen_and_state_are_kept(self):
+        headers = {"Authorization": "Bearer " + self.key, "X-Collector-State": "paused",
+                   "User-Agent": "arenasweats-collector/0.3.2"}
+        self.assertEqual(self.client.get("/v1/policy", headers=headers).status_code, 200)
+        self.assertEqual(self.db.execute("SELECT state, version FROM contributor_seen").fetchone(), ("paused", "0.3.2"))
+        self.assertIn("paused", self.admin("keys"))
+        headers["X-Collector-State"] = "<script>"
+        self.now += 120
+        self.client.get("/v1/policy", headers=headers)
+        self.assertEqual(self.db.execute("SELECT state FROM contributor_seen").fetchone()[0], "unknown")
+        self.assertEqual(ingest.relay_status(self.db, self.now)["installs_seen"]["last_hour"], {"unknown": 1})
+
     def test_no_key_or_wrong_key_is_refused(self):
         self.assertEqual(self.client.post("/v1/games", data=b"{}").status_code, 401)
         self.assertEqual(self.client.post("/v1/work", data=b"{}").status_code, 401)
@@ -641,6 +654,7 @@ class WithServer(CollectorCase):
         os.environ["INGEST_DB"] = os.path.join(self.tmp.name, "ingest.db")
         self.addCleanup(os.environ.pop, "INGEST_DB", None)
         ingest.recent.clear()
+        ingest.seen_written.clear()
         ingest.clock = lambda: self.real_start + self.clock.now()         # the server lives in the same pretend time
         self.addCleanup(setattr, ingest, "clock", time.time)
         self.db = ingest.connect()
@@ -669,6 +683,18 @@ class WithServer(CollectorCase):
 
 
 class EndToEnd(WithServer):
+    def test_a_paused_collector_still_checks_in(self):
+        states = []
+        original = ingest.note_seen
+        def record(db, contributor, now):
+            states.append(ingest.request.headers.get("X-Collector-State"))
+            return original(db, contributor, now)
+        ingest.note_seen = record
+        self.addCleanup(setattr, ingest, "note_seen", original)
+        self.fake.phase = "InProgress"                     # in a game for the whole run
+        self.run_collector(minutes=25, server=self.server())
+        self.assertGreaterEqual(states.count("paused"), 2)  # every 10 minutes while paused
+
     def test_a_new_install_signs_up_and_uploads(self):
         saved = {}
         self.addCleanup(setattr, collector, "save_config", collector.save_config)

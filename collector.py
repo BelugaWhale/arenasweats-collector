@@ -56,7 +56,7 @@ import zipfile
 import zlib
 from collections import Counter
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
 KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
@@ -709,11 +709,13 @@ class Server:
         if not (self.url.startswith("https://") or local_test):
             raise Fatal("The upload address must start with https://")
         self.key = key or None      # None until this install has signed up (Collector.sign_up)
+        self.state = "collecting"   # what this collector is doing, sent with every request
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def call(self, method, path, payload=None):
         """Returns (status, parsed JSON or None, seconds the server asked us to wait). Status 0 = unreachable."""
-        headers = {"Accept": "application/json", "User-Agent": "arenasweats-collector/" + VERSION}
+        headers = {"Accept": "application/json", "User-Agent": "arenasweats-collector/" + VERSION,
+                   "X-Collector-State": self.state}
         if self.key:
             headers["Authorization"] = "Bearer " + self.key
         body = None
@@ -843,6 +845,7 @@ class Collector:
                     continue
             else:
                 self.say("Waiting for the League client. Open it and log in.", once=True)
+            self.heartbeat("waiting_for_client" if not running else "client_unreachable")
             self.sleep(10)
 
     def try_client(self, where, make):
@@ -1105,6 +1108,7 @@ class Collector:
                     else:
                         self.say("Paused: the League client is not ready yet (status %s)." % status)
                     self.hand_in()      # so nothing that is ready waits through the game
+                self.heartbeat("paused")
             self.sleep(5)
 
     def hand_in(self):
@@ -1131,6 +1135,8 @@ class Collector:
         """One match-history request: paced, and only while collecting is allowed. None on failure."""
         while True:                     # wait out the pace, looking at the client at least every 5 seconds
             self.sleep(min(5.0, self.next_allowed - self.now()))
+            if self.failures:
+                self.heartbeat("client_failing")
             self.gate()
             if self.work_deadline is not None and self.now() > self.work_deadline:
                 raise WorkExpired()
@@ -1257,6 +1263,16 @@ class Collector:
             log.info("sign-up answered %s", status)
             self.say("Cannot reach ArenaSweats yet. Trying again in a minute.", once=True)
             self.sleep(max(60, wait))
+
+    def heartbeat(self, state):
+        """While it waits, still tell ArenaSweats every 10 minutes what it is doing, so a paused
+        collector looks different from one that was closed."""
+        if self.server and self.server.key and self.now() - self.policy_at >= POLICY_SECONDS:
+            self.server.state = state
+            try:
+                self.refresh_policy()
+            finally:
+                self.server.state = "collecting"
 
     def refresh_policy(self, first=False):
         self.policy_at = self.now()

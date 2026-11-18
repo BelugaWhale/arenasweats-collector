@@ -77,6 +77,9 @@ PUUID_RE = re.compile(r"[0-9A-Za-z_-]{20,100}")
 SCHEMA = """
 -- Sign-ups of the last day, for the daily limits. The address is stored only as a hash.
 CREATE TABLE IF NOT EXISTS signups(at INTEGER NOT NULL, address TEXT NOT NULL);
+-- When each install last got in touch, and what it said it was doing (collecting, paused, ...).
+CREATE TABLE IF NOT EXISTS contributor_seen(
+    contributor_id INTEGER PRIMARY KEY, seen_at INTEGER NOT NULL, state TEXT NOT NULL, version TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS contributors(
     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, key_hash TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0);
@@ -273,6 +276,23 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_BODY     # larger bodies are refused before being read
 recent = defaultdict(deque)                     # contributor id -> times of recent requests
 recent_lock = threading.Lock()
+seen_written = {}                               # (contributor id, state) -> when this worker last stored it
+SEEN_EVERY = 60                                 # store a contributor's "last seen" at most this often per state
+
+
+def note_seen(db, contributor, now):
+    """Remember when an install last got in touch and what it said it was doing, for health checks."""
+    state = request.headers.get("X-Collector-State", "")
+    state = state if re.fullmatch(r"[a-z_]{1,24}", state) else "unknown"
+    agent = request.headers.get("User-Agent", "")
+    version = agent.split("/", 1)[1] if agent.startswith("arenasweats-collector/") else ""
+    version = version if re.fullmatch(r"[0-9A-Za-z.+-]{1,20}", version) else ""
+    with recent_lock:
+        if now - seen_written.get((contributor, state), 0) < SEEN_EVERY:
+            return
+        seen_written[(contributor, state)] = now
+    with db:
+        db.execute("INSERT OR REPLACE INTO contributor_seen VALUES(?, ?, ?, ?)", (contributor, int(now), state, version))
 
 
 def fail(status, message, **headers):
@@ -307,6 +327,7 @@ def check_key():
         if len(times) >= REQUESTS_PER_MINUTE:
             return fail(429, "too many requests", **{"Retry-After": "60"})
         times.append(now)
+    note_seen(g.db, row[0], now)
     return None
 
 
@@ -641,12 +662,13 @@ def cmd_set_key(db, args, disabled):
 
 def cmd_keys(db, _args):
     rows = db.execute("""
-        SELECT c.name, c.disabled, COUNT(m.game_id), MAX(m.received_at) FROM contributors c
-        LEFT JOIN games m ON m.contributor_id = c.id GROUP BY c.id ORDER BY c.name""").fetchall()
-    for name, disabled, count, last in rows:
-        print("%-24s %-4s %8d matches   last upload: %s" % (
-            name, "OFF" if disabled else "on", count,
-            time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "never"))
+        SELECT c.name, c.disabled, COUNT(m.game_id), MAX(m.received_at), s.seen_at, s.state, s.version
+        FROM contributors c LEFT JOIN games m ON m.contributor_id = c.id
+        LEFT JOIN contributor_seen s ON s.contributor_id = c.id GROUP BY c.id ORDER BY c.name""").fetchall()
+    when = lambda moment: time.strftime("%Y-%m-%d %H:%M", time.localtime(moment)) if moment else "never"
+    for name, disabled, count, last, seen, state, version in rows:
+        print("%-24s %-4s %8d matches   last upload: %-16s   last seen: %-16s %s %s" % (
+            name, "OFF" if disabled else "on", count, when(last), when(seen), state or "", version or ""))
 
 
 def cmd_purge(db, args):
@@ -802,7 +824,10 @@ def relay_status(db, now):
             "oldest_waiting_received_at": first[0] if first else None,
             "last_export_at": int(values["relay_export_at"]) if "relay_export_at" in values else None,
             "last_ack_at": int(values["relay_ack_at"]) if "relay_ack_at" in values else None,
-            "uploads_paused": backlog_full(db), "platforms": platforms}
+            "uploads_paused": backlog_full(db), "platforms": platforms,
+            "installs_seen": {label: dict(db.execute(
+                "SELECT state, COUNT(*) FROM contributor_seen WHERE seen_at > ? GROUP BY state", (now - seconds,)))
+                for label, seconds in (("last_hour", 3600), ("last_day", 86400))}}
 
 
 def cmd_relay(db, args):

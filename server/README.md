@@ -66,6 +66,17 @@ Trust covers what a match says, not its size or shape:
 - `disable-key` stops a contributor. `purge` deletes everything they sent and puts those
   matches back on the wanted list, so other collectors fetch them again.
 
+## Download and last seen
+
+- `https://arenasweats.lol/collector/download/ArenaSweatsCollector.exe` serves the newest release
+  straight from the web server (GitHub downloads are unreliable in China). `deploy/fetch_download.sh`
+  keeps it equal to the newest GitHub release, checking the release's SHA-256, from the normal
+  user's cron every 30 minutes.
+- Every request records when that install was last seen and what it was doing
+  (`X-Collector-State`: collecting, paused, waiting_for_client, client_unreachable, client_failing).
+  Collectors check in every 10 minutes even while paused. `ingest.py keys` shows it, and
+  `relay status` reports installs seen in the last hour and day by state.
+
 ## Endpoints
 
 | | |
