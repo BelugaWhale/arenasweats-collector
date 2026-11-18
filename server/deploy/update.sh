@@ -17,12 +17,13 @@ for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:8870/healthz >/dev/null 2>&1
 curl -fsS http://127.0.0.1:8870/healthz >/dev/null && echo "collector service: running ($(systemctl show -p NRestarts --value arenasweats-collector) restarts)"
 
 backup="$(mktemp -d /var/backups/nginx-arenasweats-collector-XXXXXX)"
-cp -p "$zone" "$location" "$backup/"
+cp -p "$zone" "$backup/zone.conf"          # both files are named arenasweats-collector.conf
+cp -p "$location" "$backup/location.conf"
 install -m 0644 "$here/nginx-zone.conf" "$zone"
 install -m 0644 "$here/nginx-location.conf" "$location"
 if ! nginx -t; then
-  cp -p "$backup/$(basename "$zone")" "$zone"
-  cp -p "$backup/$(basename "$location")" "$location"
+  cp -p "$backup/zone.conf" "$zone"
+  cp -p "$backup/location.conf" "$location"
   echo "nginx rejected the new files; the old ones were put back (copies in $backup)"
   exit 1
 fi
