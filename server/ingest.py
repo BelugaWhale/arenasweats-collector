@@ -72,6 +72,13 @@ MORE_PAGES = 3                   # ... then three pages at a time, for as long a
                                  # when no fresher work is waiting, so nothing is missed in the end.
 MAX_INDEX = 1000                 # never further back than this many matches
 
+# ---- event games the rankings server is waiting for (see relay `urgent`): handed out before anything else
+URGENT_GAME_SECONDS = 300        # such a match not held yet is handed out again this often (it may not have ended)
+URGENT_LIST_SECONDS = 600        # and each of its players' lists is read from the top again this often
+URGENT_KEEP_SECONDS = 3600       # the rankings server sends its list every minute; one it stops sending lapses
+MAX_URGENT = 1000                # matches in one list
+MAX_URGENT_PLAYERS = 18          # players named for one match
+
 PLATFORM_RE = re.compile(r"[A-Z0-9_]{2,12}")
 PUUID_RE = re.compile(r"[0-9A-Za-z_-]{20,100}")
 
@@ -130,6 +137,17 @@ CREATE TABLE IF NOT EXISTS outbox(seq INTEGER PRIMARY KEY AUTOINCREMENT, platfor
 CREATE TABLE IF NOT EXISTS shipped(
     platform TEXT NOT NULL, game_id INTEGER NOT NULL, shipped_at INTEGER NOT NULL, PRIMARY KEY(platform, game_id));
 CREATE INDEX IF NOT EXISTS shipped_by_time ON shipped(shipped_at);
+-- ArenaSweats Events games the rankings server is waiting for, and their players. Only the rankings server's relay
+-- key sets them (relay `urgent`, which replaces the whole list); collectors cannot.
+CREATE TABLE IF NOT EXISTS urgent_games(
+    platform TEXT NOT NULL, game_id INTEGER NOT NULL,
+    until INTEGER NOT NULL,                    -- asked for until then, unless the rankings server asks again
+    handed_at INTEGER NOT NULL DEFAULT 0,      -- last handed out to a collector
+    PRIMARY KEY(platform, game_id));
+CREATE TABLE IF NOT EXISTS urgent_players(
+    platform TEXT NOT NULL, game_id INTEGER NOT NULL, puuid TEXT NOT NULL,
+    handed_at INTEGER NOT NULL DEFAULT 0,      -- their list was last handed out to be read from the top
+    PRIMARY KEY(platform, game_id, puuid));
 """
 
 
@@ -520,6 +538,17 @@ def work():
             db.execute("INSERT OR IGNORE INTO players(platform, puuid, due_at) VALUES(?, ?, ?)", (platform, start, now))
 
         if more:
+            # 0. Event games the rankings server is waiting for (relay `urgent`) and not held yet, however many
+            #    tries they took: one may not have ended yet. Each goes out again after URGENT_GAME_SECONDS.
+            fetch = [game_id for (game_id,) in db.execute(
+                "SELECT u.game_id FROM urgent_games u WHERE u.platform = ? AND u.until > ? AND u.handed_at <= ? "
+                "AND NOT EXISTS (SELECT 1 FROM games g WHERE g.platform = u.platform AND g.game_id = u.game_id) "
+                "ORDER BY u.handed_at, u.game_id LIMIT ?", (platform, now, now - URGENT_GAME_SECONDS, GAMES_PER_ROUND))]
+            db.executemany("UPDATE urgent_games SET handed_at = ? WHERE platform = ? AND game_id = ?",
+                           [(now, platform, game_id) for game_id in fetch])
+            # (not handed out a second time from the wanted list, and not counted as one of its tries)
+            db.executemany("UPDATE wanted SET leased_until = ? WHERE platform = ? AND game_id = ?",
+                           [(now + LEASE_SECONDS, platform, game_id) for game_id in fetch])
             # 1. Matches known to exist but not held yet, newest first. One that nobody could fetch after
             #    GAME_TRIES tries is moved aside instead, so it is not asked for (or looked at) again.
             for _ in range(3):
@@ -527,13 +556,29 @@ def work():
                                   "ORDER BY game_id DESC LIMIT ?", (platform, now, GAMES_PER_ROUND - len(fetch)))
                 rows = rows.fetchall()
                 spent = [(platform, game_id) for game_id, tries in rows if tries >= GAME_TRIES]
-                fetch += [game_id for game_id, tries in rows if tries < GAME_TRIES]
+                taken = [game_id for game_id, tries in rows if tries < GAME_TRIES]
+                fetch += taken
+                # Leased at once, so the next look (after some were moved aside) does not take them again.
+                db.executemany("UPDATE wanted SET leased_until = ?, tries = tries + 1 WHERE platform = ? AND game_id = ?",
+                               [(now + LEASE_SECONDS, platform, game_id) for game_id in taken])
                 db.executemany("INSERT OR IGNORE INTO given_up VALUES(?, ?)", spent)
                 db.executemany("DELETE FROM wanted WHERE platform = ? AND game_id = ?", spent)
                 if not spent:
                     break
-            db.executemany("UPDATE wanted SET leased_until = ?, tries = tries + 1 WHERE platform = ? AND game_id = ?",
-                           [(now + LEASE_SECONDS, platform, game_id) for game_id in fetch])
+            # The lists of the players in those event games, from the top, ahead of every other list. Each goes
+            # out again after URGENT_LIST_SECONDS, whether its last read worked or not, until the game is held.
+            urgent = db.execute(
+                "SELECT p.puuid, p.read_to FROM urgent_players up "
+                "JOIN urgent_games u ON u.platform = up.platform AND u.game_id = up.game_id "
+                "JOIN players p ON p.platform = up.platform AND p.puuid = up.puuid "
+                "WHERE up.platform = ? AND u.until > ? AND up.handed_at <= ? AND p.leased_until < ? "
+                "AND NOT EXISTS (SELECT 1 FROM games g WHERE g.platform = u.platform AND g.game_id = u.game_id) "
+                "GROUP BY p.puuid ORDER BY MIN(up.handed_at), p.puuid LIMIT ?",
+                (platform, now, now - URGENT_LIST_SECONDS, now, max(PLAYERS_PER_ROUND - len(handed), 0))).fetchall()
+            for puuid, read_to in urgent:
+                hand(puuid, 0, 0, max(read_to, season), FIRST_PAGES)
+            db.executemany("UPDATE urgent_players SET handed_at = ? WHERE platform = ? AND puuid = ?",
+                           [(now, platform, puuid) for puuid, _ in urgent])
             # While there is a full load of matches to fetch, no new lists are started: finding more
             # matches would only lengthen the queue.
             room = PLAYERS_PER_ROUND - len(handed) if len(fetch) < GAMES_PER_ROUND else 0
@@ -711,6 +756,9 @@ def cmd_stats(db, _args):
         relay["waiting"], *(time.strftime("%Y-%m-%d %H:%M", time.localtime(relay[name])) if relay[name] else "never"
                             for name in ("last_export_at", "last_ack_at")),
         "; UPLOADS PAUSED: " + relay["uploads_paused"] if relay["uploads_paused"] else ""))
+    print("Event games asked for first: %d not received yet; list last sent %s" % (
+        relay["urgent_not_held"], time.strftime("%Y-%m-%d %H:%M", time.localtime(relay["last_urgent_at"]))
+        if relay["last_urgent_at"] else "never"))
     rules = get_policy(db)
     print("Policy: %s, season starts %s UTC" % (
         {name: rules[name] for name in ("enabled", "delay", "message")},
@@ -802,6 +850,36 @@ def relay_ack(db, seqs, now):
             return taken, emptied
 
 
+def valid_urgent(game):
+    return (isinstance(game, dict) and isinstance(game.get("platform"), str) and PLATFORM_RE.fullmatch(game["platform"])
+            and is_int(game.get("game_id"), 1, 2 ** 53) and isinstance(game.get("players"), list)
+            and len(game["players"]) <= MAX_URGENT_PLAYERS
+            and all(isinstance(puuid, str) and PUUID_RE.fullmatch(puuid) and puuid.strip("0-") for puuid in game["players"]))
+
+
+def relay_urgent(db, games, now):
+    """The rankings server's list of ArenaSweats Events games it is waiting for, with their players. It replaces the
+    last list. Until a game is held here it is handed out before any other match, and its players' lists before any
+    other list (see `work`). Returns (matches, players) on the list."""
+    keys = {(game["platform"], game["game_id"]) for game in games}
+    players = {(game["platform"], game["game_id"], puuid) for game in games for puuid in game["players"]}
+    db.execute("BEGIN IMMEDIATE")
+    with db:
+        # Matches and players still on the list keep when they were last handed out.
+        db.executemany("DELETE FROM urgent_games WHERE platform = ? AND game_id = ?",
+                       set(db.execute("SELECT platform, game_id FROM urgent_games")) - keys)
+        db.executemany("DELETE FROM urgent_players WHERE platform = ? AND game_id = ? AND puuid = ?",
+                       set(db.execute("SELECT platform, game_id, puuid FROM urgent_players")) - players)
+        db.executemany("INSERT INTO urgent_games(platform, game_id, until) VALUES(?, ?, ?) "
+                       "ON CONFLICT(platform, game_id) DO UPDATE SET until = excluded.until",
+                       [key + (now + URGENT_KEEP_SECONDS,) for key in sorted(keys)])
+        db.executemany("INSERT OR IGNORE INTO urgent_players(platform, game_id, puuid) VALUES(?, ?, ?)", sorted(players))
+        db.executemany("INSERT OR IGNORE INTO players(platform, puuid, due_at) VALUES(?, ?, ?)",
+                       sorted({(platform, puuid, now) for platform, _, puuid in players}))
+        db.execute("INSERT OR REPLACE INTO settings VALUES('relay_urgent_at', ?)", (str(now),))
+    return len(keys), len(players)
+
+
 def relay_status(db, now):
     """How the relay and the collectors are doing, for the health check."""
     values = dict(db.execute("SELECT name, value FROM settings WHERE name LIKE 'relay_%'"))
@@ -824,6 +902,10 @@ def relay_status(db, now):
             "oldest_waiting_received_at": first[0] if first else None,
             "last_export_at": int(values["relay_export_at"]) if "relay_export_at" in values else None,
             "last_ack_at": int(values["relay_ack_at"]) if "relay_ack_at" in values else None,
+            "last_urgent_at": int(values["relay_urgent_at"]) if "relay_urgent_at" in values else None,
+            "urgent_not_held": db.execute(
+                "SELECT COUNT(*) FROM urgent_games u WHERE u.until > ? AND NOT EXISTS "
+                "(SELECT 1 FROM games g WHERE g.platform = u.platform AND g.game_id = u.game_id)", (now,)).fetchone()[0],
             "uploads_paused": backlog_full(db), "platforms": platforms,
             "installs_seen": {label: dict(db.execute(
                 "SELECT state, COUNT(*) FROM contributor_seen WHERE seen_at > ? GROUP BY state", (now - seconds,)))
@@ -836,6 +918,9 @@ def cmd_relay(db, args):
       export N   the next N matches waiting (at most RELAY_BATCH), oldest first, one JSON object a line
       ack        standard input is {"seqs": [...]}: those matches are safely held by the rankings server
       status     how the relay and the collectors are doing, as JSON
+      urgent     standard input is {"games": [{"platform", "game_id", "players": [PUUIDs]}, ...]}: the ArenaSweats
+                 Events games the rankings server is waiting for, replacing the last list; collectors are asked
+                 for them, and their players' lists, before anything else
     """
     words = args.request or os.environ.get("SSH_ORIGINAL_COMMAND", "").split()
     now = int(clock())
@@ -849,8 +934,16 @@ def cmd_relay(db, args):
         print(json.dumps({"taken": taken, "emptied": emptied}))
     elif words == ["status"]:
         print(json.dumps(relay_status(db, now)))
+    elif words == ["urgent"]:
+        body = json.loads(sys.stdin.read(10 * 1024 * 1024))
+        games = body.get("games") if isinstance(body, dict) else None
+        if not isinstance(games, list) or len(games) > MAX_URGENT or not all(valid_urgent(game) for game in games):
+            raise ValueError("urgent expects {\"games\": [up to %d {\"platform\", \"game_id\", \"players\": "
+                             "[up to %d PUUIDs]}]}" % (MAX_URGENT, MAX_URGENT_PLAYERS))
+        matches, players = relay_urgent(db, games, now)
+        print(json.dumps({"games": matches, "players": players}))
     else:
-        raise ValueError("relay expects: export N | ack | status")
+        raise ValueError("relay expects: export N | ack | status | urgent")
 
 
 def main(argv=None):
@@ -874,7 +967,7 @@ def main(argv=None):
                                help="whether new installs can get their own key automatically")
     policy_parser.add_argument("--season-start", metavar="YYYY-MM-DD",
                                help="nothing from before this UTC date is asked for or kept")
-    relay_parser = commands.add_parser("relay", help="for the rankings server's SSH key: export N | ack | status")
+    relay_parser = commands.add_parser("relay", help="for the rankings server's SSH key: export N | ack | status | urgent")
     relay_parser.add_argument("request", nargs="*")
     export_parser = commands.add_parser("export", help="write the held matches to a .jsonl.gz file")
     export_parser.add_argument("out")

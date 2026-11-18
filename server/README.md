@@ -23,6 +23,11 @@ Live at `https://arenasweats.lol/collector/` on the website server.
   changed with `policy --season-start`. Moving it earlier has every list read so far read
   again back to the new date, when there is room.
 - **Whose list to read next:**
+  0. ArenaSweats Events games that the rankings server is waiting for go out before anything
+     else, until they are held here, every 5 minutes (one may not have ended yet), however
+     many tries that takes. The lists of the players in them are read from the top before
+     any other list, each every 10 minutes, until the game is held. Only the rankings
+     server's relay key can name these games (`relay urgent`, below); collectors cannot.
   1. Matches on the wanted list go out first, newest first. While there is a full load of
      them, no new lists are started.
   2. Then the top of the lists that are most overdue. A player never read yet is due at
@@ -152,6 +157,11 @@ its address is never given to collectors.
   record), so the match is still known, never asked for again, and duplicates are still recognised.
 - `relay status` gives what is waiting, the last pull and confirmation, and uploads per hour per
   server, for the health check.
+- `relay urgent` takes `{"games": [{"platform", "game_id", "players": [PUUIDs]}]}` on standard input:
+  the ArenaSweats Events games Eagle is waiting for (they have a result deadline), each with the
+  players whose lists may show it. Each list replaces the last. Eagle sends it every minute, and a
+  list it stops sending lapses after an hour. `relay status` gives when it was last sent
+  (`last_urgent_at`) and how many of its games are not held yet (`urgent_not_held`).
 
 The code on Eagle is `collector_ingest.py` in ArenaSweats-database.
 

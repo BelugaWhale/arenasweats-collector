@@ -53,6 +53,13 @@ class ServerCase(unittest.TestCase):
     def add_key(self, name):
         return self.admin("add-key", name).split()[-1]
 
+    def relay(self, *request, stdin=None):
+        """The rankings server's relay command, as its SSH key runs it."""
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), unittest.mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
+            ingest.main(["relay", *request])
+        return output.getvalue()
+
     def admin(self, *args):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -140,12 +147,6 @@ class Keys(ServerCase):
 
 class Relay(ServerCase):
     # The relay empties records on this server: a bug here would lose collected matches for good.
-    def relay(self, *request, stdin=None):
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output), unittest.mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
-            ingest.main(["relay", *request])
-        return output.getvalue()
-
     def exported(self, limit=100):
         return [json.loads(line) for line in self.relay("export", str(limit)).splitlines()]
 
@@ -519,6 +520,13 @@ class Work(ServerCase):
         self.assertEqual((answer["games"], answer["players"], answer["policy"]["enabled"]), ([], [], False))
         self.assertEqual(self.count("wanted"), 1)
 
+    def test_a_match_given_up_on_does_not_send_the_others_twice(self):
+        self.work([self.report(self.PLAYER, [100, 200])], more=False)
+        self.db.execute("UPDATE wanted SET tries = ? WHERE game_id = 200", (ingest.GAME_TRIES,))
+        self.db.commit()
+        self.assertEqual(self.work()["games"], [100])
+        self.assertEqual(self.db.execute("SELECT tries FROM wanted WHERE game_id = 100").fetchone()[0], 1)
+
     def test_a_full_load_of_matches_means_no_more_lists(self):
         self.post(self.games)
         answer = self.work([self.report(self.PLAYER, list(range(5000, 5300)))])
@@ -542,6 +550,119 @@ class Work(ServerCase):
     def test_reading_cannot_be_marked_beyond_the_present(self):
         self.work([self.report(self.handed(self.PLAYER), [], read_to=2 ** 52)], more=False)
         self.assertLessEqual(self.player(self.PLAYER)[1], int(self.now * 1000))
+
+
+class Urgent(ServerCase):
+    """ArenaSweats Events games the rankings server is waiting for (relay `urgent`): they and their players' lists go
+    out before anything else until the match is held. Only the rankings server's relay key can name them."""
+
+    PLAYERS = ["11111111-2222-3333-4444-55555555555%d" % n for n in range(3)]
+
+    def setUp(self):
+        super().setUp()
+        # A full load of other matches to fetch, so no ordinary list goes out: only the urgent ones.
+        self.work([self.report("f" * 36, list(range(5000, 5300)))], more=False)
+
+    def urgent(self, *games, platform="OC1"):
+        """Send the rankings server's list: (game_id, players) pairs."""
+        body = {"games": [{"platform": platform, "game_id": game_id, "players": list(players)}
+                          for game_id, players in games]}
+        return self.relay("urgent", stdin=json.dumps(body))
+
+    def test_event_games_and_their_players_lists_go_out_first(self):
+        self.assertEqual(json.loads(self.urgent((424242, self.PLAYERS[:2]), (424243, []))), {"games": 2, "players": 2})
+        answer = self.work()
+        self.assertEqual(answer["games"][:2], [424242, 424243])
+        self.assertEqual(len(answer["games"]), ingest.GAMES_PER_ROUND)
+        self.assertEqual(len(set(answer["games"])), len(answer["games"]))
+        self.assertEqual(sorted(item["puuid"] for item in answer["players"]), self.PLAYERS[:2])
+        self.assertTrue(all(self.shape(item) == {"since": self.season, "begin": 0, "pages": 1}
+                            for item in answer["players"]))
+
+    def test_an_event_game_is_asked_for_again_until_it_arrives(self):
+        game_id = self.games[0]["gameId"]
+        self.urgent((game_id, self.PLAYERS[:1]))
+        handed = 0
+        for _ in range(ingest.GAME_TRIES + 3):                            # never given up on, unlike other matches
+            answer = self.work()
+            handed += answer["games"].count(game_id)
+            self.assertNotIn(game_id, self.work(key=self.add_key("bob%d" % handed))["games"])  # not twice at once
+            self.now += ingest.URGENT_GAME_SECONDS
+            self.urgent((game_id, self.PLAYERS[:1]))
+        self.assertEqual(handed, ingest.GAME_TRIES + 3)
+        self.post(self.games[:1])
+        self.now += ingest.URGENT_LIST_SECONDS
+        self.db.execute("UPDATE players SET due_at = ?", (int(self.now) + 86400,))   # no list is due otherwise
+        self.db.commit()
+        answer = self.work()
+        self.assertNotIn(game_id, answer["games"])                        # held: no longer urgent ...
+        self.assertIsNone(self.item(answer, self.PLAYERS[0]))             # ... nor its players' lists
+        self.assertEqual(json.loads(self.relay("status"))["urgent_not_held"], 0)
+
+    def test_players_lists_are_read_again_every_few_minutes_even_when_their_reads_fail(self):
+        self.urgent((424242, self.PLAYERS[:2]))
+        first = self.work()
+        self.work([self.report(self.item(first, self.PLAYERS[0]), [], complete=False),
+                   self.report(self.item(first, self.PLAYERS[1]), [])], more=False)
+        self.assertEqual(self.work()["players"], [])                      # read a moment ago
+        self.now += ingest.URGENT_LIST_SECONDS
+        again = self.work()
+        self.assertEqual(sorted(item["puuid"] for item in again["players"]), self.PLAYERS[:2])
+        self.work([self.report(self.item(again, self.PLAYERS[1]), [424242])], more=False)
+        self.assertIn(424242, [row[0] for row in self.db.execute("SELECT game_id FROM wanted")])
+
+    def test_each_list_replaces_the_last_and_one_not_sent_again_lapses(self):
+        self.urgent((424242, self.PLAYERS[:1]))
+        self.urgent((424243, self.PLAYERS[1:2]))
+        answer = self.work()
+        self.assertEqual((answer["games"][0], [item["puuid"] for item in answer["players"]]), (424243, self.PLAYERS[1:2]))
+        self.assertNotIn(424242, answer["games"])
+        self.urgent((424243, self.PLAYERS[1:2]))                          # sent again: not handed out again yet
+        self.assertNotIn(424243, self.work()["games"])
+        self.now += ingest.URGENT_KEEP_SECONDS
+        self.assertNotIn(424243, self.work()["games"])                    # not sent for an hour
+        self.urgent()
+        self.assertEqual(self.count("urgent_games") + self.count("urgent_players"), 0)
+
+    def test_a_wanted_or_given_up_event_game_goes_out_once_without_counting_tries(self):
+        self.work([self.report("p" * 36, [424242])], more=False)
+        self.db.execute("INSERT INTO given_up VALUES('OC1', 424243)")
+        self.db.commit()
+        tries = self.db.execute("SELECT tries FROM wanted WHERE game_id = 424242").fetchone()[0]
+        self.urgent((424242, []), (424243, []))
+        answer = self.work()
+        self.assertEqual((answer["games"].count(424242), answer["games"].count(424243)), (1, 1))
+        self.assertEqual(self.db.execute("SELECT tries FROM wanted WHERE game_id = 424242").fetchone()[0], tries)
+        self.assertNotIn(424242, self.work(key=self.add_key("bob"))["games"])   # nor from the wanted list meanwhile
+
+    def test_event_games_are_kept_apart_by_server(self):
+        self.urgent((424242, self.PLAYERS[:1]), platform="HN1")
+        self.assertNotIn(424242, self.work()["games"])
+        answer = self.send("/v1/work", {"platform": "HN1", "reports": []}).get_json()
+        self.assertEqual((answer["games"], [item["puuid"] for item in answer["players"]]), ([424242], self.PLAYERS[:1]))
+
+    def test_collectors_cannot_name_event_games(self):
+        games = [{"platform": "OC1", "game_id": 424242, "players": self.PLAYERS}]
+        self.work(urgent=games, games=games)
+        self.assertEqual(self.send("/v1/urgent", {"games": games}).status_code, 404)
+        self.assertEqual(self.count("urgent_games"), 0)
+
+    def test_bad_lists_are_refused_and_change_nothing(self):
+        self.urgent((424242, self.PLAYERS[:1]))
+        good = {"platform": "OC1", "game_id": 1, "players": []}
+        for body in ("not json", "[]", {"games": None}, {"games": [dict(good, game_id="1")]},
+                     {"games": [dict(good, platform="oc1")]}, {"games": [dict(good, game_id=0)]},
+                     {"games": [dict(good, players=["x"])]}, {"games": [dict(good, players=["0" * 36])]},
+                     {"games": [dict(good, players=self.PLAYERS * 7)]}, {"games": [good] * (ingest.MAX_URGENT + 1)}):
+            self.assertIn("Not understood", self.relay("urgent", stdin=body if isinstance(body, str) else json.dumps(body)))
+        self.assertEqual([row[0] for row in self.db.execute("SELECT game_id FROM urgent_games")], [424242])
+
+    def test_status_shows_the_list(self):
+        self.assertIsNone(json.loads(self.relay("status"))["last_urgent_at"])
+        self.urgent((424242, []))
+        status = json.loads(self.relay("status"))
+        self.assertEqual((status["last_urgent_at"], status["urgent_not_held"]), (int(self.now), 1))
+        self.assertIn("Event games asked for first: 1 not received yet", self.admin("stats"))
 
 
 class Limits(ServerCase):
@@ -726,6 +847,17 @@ class EndToEnd(WithServer):
         self.assertEqual([n for n in os.listdir(self.data_dir) if n.endswith(".zip")], [])   # not a test run
         stored = self.db.execute("SELECT payload FROM games LIMIT 1").fetchone()[0]
         self.assertEqual(len(json.loads(ingest.zlib.decompress(stored))["participants"]), 16)
+
+    def test_an_event_game_is_fetched_before_anything_else(self):
+        game_id = min(game for game in self.fake.arena_ids()
+                      if self.fake.me not in collector.player_ids(self.fake.games[game]))
+        players = [puuid for puuid in collector.player_ids(self.fake.games[game_id]) if puuid.strip("0-")][:3]
+        body = {"games": [{"platform": "OC1", "game_id": game_id, "players": players}]}
+        with contextlib.redirect_stdout(io.StringIO()), unittest.mock.patch.object(sys, "stdin", io.StringIO(json.dumps(body))):
+            ingest.main(["relay", "urgent"])
+        self.run_collector(minutes=5, server=self.server())
+        self.assertTrue(self.fetched()[0].endswith("/games/%d" % game_id))
+        self.assertIn(game_id, self.server_ids())
 
     def test_work_is_not_taken_on_while_playing_and_stale_work_is_dropped(self):
         """The review's case: work taken on just before a game must not be done after someone else redid it."""
