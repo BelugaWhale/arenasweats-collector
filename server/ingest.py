@@ -23,6 +23,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import sys
 import threading
@@ -408,8 +409,7 @@ def backlog_full(db):
     first, last = db.execute("SELECT MIN(seq), MAX(seq) FROM outbox").fetchone()
     if first is not None and last - first + 1 > MAX_BACKLOG:
         return "ArenaSweats is catching up; matches are kept and sent later"
-    disk = os.statvfs(os.path.dirname(os.path.abspath(db_path())))
-    if disk.f_bavail * disk.f_frsize < MIN_FREE_BYTES:
+    if shutil.disk_usage(os.path.dirname(os.path.abspath(db_path()))).free < MIN_FREE_BYTES:
         return "ArenaSweats is low on space; matches are kept and sent later"
     return None
 
