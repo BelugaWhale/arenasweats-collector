@@ -324,7 +324,7 @@ def fail(status, message, **headers):
 @app.before_request
 def check_key():
     """Every request except the health check needs a valid key. Runs before any body is read."""
-    if request.path in ("/healthz", "/check"):
+    if request.path in ("/healthz", "/check", "/latest", "/download/" + PROGRAM):
         return None
     if request.path == "/v1/register":       # a new install asking for its own key
         g.db = connect()
@@ -380,6 +380,37 @@ def read_body():
 
 
 CHECK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "client-check.ps1")
+PROGRAM = "ArenaSweatsCollector.exe"
+
+
+def downloads_dir():
+    """Where deploy/fetch_download.sh keeps the newest release (beside this repository's folder)."""
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.environ.get("COLLECTOR_DOWNLOADS") or os.path.join(os.path.dirname(repo), "arenasweats-collector-downloads")
+
+
+@app.get("/latest")
+def latest():
+    """The newest collector, for collectors that offer to update themselves at start."""
+    try:
+        with open(os.path.join(downloads_dir(), "latest.json"), encoding="utf-8") as handle:
+            info = json.load(handle)
+    except (OSError, ValueError):
+        return fail(404, "no release known")
+    return jsonify({"version": info.get("version"), "sha256": info.get("sha256"), "size": info.get("size"),
+                    "path": "/download/" + PROGRAM})
+
+
+@app.get("/download/" + PROGRAM)
+def download():
+    """The newest collector. In production nginx serves this file itself; this is the fallback."""
+    path = os.path.join(downloads_dir(), PROGRAM)
+    if not os.path.isfile(path):
+        return fail(404, "no release known")
+    with open(path, "rb") as handle:
+        body = handle.read()
+    return app.response_class(body, mimetype="application/octet-stream",
+                              headers={"Content-Disposition": 'attachment; filename="%s"' % PROGRAM})
 
 
 @app.get("/check")

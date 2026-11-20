@@ -38,6 +38,8 @@ It sends the Arena matches it reads to ArenaSweats and keeps going until you clo
 window. While it runs it keeps your PC from going to sleep; the screen can still turn off. The first time, it gets its own upload key from ArenaSweats and saves it in
 `config.json` next to the program.
 
+When a new version is out, it asks whether to update before it starts.
+
 If it can't find League by itself, it asks you which folder League is installed in.
 
 MIT licence; see [`LICENSE`](LICENSE).

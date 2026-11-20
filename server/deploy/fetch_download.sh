@@ -16,7 +16,7 @@ asset = next(a for a in release["assets"] if a["name"] == "ArenaSweatsCollector.
 print(asset["browser_download_url"], (asset.get("digest") or "").replace("sha256:", "") or "-", release["tag_name"])
 ' <<<"$info")
 [ "$digest" != "-" ] || { echo "$(date -u +%FT%TZ) release $tag has no checksum; not updating"; exit 1; }
-if [ -f "$dir/$name" ] && [ "$(sha256sum "$dir/$name" | cut -d' ' -f1)" = "$digest" ]; then
+if [ -f "$dir/$name" ] && [ "$(sha256sum "$dir/$name" | cut -d' ' -f1)" = "$digest" ] && [ -f "$dir/latest.json" ]; then
   exit 0
 fi
 tmp="$(mktemp "$dir/.$name.XXXXXX")"
@@ -27,4 +27,6 @@ chmod 644 "$tmp"
 mv -f "$tmp" "$dir/$name"
 trap - EXIT
 echo "$digest  $name" > "$dir/$name.sha256"
+printf '{"version": "%s", "sha256": "%s", "size": %s}\n' "${tag#v}" "$digest" "$(stat -c %s "$dir/$name")" > "$dir/latest.json.tmp"
+mv -f "$dir/latest.json.tmp" "$dir/latest.json"
 echo "$(date -u +%FT%TZ) now serving $tag ($digest)"

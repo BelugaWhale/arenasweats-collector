@@ -36,6 +36,7 @@ import argparse
 import base64
 import calendar
 import gzip
+import hashlib
 import http.client
 import json
 import logging
@@ -47,6 +48,7 @@ import re
 import socket
 import sqlite3
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -56,7 +58,7 @@ import zipfile
 import zlib
 from collections import Counter
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
 KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
@@ -1383,6 +1385,102 @@ def program_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+MAX_UPDATE_BYTES = 60 * 1024 * 1024
+
+
+def version_tuple(text):
+    """'0.3.4' as (0, 3, 4), or None when it is not a plain version number."""
+    if not isinstance(text, str) or not re.fullmatch(r"[0-9]{1,4}(\.[0-9]{1,4}){1,3}", text):
+        return None
+    return tuple(int(part) for part in text.split("."))
+
+
+def latest_release(base_url):
+    """What ArenaSweats says the newest collector is ({version, sha256, url}), or None.
+    The download must come from the same server this collector talks to."""
+    base = base_url.rstrip("/")
+    request = urllib.request.Request(base + "/latest", headers={"User-Agent": "arenasweats-collector/" + VERSION})
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
+        data = as_dict(parse_json(response.read(65536)))
+    path, digest = data.get("path"), data.get("sha256")
+    if (version_tuple(data.get("version")) and isinstance(path, str) and re.fullmatch(r"/download/[A-Za-z0-9_.-]{1,80}", path)
+            and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
+        return {"version": data["version"], "sha256": digest, "url": base + path}
+    return None
+
+
+def install_update(release, exe_path):
+    """Download the new program beside this one, check it against its SHA-256 and put it in this
+    one's place. The running program is renamed to <name>.old (Windows allows that), not deleted;
+    it is removed on the next start. Raises on any problem, leaving this program as it was."""
+    temp = os.path.join(os.path.dirname(exe_path), ".ArenaSweatsCollector.update")
+    old = exe_path + ".old"
+    digest, size = hashlib.sha256(), 0
+    request = urllib.request.Request(release["url"], headers={"User-Agent": "arenasweats-collector/" + VERSION})
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response, open(temp, "wb") as out:
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPDATE_BYTES:
+                    raise ValueError("the download is too large")
+                digest.update(chunk)
+                out.write(chunk)
+        if digest.hexdigest() != release["sha256"]:
+            raise ValueError("the download does not match its checksum")
+        if os.path.exists(old):
+            os.remove(old)
+        os.replace(exe_path, old)
+        try:
+            os.replace(temp, exe_path)
+        except OSError:
+            os.replace(old, exe_path)       # put this program back
+            raise
+    finally:
+        if os.path.exists(temp):
+            os.remove(temp)
+
+
+def offer_update(base_url, ask=input, spawn=subprocess.Popen):
+    """When ArenaSweats has a newer collector, ask whether to update; on yes, install and start it.
+    Returns True when the new version was started (this one should then stop)."""
+    try:
+        release = latest_release(base_url)
+    except (OSError, ValueError, http.client.HTTPException):
+        return False                        # no answer: carry on with this version
+    if not release or version_tuple(release["version"]) <= version_tuple(VERSION):
+        return False
+    print("A new version of the collector is available: %s (you have %s)." % (release["version"], VERSION))
+    print("有新版本的采集器：%s（当前 %s）。" % (release["version"], VERSION))
+    try:
+        answer = ask("Update now? 现在更新？ [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+    if answer not in ("", "y", "yes", "是"):
+        print("Keeping version %s." % VERSION)
+        return False
+    print("Downloading %s ..." % release["version"])
+    try:
+        install_update(release, sys.executable)
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        print("The update did not work (%s). Carrying on with version %s." % (error, VERSION))
+        return False
+    print("Updated to %s. Starting it ..." % release["version"])
+    spawn([sys.executable] + sys.argv[1:])
+    return True
+
+
+def remove_old_program():
+    """Delete the previous version left behind by an update, once it is no longer running."""
+    try:
+        if os.path.exists(sys.executable + ".old"):
+            os.remove(sys.executable + ".old")
+    except OSError:
+        pass
+
+
 def load_config(folder):
     """config.json beside the program may hold: server, key, league_dir."""
     try:
@@ -1484,6 +1582,7 @@ def main(argv=None):
                         help="read nothing older than this UTC date, the start of the season (default %(default)s; "
                              "with an upload address, ArenaSweats sets it)")
     parser.add_argument("--data-dir", help="where to keep collected data (default: 'data' beside this program)")
+    parser.add_argument("--no-update", action="store_true", help="don't check for a newer version at start")
     parser.add_argument("--export", metavar="FILE",
                         help="write the match records held locally to FILE (JSON lines; .gz to compress) and exit")
     opts = parser.parse_args(argv)
@@ -1493,6 +1592,11 @@ def main(argv=None):
             stream.reconfigure(errors="replace")
 
     config = load_config(program_dir())
+    if getattr(sys, "frozen", False) and os.name == "nt":       # the packaged Windows program
+        remove_old_program()
+        if not opts.no_update and not opts.export and sys.stdin and sys.stdin.isatty():
+            if offer_update(opts.server or config.get("server") or DEFAULT_SERVER):
+                return 0
     data_dir = os.path.abspath(opts.data_dir or os.path.join(program_dir(), "data"))
     os.makedirs(data_dir, exist_ok=True)
     if opts.export:

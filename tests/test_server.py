@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import copy
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -13,6 +14,8 @@ import threading
 import time
 import unittest
 import unittest.mock
+import urllib.error
+import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -1036,6 +1039,89 @@ class EndToEnd(WithServer):
                 collector.Server(url, "k")
         collector.Server("https://arenasweats.lol/collector", "k")
         self.assertIsNone(collector.Server("https://arenasweats.lol/collector", "").key)    # it signs up instead
+
+
+class Updates(WithServer):
+    """A collector offers to update itself from the server it talks to."""
+
+    def setUp(self):
+        super().setUp()
+        self.downloads = os.path.join(self.tmp.name, "downloads")
+        os.makedirs(self.downloads)
+        os.environ["COLLECTOR_DOWNLOADS"] = self.downloads
+        self.addCleanup(os.environ.pop, "COLLECTOR_DOWNLOADS", None)
+        self.program = os.path.join(self.tmp.name, "program", "ArenaSweatsCollector.exe")
+        os.makedirs(os.path.dirname(self.program))
+        with open(self.program, "wb") as handle:
+            handle.write(b"old program")
+
+    def publish(self, version, body, digest=None):
+        with open(os.path.join(self.downloads, ingest.PROGRAM), "wb") as handle:
+            handle.write(body)
+        with open(os.path.join(self.downloads, "latest.json"), "w") as handle:
+            json.dump({"version": version, "sha256": digest or hashlib.sha256(body).hexdigest(), "size": len(body)}, handle)
+
+    def test_versions_compare_as_numbers(self):
+        self.assertGreater(collector.version_tuple("0.3.10"), collector.version_tuple("0.3.9"))
+        for bad in (None, "", "v0.3.4", "0.3.4-beta", "1"):
+            self.assertIsNone(collector.version_tuple(bad), bad)
+
+    def test_nothing_is_offered_without_a_release_or_a_newer_one(self):
+        asked = []
+        self.assertFalse(collector.offer_update(self.url, ask=lambda prompt: asked.append(prompt) or "y"))
+        self.publish(collector.VERSION, b"same version")
+        self.assertFalse(collector.offer_update(self.url, ask=lambda prompt: asked.append(prompt) or "y"))
+        self.assertEqual(asked, [])
+
+    def test_yes_installs_the_new_version_and_starts_it(self):
+        self.publish("99.0.0", b"new program")
+        started = []
+        self.addCleanup(setattr, sys, "executable", sys.executable)
+        sys.executable = self.program
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(collector.offer_update(self.url, ask=lambda prompt: "y", spawn=started.append))
+        with open(self.program, "rb") as handle:
+            self.assertEqual(handle.read(), b"new program")
+        with open(self.program + ".old", "rb") as handle:
+            self.assertEqual(handle.read(), b"old program")
+        self.assertEqual(started[0][0], self.program)
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.program))),
+                         ["ArenaSweatsCollector.exe", "ArenaSweatsCollector.exe.old"])
+
+    def test_no_keeps_this_version(self):
+        self.publish("99.0.0", b"new program")
+        self.addCleanup(setattr, sys, "executable", sys.executable)
+        sys.executable = self.program
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(collector.offer_update(self.url, ask=lambda prompt: "n", spawn=self.fail))
+        with open(self.program, "rb") as handle:
+            self.assertEqual(handle.read(), b"old program")
+
+    def test_a_download_that_fails_its_checksum_changes_nothing(self):
+        self.publish("99.0.0", b"tampered program", digest="0" * 64)
+        self.addCleanup(setattr, sys, "executable", sys.executable)
+        sys.executable = self.program
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(collector.offer_update(self.url, ask=lambda prompt: "y", spawn=self.fail))
+        self.assertIn("did not work", output.getvalue())
+        with open(self.program, "rb") as handle:
+            self.assertEqual(handle.read(), b"old program")
+        self.assertEqual(os.listdir(os.path.dirname(self.program)), ["ArenaSweatsCollector.exe"])
+
+    def test_latest_and_download_need_no_key(self):
+        self.assertEqual(self.http_get("/latest")[0], 404)
+        self.publish("99.0.0", b"new program")
+        status, body = self.http_get("/latest")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["path"], "/download/ArenaSweatsCollector.exe")
+        self.assertEqual(self.http_get("/download/ArenaSweatsCollector.exe"), (200, b"new program"))
+
+    def http_get(self, path):
+        try:
+            with urllib.request.urlopen(self.url + path, timeout=10) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read()
 
 
 class HostileServer(CollectorCase):
