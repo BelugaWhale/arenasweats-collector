@@ -324,7 +324,7 @@ def fail(status, message, **headers):
 @app.before_request
 def check_key():
     """Every request except the health check needs a valid key. Runs before any body is read."""
-    if request.path == "/healthz":
+    if request.path in ("/healthz", "/check"):
         return None
     if request.path == "/v1/register":       # a new install asking for its own key
         g.db = connect()
@@ -377,6 +377,17 @@ def read_body():
     if not isinstance(data, dict):
         return None, fail(400, "expected a JSON object")
     return data, None
+
+
+CHECK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "client-check.ps1")
+
+
+@app.get("/check")
+def client_check():
+    """A read-only PowerShell check a tester runs with one line: irm https://arenasweats.lol/collector/check | iex"""
+    with open(CHECK_SCRIPT, "rb") as handle:
+        body = handle.read()
+    return app.response_class(body, mimetype="text/plain", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/healthz")

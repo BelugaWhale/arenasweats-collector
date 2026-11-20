@@ -112,6 +112,12 @@ class ServerCase(unittest.TestCase):
 
 
 class Keys(ServerCase):
+    def test_the_client_check_is_served_without_a_key(self):
+        answer = self.client.get("/check")
+        self.assertEqual(answer.status_code, 200)
+        self.assertIn(b"ArenaSweats login check", answer.data)
+        self.assertFalse(answer.data.startswith(b"\xef\xbb\xbf"))        # no byte-order mark: it is piped into iex
+
     def test_last_seen_and_state_are_kept(self):
         headers = {"Authorization": "Bearer " + self.key, "X-Collector-State": "paused",
                    "User-Agent": "arenasweats-collector/0.3.2"}
