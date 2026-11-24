@@ -1295,7 +1295,7 @@ class Updates(WithServer):
                 result = collector.offer_update(self.url, ask=lambda prompt: asked.append(prompt) or answer,
                                                 spawn=started.append)
             self.assertEqual(result, updates, answer)
-            self.assertEqual(asked, ["Update now? 现在更新？ [Y/n] (updates by itself in 10 s / 10 秒后自动更新) "])
+            self.assertEqual(asked, ["Update now? 现在更新？ [Y/n]  No answer = update / 不回答即更新: "])
             self.assertEqual("No answer: updating. 无人回答：自动更新。" in output.getvalue(), answer is None)
             self.assertIn("A new version of the collector is available: 99.0.0 (you have %s).\n"
                           "有新版本的采集器：99.0.0（当前 %s）。" % (collector.VERSION, collector.VERSION), output.getvalue())
@@ -1342,15 +1342,15 @@ class Updates(WithServer):
         self.publish("99.0.0", b"new program")
         code, shown, started, _ = self.start("n\ny\n")
         self.assertEqual((code, started), (0, []))
-        self.assertInOrder(shown, "Update now? 现在更新？ [Y/n] ", "Keeping version", "Turn it on? 是否开启？ [y/N] ",
+        self.assertInOrder(shown, "Update now? 现在更新？ [Y/n] ", "Keeping version", "Activate fast mode? 开启快速模式？ [y/N] ",
                            collector.FAST_ON, "Connected to the League client", "Press Enter to close.")
-        self.assertEqual(shown.count("Turn it on?"), 1)
+        self.assertEqual(shown.count("Activate fast mode?"), 1)
         self.assertTrue(history(self.fake.requests))                       # and it collects
         self.assertEqual(self.db.execute("SELECT state FROM contributor_seen").fetchone()[0], "collecting_fast")
 
     def test_enter_to_the_fast_mode_question_means_no(self):
         code, shown, _, _ = self.start("\n")
-        self.assertInOrder(shown, "Turn it on? 是否开启？ [y/N] ", "Connected to the League client")
+        self.assertInOrder(shown, "Activate fast mode? 开启快速模式？ [y/N] ", "Connected to the League client")
         self.assertNotIn(collector.FAST_ON, shown)
         self.assertEqual(self.db.execute("SELECT state FROM contributor_seen").fetchone()[0], "collecting")
 
@@ -1361,7 +1361,7 @@ class Updates(WithServer):
         self.assertEqual(started, [argv])                                  # the same arguments, --fast included
         self.assertEqual(started[0][-1], "--fast")
         self.assertIn("Updated to 99.0.0. Starting it ...", shown)
-        self.assertNotIn("Turn it on?", shown)
+        self.assertNotIn("Activate fast mode?", shown)
         self.assertEqual(history(self.fake.requests), [])                  # the old version stops there
 
     def test_the_flags_skip_the_question(self):
@@ -1370,7 +1370,7 @@ class Updates(WithServer):
             code, shown, _, _ = self.start("", flag)
             self.assertEqual(code, 0)
             self.assertNotIn("Update now?", shown)
-            self.assertNotIn("Turn it on?", shown)
+            self.assertNotIn("Activate fast mode?", shown)
             self.assertEqual(collector.FAST_ON in shown, on)
 
     def test_a_download_that_fails_its_checksum_changes_nothing(self):

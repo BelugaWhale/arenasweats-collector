@@ -8,7 +8,8 @@ WHAT IT DOES
   2. While you are not playing, slowly asks that client for this season's Arena
      match history: match lists of players, and the full record of Arena matches.
      Fast mode, which you can turn on at start, waits half as long between requests.
-     It is experimental: we are not sure it is safe for your League account.
+     It is beta: we are not sure yet that it is safe for your account, so for now
+     use it only with a throwaway account.
   3. Sends the matches to ArenaSweats (DEFAULT_SERVER below), which tells it which
      players and matches to read next, so no two collectors read the same thing.
      The first time, it asks ArenaSweats for this install's own upload key and
@@ -62,7 +63,7 @@ import zipfile
 import zlib
 from collections import Counter, namedtuple
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
 KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
@@ -1929,28 +1930,47 @@ ANSWER_SECONDS = 10    # a start-up question nobody answers takes its default af
 
 def timed_input(prompt, seconds=ANSWER_SECONDS):
     """input() for the start-up questions, so a collector started with nobody at the PC still starts: returns None
-    when nothing is typed within `seconds`. Once a key is pressed it waits for Enter, like input()."""
+    when nothing is typed within `seconds`. In the Windows console it counts the seconds down after the question;
+    once a key is pressed the count goes and it waits for Enter, like input()."""
     sys.stdout.write(prompt)
     sys.stdout.flush()
-    if os.name != "nt":
-        import select
-        try:
-            ready = select.select([sys.stdin], [], [], seconds)[0]
-        except (OSError, ValueError):           # not a stream it can wait on: wait for the answer as input() does
-            return input()
-        if not ready:
-            sys.stdout.write("\n")
-            return None
-        line = sys.stdin.readline()
-        if not line:
-            raise EOFError
-        return line.rstrip("\r\n")
+    if os.name == "nt":
+        if sys.stdin is sys.__stdin__ and sys.stdin is not None and sys.stdin.isatty():
+            return _console_timed_input(seconds)
+        return input()                          # not the console (a pipe, or tests): an answer a line, as input()
+    import select
+    try:
+        ready = select.select([sys.stdin], [], [], seconds)[0]
+    except (OSError, ValueError):               # not a stream it can wait on: wait for the answer as input() does
+        return input()
+    if not ready:
+        sys.stdout.write("\n")
+        return None
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return line.rstrip("\r\n")
+
+
+def _console_timed_input(seconds):
+    """timed_input() in the Windows console: read key by key, with the seconds left shown after the question."""
     import msvcrt
-    typed, deadline = [], time.monotonic() + seconds
+    typed, deadline, shown = [], time.monotonic() + seconds, ""
+
+    def show(count):                            # replace the shown count (only it: the question stays)
+        nonlocal shown
+        spare = max(0, len(shown) - len(count))
+        sys.stdout.write("\b" * len(shown) + count + " " * spare + "\b" * spare)
+        sys.stdout.flush()
+        shown = count
+
+    show("%d " % seconds)
     while True:
         if msvcrt.kbhit():
             char = msvcrt.getwch()
-            deadline = None                     # someone is typing: wait for Enter
+            if deadline is not None:            # someone is typing: the count goes, and it waits for Enter
+                show("")
+                deadline = None
             if char in ("\x00", "\xe0"):        # an arrow or function key; its second half follows
                 msvcrt.getwch()
             elif char == "\x03":
@@ -1967,10 +1987,17 @@ def timed_input(prompt, seconds=ANSWER_SECONDS):
                 typed.append(char)
                 sys.stdout.write(char)
             sys.stdout.flush()
-        elif deadline is not None and time.monotonic() >= deadline:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            return None
+        elif deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                show("0")
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return None
+            count = "%d " % int(left + 0.999)
+            if count != shown:
+                show(count)
+            time.sleep(0.05)
         else:
             time.sleep(0.05)
 
@@ -1988,8 +2015,7 @@ def offer_update(base_url, ask=timed_input, spawn=subprocess.Popen):
     print("A new version of the collector is available: %s (you have %s)." % (release["version"], VERSION))
     print("有新版本的采集器：%s（当前 %s）。" % (release["version"], VERSION))
     try:
-        answer = ask("Update now? 现在更新？ [Y/n] (updates by itself in %d s / %d 秒后自动更新) "
-                     % (ANSWER_SECONDS, ANSWER_SECONDS))
+        answer = ask("Update now? 现在更新？ [Y/n]  No answer = update / 不回答即更新: ")
     except (EOFError, KeyboardInterrupt):
         answer = "n"
     if answer is None:
@@ -2010,19 +2036,18 @@ def offer_update(base_url, ask=timed_input, spawn=subprocess.Popen):
     return True
 
 
-FAST_ON = "Fast mode is on (experimental). 快速模式已开启（实验性）。"
+FAST_ON = "Fast mode is on (beta). 快速模式已开启（测试版）。"
 
 
 def ask_fast_mode(ask=timed_input):
     """Ask at start whether to turn fast mode on. Only a yes turns it on; Enter, or no answer within ANSWER_SECONDS,
     means no."""
-    print("Fast mode collects about %s times faster. It is experimental: we are not sure it is safe for your "
-          "League account." % FAST_SPEEDUP)
-    print("快速模式的采集速度约为正常速度的 %s 倍。此功能为实验性功能：我们不确定它对你的英雄联盟账号是否安全。"
+    print("Fast mode collects about %s times faster. Beta: we are not sure yet that it is safe for your account, "
+          "so for now please use it only with a throwaway account." % FAST_SPEEDUP)
+    print("快速模式的采集速度约为正常速度的 %s 倍。测试版：我们还不确定它对账号是否安全，目前请只在小号上使用。"
           % FAST_SPEEDUP)
     try:
-        answer = ask("Turn it on? 是否开启？ [y/N] (normal mode in %d s / %d 秒后以普通模式开始) "
-                     % (ANSWER_SECONDS, ANSWER_SECONDS))
+        answer = ask("Activate fast mode? 开启快速模式？ [y/N]  No answer = normal mode / 不回答即普通模式: ")
     except (EOFError, KeyboardInterrupt):
         answer = "n"
     if answer is None:
@@ -2142,8 +2167,9 @@ def main(argv=None):
                              "with an upload address, ArenaSweats sets it)")
     parser.add_argument("--data-dir", help="where to keep collected data (default: 'data' beside this program)")
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction,
-                        help="experimental: collect about %s times faster; we are not sure it is safe for your "
-                             "League account (either flag skips the question at start)" % FAST_SPEEDUP)
+                        help="beta: collect about %s times faster; for now use it only with a throwaway account, "
+                             "as we are not sure yet that it is safe (either flag skips the question at start)"
+                             % FAST_SPEEDUP)
     parser.add_argument("--no-update", action="store_true", help="don't check for a newer version at start")
     parser.add_argument("--export", metavar="FILE",
                         help="write the match records held locally to FILE (JSON lines; .gz to compress) and exit")

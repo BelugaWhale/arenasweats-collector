@@ -323,10 +323,11 @@ class FastMode(CollectorCase):
             asked = []
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(collector.ask_fast_mode(lambda prompt: asked.append(prompt) or answer), expected)
-            self.assertEqual(asked, ["Turn it on? 是否开启？ [y/N] (normal mode in 10 s / 10 秒后以普通模式开始) "])
-        self.assertIn("Fast mode collects about %s times faster. It is experimental: we are not sure it is safe "
-                      "for your League account." % collector.FAST_SPEEDUP, output.getvalue())
-        self.assertIn("快速模式的采集速度约为正常速度的 %s 倍。此功能为实验性功能：我们不确定它对你的英雄联盟账号是否安全。"
+            self.assertEqual(asked, ["Activate fast mode? 开启快速模式？ [y/N]  No answer = normal mode / 不回答即普通模式: "])
+        self.assertIn("Fast mode collects about %s times faster. Beta: we are not sure yet that it is safe for your "
+                      "account, so for now please use it only with a throwaway account." % collector.FAST_SPEEDUP,
+                      output.getvalue())
+        self.assertIn("快速模式的采集速度约为正常速度的 %s 倍。测试版：我们还不确定它对账号是否安全，目前请只在小号上使用。"
                       % collector.FAST_SPEEDUP, output.getvalue())
 
         def closed(prompt):
