@@ -7,6 +7,8 @@ WHAT IT DOES
      the client was started with (what Task Manager shows for it).
   2. While you are not playing, slowly asks that client for this season's Arena
      match history: match lists of players, and the full record of Arena matches.
+     Fast mode, which you can turn on at start, waits half as long between requests.
+     It is experimental: we are not sure it is safe for your League account.
   3. Sends the matches to ArenaSweats (DEFAULT_SERVER below), which tells it which
      players and matches to read next, so no two collectors read the same thing.
      The first time, it asks ArenaSweats for this install's own upload key and
@@ -35,6 +37,7 @@ Only the Python standard library is used, so this one file is the whole program.
 import argparse
 import base64
 import calendar
+import errno
 import gzip
 import hashlib
 import http.client
@@ -53,12 +56,13 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 import zlib
-from collections import Counter
+from collections import Counter, namedtuple
 
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
 KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
@@ -66,8 +70,11 @@ KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 # Limits. These keep the collector gentle. The upload server can slow it down
 # or switch it off, but nothing can make it go faster than MIN_DELAY.
 # ---------------------------------------------------------------------------
-MIN_DELAY = 1.0        # hard floor: at most one match-history request per second
+MIN_DELAY = 1.0        # hard floor: at most one match-history request per second, in fast mode too
 DEFAULT_DELAY = 2.0    # normal gap between match-history requests, in seconds
+FAST_FACTOR = 2        # fast mode (experimental, only when the user turns it on) halves the gap, never below MIN_DELAY
+FAST_SPEEDUP = "1.6"   # matches an hour in fast mode against the normal pace (fake client, real client's answer times)
+FAST_REST = 3600       # in fast mode, a 429 or 3 failed requests in a row bring back the normal pace for this long
 PAGE_SIZE = 20         # matches per match-list request
 MAX_PAGES = 50         # never read further back than this many pages of one player's list
 FIRST_PAGES = 1        # a list is read one page at first ...
@@ -87,6 +94,7 @@ TEST_MINUTES = 15      # length of a test run (no upload address set)
 MAX_LCU_BYTES = 8 * 1024 * 1024
 
 IDLE_PHASES = {"None", "Lobby"}   # client states in which collection is allowed
+PHASE_SECONDS = 5                 # while it is idle, the client's state is asked at most this often
 ARENA_MODES = {"CHERRY"}          # Riot's internal name for Arena
 
 # A player id may only contain these characters, so it is safe inside an address.
@@ -168,11 +176,14 @@ class Lcu:
         # ProxyHandler({}) = never send these local requests through a proxy.
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context), NoRedirect())
+        self.opened, self.sent, self.last = time.monotonic(), 0, None    # for the log: see Collector.doing
 
     def get(self, path, timeout=20):
         """GET one allowed path. Returns (status, parsed JSON or None); status 0 = timed out."""
         if not any(pattern.fullmatch(path) for pattern in LCU_ALLOWED):
             raise ValueError("refused: not on the allowed list: " + path)
+        self.sent += 1
+        self.last = (path, time.monotonic(), None)      # what was asked last, when, and its status (None: no answer)
         request = urllib.request.Request(self.base + path, headers=self.headers, method="GET")
         try:
             try:
@@ -188,6 +199,7 @@ class Lcu:
             raise ClientGone(str(error.reason))
         except (OSError, http.client.HTTPException) as error:
             raise ClientGone(str(error))
+        self.last = (path, self.last[1], status)
         return status, parse_json(body)
 
 
@@ -303,15 +315,109 @@ def query_program(pid, command_line=False):
         k32.CloseHandle(handle)
 
 
+Running = namedtuple("Running", "pid name started memory private handles")
+_table_api = None
+
+
+def process_table():
+    """Every running program as {process id: Running}, from the list Windows keeps of them (what
+    Task Manager shows): its name, when it started (seconds since 1970), its memory (working set)
+    and private memory in bytes, and its handle count. No program is opened for this, so the
+    League client is not touched. Empty off Windows, or when Windows will not say."""
+    global _table_api
+    if os.name != "nt":
+        return {}
+    ctypes = windows_api()[0]
+    if _table_api is None:
+        nt = ctypes.WinDLL("ntdll")
+        nt.NtQuerySystemInformation.restype = ctypes.c_long
+        nt.NtQuerySystemInformation.argtypes = (ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                                                ctypes.POINTER(ctypes.c_ulong))
+
+        class Info(ctypes.Structure):       # one program in that list (SYSTEM_PROCESS_INFORMATION)
+            _fields_ = [("NextEntryOffset", ctypes.c_ulong), ("NumberOfThreads", ctypes.c_ulong),
+                        ("WorkingSetPrivateSize", ctypes.c_longlong), ("HardFaultCount", ctypes.c_ulong),
+                        ("NumberOfThreadsHighWatermark", ctypes.c_ulong), ("CycleTime", ctypes.c_ulonglong),
+                        ("CreateTime", ctypes.c_longlong), ("UserTime", ctypes.c_longlong),
+                        ("KernelTime", ctypes.c_longlong), ("NameLength", ctypes.c_ushort),
+                        ("NameMaximumLength", ctypes.c_ushort), ("NameBuffer", ctypes.c_void_p),
+                        ("BasePriority", ctypes.c_long), ("UniqueProcessId", ctypes.c_void_p),
+                        ("InheritedFromUniqueProcessId", ctypes.c_void_p), ("HandleCount", ctypes.c_ulong),
+                        ("SessionId", ctypes.c_ulong), ("UniqueProcessKey", ctypes.c_void_p),
+                        ("PeakVirtualSize", ctypes.c_size_t), ("VirtualSize", ctypes.c_size_t),
+                        ("PageFaultCount", ctypes.c_ulong), ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t), ("PrivatePageCount", ctypes.c_size_t)]
+        _table_api = (nt, Info)
+    nt, Info = _table_api
+    size, status = 1 << 20, None
+    for _ in range(6):
+        buffer = ctypes.create_string_buffer(size)
+        needed = ctypes.c_ulong(0)
+        status = nt.NtQuerySystemInformation(5, buffer, size, ctypes.byref(needed)) & 0xFFFFFFFF  # 5 = programs
+        if status != 0xC0000004:            # 0xC0000004 = the list did not fit: try a bigger buffer
+            break
+        size = max(size * 2, needed.value + (1 << 16))
+    if status != 0:
+        return {}
+    table, offset, start = {}, 0, ctypes.addressof(buffer)
+    while offset + ctypes.sizeof(Info) <= size:
+        info = Info.from_buffer(buffer, offset)
+        name = ""
+        if info.NameBuffer and start <= info.NameBuffer and info.NameBuffer + info.NameLength <= start + size:
+            name = ctypes.wstring_at(info.NameBuffer, info.NameLength // 2)
+        pid = info.UniqueProcessId or 0
+        started = info.CreateTime / 1e7 - 11644473600 if info.CreateTime > 0 else 0.0   # 1601 -> 1970
+        table[pid] = Running(pid, name, started, info.WorkingSetSize, info.PrivatePageCount, info.HandleCount)
+        if not info.NextEntryOffset:
+            break
+        offset += info.NextEntryOffset
+    return table
+
+
+QUERY_RETRY = 600     # seconds before asking again about a program Windows would not tell about
+answers = {}          # (process id, start time, with command line) -> (what query_program said, when)
+
+
+def query_once(pid, command_line=False, table=None):
+    """query_program, but each running program is opened once, not every round: its path and
+    command line stay the same for as long as it runs. When Windows refused, it is asked again
+    only after QUERY_RETRY seconds. `table` (from process_table) tells a program apart from a
+    later one that happens to get the same process id."""
+    program = (table or {}).get(pid)
+    started = program.started if program else None
+    for key in ((pid, started, True), (pid, started, command_line)):
+        found = answers.get(key)
+        if found and (found[0][1 if command_line else 0] is not None or time.monotonic() - found[1] < QUERY_RETRY):
+            return found[0]
+    answer = query_program(pid, command_line)
+    answers[(pid, started, command_line)] = (answer, time.monotonic())
+    log.info("asked Windows about program %d (%s)%s: path %s%s", pid, program.name if program else "?",
+             " and its command line" if command_line else "", "given" if answer[0] else "refused",
+             (", command line " + ("given" if answer[1] else "refused")) if command_line else "")
+    return answer
+
+
+def forget_closed(programs):
+    """Drop what was learned about programs that are no longer running."""
+    running = {pid for pid, _ in programs}
+    for key in [key for key in answers if key[0] not in running]:
+        del answers[key]
+
+
 def running_client_dirs(names=CLIENT_NAMES):
     """Folders of the running League client programs (Windows only). A folder is None when
     Windows would not say where the program is."""
     dirs, related, errors = [], set(), set()
-    for pid, name in running_programs():
+    programs, table = running_programs(), process_table()
+    forget_closed(programs)
+    for pid, name in programs:
         if any(word in name.lower() for word in RELATED_WORDS):
             related.add(name)
         if name.lower() in names:
-            path, _, error = query_program(pid)
+            path, _, error = query_once(pid, table=table)
             folder = os.path.dirname(path) if path else None
             if folder is None:
                 errors.add(str(error))
@@ -336,11 +442,14 @@ def login_from_command_line(line):
 def command_line_logins():
     """(port, password, protocol) of the running client, taken from the command line its window
     program was started with. Used only when no lockfile works. Windows gives this only when it
-    lets this program see the client. The password is never written anywhere."""
+    lets this program see the client. Read once for each start of the client (see query_once).
+    The password is never written anywhere."""
     logins = []
-    for pid, name in running_programs():
+    programs, table = running_programs(), process_table()
+    forget_closed(programs)
+    for pid, name in programs:
         if name.lower() == WINDOW_PROGRAM:
-            login = login_from_command_line(query_program(pid, command_line=True)[1])
+            login = login_from_command_line(query_once(pid, command_line=True, table=table)[1])
             if login:
                 logins.append(login + ("https",))
     note("client command line", "%d usable" % len(logins))
@@ -530,6 +639,101 @@ def lockfile_paths(league_dir=None):
 
 
 # ---------------------------------------------------------------------------
+# Watching the client's programs, for the log
+# ---------------------------------------------------------------------------
+WATCH_SECONDS = 5            # how often the list of running programs is looked at
+CLIENT_LOG_SECONDS = 600     # how often the client's programs are described in the log
+MAIN_PROGRAMS = ("leagueclient.exe", "leagueclientux.exe")
+RENDER_PROGRAM = "leagueclientuxrender.exe"           # the client's window contents; there are several
+CRASH_WORDS = ("werfault", "bugsplat", "bssndrpt")   # programs that report a crash (League's own crash
+                                                      # handlers run all the time, so they are not counted)
+
+
+def duration(seconds):
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return "%dh%02dm" % (seconds // 3600, seconds // 60 % 60)
+    return "%dm%02ds" % (seconds // 60, seconds % 60)
+
+
+def megabytes(size):
+    return "%d MB" % round(size / 2 ** 20)
+
+
+def short_path(path):
+    """A client address for the log, with player ids cut to 8 characters."""
+    return re.sub(PUUID, lambda found: found.group(0)[:8], path)
+
+
+class ClientWatch:
+    """Writes to the log how the League client's programs are doing, from the list of running
+    programs Windows keeps (nothing is opened for it): every 10 minutes their process ids, how long
+    they have run and their memory, and, within seconds, when one of them closes or starts, with
+    what the collector was doing then. So a report of the client closing comes with data."""
+
+    def __init__(self, now, wall):
+        self.now, self.wall = now, wall
+        self.known = None            # process id -> Running: the client's programs at the last look
+        self.looked_at = self.described_at = float("-inf")
+
+    def tick(self, doing):
+        if self.now() - self.looked_at >= WATCH_SECONDS:
+            self.look(doing)
+
+    def describe_soon(self):
+        self.described_at = float("-inf")
+
+    @staticmethod
+    def name(program):
+        return program.name[:-4] if program.name.lower().endswith(".exe") else program.name
+
+    def look(self, doing):
+        """`doing`: a function that says what the collector is doing."""
+        last_look, self.looked_at = self.looked_at, self.now()
+        table = process_table()
+        if not table:
+            return                   # not Windows, or Windows would not say
+        client = {pid: p for pid, p in table.items() if p.name.lower() in MAIN_PROGRAMS + (RENDER_PROGRAM,)}
+        if self.known is not None:
+            def gone(p):
+                return p.pid not in client or client[p.pid].started != p.started
+            closed = [p for p in self.known.values() if p.name.lower() in MAIN_PROGRAMS and gone(p)]
+            opened = [p for p in client.values() if p.name.lower() in MAIN_PROGRAMS
+                      and (p.pid not in self.known or self.known[p.pid].started != p.started)]
+            if closed:
+                renders = [p for p in self.known.values() if p.name.lower() == RENDER_PROGRAM]
+                related = sorted({p.name for p in table.values() if any(w in p.name.lower() for w in RELATED_WORDS)})
+                crash = sorted({p.name for p in table.values() if any(w in p.name.lower() for w in CRASH_WORDS)})
+                log.warning("League client program closed: %s; %s of %d LeagueClientUxRender programs closed too. "
+                            "Collector: %s. Programs still running: %s. Crash reporters running: %s",
+                            "; ".join("%s (pid %d) after running %s, memory %s, private %s, %d handles at the "
+                                      "last look %ds before" % (self.name(p), p.pid, duration(self.wall() - p.started),
+                                                                 megabytes(p.memory), megabytes(p.private), p.handles,
+                                                                 self.looked_at - last_look) for p in closed),
+                            sum(1 for p in renders if gone(p)), len(renders), doing(),
+                            ", ".join(related) or "none", ", ".join(crash) or "none")
+            for p in opened:
+                log.info("League client program started: %s (pid %d)", self.name(p), p.pid)
+        self.known = client
+        if self.now() - self.described_at >= CLIENT_LOG_SECONDS:
+            self.described_at = self.now()
+            self.describe(client, doing)
+
+    def describe(self, client, doing):
+        parts = ["%s pid %d up %s, memory %s, private %s, %d handles"
+                 % (self.name(p), p.pid, duration(self.wall() - p.started), megabytes(p.memory),
+                    megabytes(p.private), p.handles)
+                 for p in sorted(client.values(), key=lambda p: (p.name.lower(), p.started))
+                 if p.name.lower() in MAIN_PROGRAMS]
+        renders = [p for p in client.values() if p.name.lower() == RENDER_PROGRAM]
+        if renders:
+            parts.append("%d LeagueClientUxRender programs, memory %s, private %s" % (
+                len(renders), megabytes(sum(p.memory for p in renders)),
+                megabytes(sum(p.private for p in renders))))
+        log.info("League client: %s. Collector: %s", "; ".join(parts) or "not running", doing())
+
+
+# ---------------------------------------------------------------------------
 # Reading the client's match data
 # ---------------------------------------------------------------------------
 def match_list(data):
@@ -700,6 +904,227 @@ class Store:
 
 
 # ---------------------------------------------------------------------------
+# Reaching ArenaSweats over the internet
+# ---------------------------------------------------------------------------
+# Python checks ArenaSweats' certificate only against the root certificates Windows already
+# holds. Windows fetches most roots only when one of its own programs first needs them (and
+# internet-cafe PCs, reset at every restart, may never keep them), while browsers bring their
+# own, so a PC whose browser opens arenasweats.lol can still lack the root that ArenaSweats'
+# certificate (from Let's Encrypt) leads to. These two roots are carried here too, besides
+# Windows' own. They are Let's Encrypt's, the same ones as in Mozilla's and every other
+# trusted list.
+EXTRA_ROOT_NAMES = {"96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6": "ISRG Root X1",
+                    "69729b8e15a86efc177a57afb7171dfc64add28c2fca8cf1507e34453ccb1470": "ISRG Root X2"}
+EXTRA_ROOTS = """
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICGzCCAaGgAwIBAgIQQdKd0XLq7qeAwSxs6S+HUjAKBggqhkjOPQQDAzBPMQsw
+CQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJuZXQgU2VjdXJpdHkgUmVzZWFyY2gg
+R3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBYMjAeFw0yMDA5MDQwMDAwMDBaFw00
+MDA5MTcxNjAwMDBaME8xCzAJBgNVBAYTAlVTMSkwJwYDVQQKEyBJbnRlcm5ldCBT
+ZWN1cml0eSBSZXNlYXJjaCBHcm91cDEVMBMGA1UEAxMMSVNSRyBSb290IFgyMHYw
+EAYHKoZIzj0CAQYFK4EEACIDYgAEzZvVn4CDCuwJSvMWSj5cz3es3mcFDR0HttwW
++1qLFNvicWDEukWVEYmO6gbf9yoWHKS5xcUy4APgHoIYOIvXRdgKam7mAHf7AlF9
+ItgKbppbd9/w+kHsOdx1ymgHDB/qo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0T
+AQH/BAUwAwEB/zAdBgNVHQ4EFgQUfEKWrt5LSDv6kviejM9ti6lyN5UwCgYIKoZI
+zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
+tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
+/q4AaOeMSQ+2b1tbFfLn
+-----END CERTIFICATE-----
+"""
+_https = None           # the certificate checking set up by https_context()
+_way = "proxy"          # the way that reached ArenaSweats last: "proxy" (Windows' setting, when there is one) or "direct"
+early_notes = []        # what happened before the log file was opened; written to it once it is
+
+
+def https_context():
+    """Certificate checking for ArenaSweats: Windows' own roots plus EXTRA_ROOTS."""
+    global _https
+    if _https is None:
+        _https = ssl.create_default_context()
+        try:
+            _https.load_verify_locations(cadata=EXTRA_ROOTS)
+        except (ssl.SSLError, ValueError) as error:
+            log.warning("could not add the extra root certificates: %s", error)
+    return _https
+
+
+def system_proxy(url):
+    """The proxy that Windows' internet settings (or an HTTPS_PROXY variable) send `url` through, or None.
+    An automatic proxy script (PAC) is not followed; network_setup() notes one in the log."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.hostname in ("127.0.0.1", "localhost"):
+        return None
+    try:
+        proxy = urllib.request.getproxies().get(parts.scheme)
+        return proxy if proxy and not urllib.request.proxy_bypass(parts.hostname or "") else None
+    except (OSError, ValueError):
+        return None
+
+
+def shown(proxy):
+    """A proxy's address without its scheme or any user name and password, for the screen and the log."""
+    return re.sub(r"^[A-Za-z0-9+.-]+://", "", proxy or "").rsplit("@", 1)[-1].rstrip("/")
+
+
+def error_reason(error):
+    """The error underneath urllib's wrapper."""
+    reason = getattr(error, "reason", None) if isinstance(error, urllib.error.URLError) else None
+    return reason if isinstance(reason, BaseException) else error
+
+
+def error_detail(error):
+    """All an error says about a failed request, for the log."""
+    reason = error_reason(error)
+    text = "%s: %s" % (type(reason).__name__, reason)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        text += " (verify code %s: %s)" % (reason.verify_code, reason.verify_message)
+    return text
+
+
+def connection_problem(error):
+    """What went wrong with a request that got no answer, in a few words: (English, Simplified Chinese)."""
+    reason = error_reason(error)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        if reason.verify_code in (9, 10):           # "not valid yet" or "expired": usually the PC's clock
+            return "certificate not valid, check this PC's date and time", "证书无效，请检查电脑的日期和时间"
+        return "certificate check failed", "证书验证失败"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "timed out", "连接超时"
+    if isinstance(reason, socket.gaierror):
+        return "name lookup (DNS) failed", "域名解析（DNS）失败"
+    if isinstance(reason, ssl.SSLError):
+        return "secure connection (TLS) failed", "安全连接（TLS）失败"
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection refused", "连接被拒绝"
+    if isinstance(reason, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return "connection cut off", "连接被中断"
+    if str(reason).startswith("Tunnel connection failed"):
+        return "the proxy would not connect", "代理拒绝连接"
+    if isinstance(reason, OSError) and reason.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, 10051, 10065):
+        return "no network", "网络不通"
+    return "network error", "网络错误"
+
+
+def why_unreachable(status, tries=()):
+    """Why ArenaSweats could not be used, in a few words: (English, Simplified Chinese).
+    `tries` is what NoAnswer holds, when there was no answer (status 0)."""
+    if status == 429:
+        return "ArenaSweats is busy, status 429", "ArenaSweats 繁忙，状态码 429"
+    if status >= 500:
+        return "ArenaSweats server error, status %d" % status, "ArenaSweats 服务器出错，状态码 %d" % status
+    if status:
+        return "ArenaSweats answered with status %d" % status, "ArenaSweats 返回状态码 %d" % status
+    proxied = any(way != "direct" for way, _, _ in tries)
+    english, chinese = [], []
+    for way, error, _ in tries:
+        en, zh = connection_problem(error)
+        if proxied:         # say which way had which problem
+            en, zh = "%s: %s" % (way, en), "%s：%s" % ("直连" if way == "direct" else way.replace("proxy", "代理", 1), zh)
+        if en not in english:
+            english.append(en)
+            chinese.append(zh)
+    return "; ".join(english) or "no connection", "；".join(chinese) or "无法连接"
+
+
+class NoAnswer(OSError):
+    """No way of reaching ArenaSweats got an answer. `tries` holds (way, error, seconds) for each way tried."""
+
+    def __init__(self, tries):
+        super().__init__("; ".join("%s: %s after %.1fs" % (way, error_detail(error), seconds)
+                                   for way, error, seconds in tries))
+        self.tries = tries
+
+
+def request_url(url, data=None, headers=None, method=None, timeout=30, limit=65536):
+    """Send one request to ArenaSweats. Returns (status, up to `limit` bytes of the body, headers).
+    It goes the way Windows' internet settings say: through their proxy when one is set. When that
+    gets no answer it tries directly, and whichever way answered goes first from then on, so a
+    proxy that is switched off or broken does not cut the collector off. Never follows a redirect.
+    Raises NoAnswer when no way got an answer."""
+    global _way
+    proxy = system_proxy(url)
+    ways = ["proxy", "direct"] if proxy else ["direct"]
+    if _way == "direct":
+        ways.reverse()
+    tries = []
+    for way in ways:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({urllib.parse.urlsplit(url).scheme: proxy} if way == "proxy" else {}),
+            urllib.request.HTTPSHandler(context=https_context()), NoRedirect())
+        request = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+        started = time.monotonic()
+        try:
+            try:
+                with opener.open(request, timeout=timeout) as response:
+                    answer = response.status, response.read(limit), response.headers
+            except urllib.error.HTTPError as error:         # an answer too, just not a happy one
+                answer = error.code, error.read(limit), error.headers
+        except (OSError, http.client.HTTPException) as error:
+            tries.append(("proxy " + shown(proxy) if way == "proxy" else "direct", error, time.monotonic() - started))
+            continue
+        if tries:
+            log.info("ArenaSweats answered %s after: %s", "directly" if way == "direct" else "through the proxy",
+                     NoAnswer(tries))
+        _way = way if proxy else _way
+        return answer
+    raise NoAnswer(tries)
+
+
+def network_setup(url):
+    """One line for the log on what reaching `url` depends on: the TLS library, the roots Windows holds, the proxy."""
+    parts = [ssl.OPENSSL_VERSION]
+    if hasattr(ssl, "enum_certificates"):       # Windows
+        try:
+            held = {hashlib.sha256(cert).hexdigest() for store in ("ROOT", "CA")
+                    for cert, encoding, _ in ssl.enum_certificates(store) if encoding == "x509_asn"}
+            parts.append("Windows holds %d certificates%s" % (len(held), "".join(
+                ", %s: %s" % (name, "yes" if digest in held else "no") for digest, name in EXTRA_ROOT_NAMES.items())))
+        except (OSError, ValueError) as error:
+            parts.append("Windows certificates not readable: %s" % error)
+    parts.append("proxy: %s" % (shown(system_proxy(url)) or "none"))
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+            script = registry_text(key, "AutoConfigURL")
+        if script:
+            parts.append("automatic proxy script (not followed): %.200s" % script)
+    except (ImportError, OSError):
+        pass
+    return "; ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # The upload address
 # ---------------------------------------------------------------------------
 class Server:
@@ -712,28 +1137,29 @@ class Server:
             raise Fatal("The upload address must start with https://")
         self.key = key or None      # None until this install has signed up (Collector.sign_up)
         self.state = "collecting"   # what this collector is doing, sent with every request
-        self.opener = urllib.request.build_opener(NoRedirect())
+        self.problem = []           # after a call that got no answer: what went wrong (NoAnswer.tries)
+        log.info("network: %s", network_setup(self.url))
+        self.fast = False           # the user turned fast mode on: "_fast" is added to the state sent
 
     def call(self, method, path, payload=None):
-        """Returns (status, parsed JSON or None, seconds the server asked us to wait). Status 0 = unreachable."""
+        """Returns (status, parsed JSON or None, seconds the server asked us to wait).
+        Status 0 = unreachable; `problem` then says why."""
         headers = {"Accept": "application/json", "User-Agent": "arenasweats-collector/" + VERSION,
-                   "X-Collector-State": self.state}
+                   "X-Collector-State": self.state + ("_fast" if self.fast else "")}
         if self.key:
             headers["Authorization"] = "Bearer " + self.key
         body = None
         if payload is not None:
             body = gzip.compress(json.dumps(payload, separators=(",", ":")).encode())
             headers.update({"Content-Type": "application/json", "Content-Encoding": "gzip"})
-        request = urllib.request.Request(self.url + path, data=body, headers=headers, method=method)
         try:
-            try:
-                with self.opener.open(request, timeout=30) as response:
-                    status, raw, retry = response.status, response.read(65536), response.headers.get("Retry-After")
-            except urllib.error.HTTPError as error:
-                status, raw, retry = error.code, error.read(65536), error.headers.get("Retry-After")
-        except (OSError, http.client.HTTPException) as error:
-            log.info("upload server unreachable: %s", error)
+            status, raw, answer_headers = request_url(self.url + path, body, headers, method, timeout=30)
+        except NoAnswer as error:
+            self.problem = error.tries
+            log.warning("%s %s got no answer: %s", method, path, error)
             return 0, None, 0
+        self.problem = []
+        retry = answer_headers.get("Retry-After")
         wait = int(retry) if retry and re.fullmatch(r"[0-9]{1,5}", retry) else 0
         return status, parse_json(raw), min(3600, wait)
 
@@ -760,18 +1186,33 @@ class Collector:
         self.busy_at = float("-inf")       # last time the client was seen busy
         self.paused = False
         self.enabled, self.policy_delay, self.message, self.policy_at = True, 0.0, "", now()
+        self.fast = bool(getattr(opts, "fast", False))     # the user turned fast mode on (experimental)
+        self.fast_allowed = True           # ArenaSweats can switch fast mode off for everyone (policy "fast")
+        self.fast_rest_until = float("-inf")    # the normal pace until then, after the client pushed back
+        if server:
+            server.fast = self.fast
         self.batch, self.next_upload, self.last_upload, self.upload_failures = UPLOAD_BATCH, 0.0, float("-inf"), 0
         self.stats, self.modes = Counter(), Counter()
         self.wrong_records, self.failed_fetches, self.rests = Counter(), Counter(), Counter()   # per match id
         self.rest_until = {}               # match id -> when a match that keeps failing may be tried again
         self.owed = {}                     # match id -> list entry, for matches still to be fetched after a failure
         self.last_said, self.last_status, self.folder_asks, self.described = None, now(), 0, False
+        self.watch, self.last_lcu = ClientWatch(now, wall), None     # for the log: the client's programs
+        self.idle_at = float("-inf")       # last time the client was seen idle
 
     # -- small helpers -------------------------------------------------------
     @property
+    def fast_on(self):
+        """Fast mode sets the pace now: the user turned it on, ArenaSweats allows it, and the client
+        has not pushed back lately."""
+        return self.fast and self.fast_allowed and self.now() >= self.fast_rest_until
+
+    @property
     def delay(self):
-        """Seconds between match-history requests. The server can raise it, nothing can lower it below MIN_DELAY."""
-        return max(MIN_DELAY, self.opts.delay, self.policy_delay)
+        """Seconds between match-history requests. The server can raise it and fast mode halves it,
+        but nothing can lower it below MIN_DELAY."""
+        delay = max(MIN_DELAY, self.opts.delay, self.policy_delay)
+        return max(MIN_DELAY, delay / FAST_FACTOR) if self.fast_on else delay
 
     def say(self, text, once=False):
         if once and text == self.last_said:
@@ -785,10 +1226,25 @@ class Collector:
         while True:
             if self.deadline is not None and self.now() >= self.deadline:
                 raise Done()
+            self.watch.tick(self.doing)
             left = end - self.now()
             if left <= 0:
                 return
             self._sleep(min(left, 1.0))
+
+    def doing(self):
+        """What the collector is doing, in one line for the log (said when the client closes)."""
+        parts = ["paused" if self.paused else "collecting" if self.lcu else "not connected"]
+        lcu = self.lcu or self.last_lcu
+        if lcu is not None and lcu.last:
+            path, when, status = lcu.last
+            parts.append("last request to the client %.0fs before: %s -> %s"
+                         % (time.monotonic() - when, short_path(path), "no answer" if status is None else status))
+            parts.append("%d requests to the client in %s on that connection"
+                         % (lcu.sent, duration(time.monotonic() - lcu.opened)))
+        if self.last_said:
+            parts.append("last message: %s" % self.last_said)
+        return "; ".join(parts)
 
     # -- main loop -----------------------------------------------------------
     def run(self):
@@ -807,8 +1263,9 @@ class Collector:
                         self.connect()
                     self.step()
                 except ClientGone as error:
-                    log.info("client gone: %s", error)
-                    self.lcu = None
+                    log.warning("client gone: %s. Collector: %s", error, self.doing())
+                    self.last_lcu, self.lcu = self.lcu, None
+                    self.watch.look(self.doing)     # which of the client's programs are still running
                     self.say("The League client closed. Waiting for it to open again.")
                     self.sleep(10)
         except Done:
@@ -900,6 +1357,7 @@ class Collector:
             self.store.retry_refused()       # offer matches the server refused before once more
         status, region = lcu.get("/riotclient/region-locale")
         log.info("connected via %s, account %s..., region-locale: %s %s", path, puuid[:8], status, region)
+        self.watch.describe_soon()
         self.say("Connected to the League client%s." % (" in " + os.path.dirname(path) if os.path.isabs(path) else ""))
         self.say("Collecting only while you are not playing, one request every %.1f seconds, matches since %s."
                  % (self.delay, time.strftime("%Y-%m-%d", time.gmtime(self.season_start / 1000))))
@@ -1092,11 +1550,15 @@ class Collector:
 
     # -- reading match history -------------------------------------------------
     def wait_until_idle(self):
-        """Return only when the client is idle (not in queue, champion select, a game or post-game)."""
+        """Return only when the client is idle (not in queue, champion select, a game or post-game).
+        While it stays idle, its state is asked at most every PHASE_SECONDS, not before every request."""
+        if not self.paused and self.now() - self.idle_at < PHASE_SECONDS:
+            return
         while True:
             status, phase = self.lcu.get("/lol-gameflow/v1/gameflow-phase", timeout=10)
             if status == 200 and isinstance(phase, str) and phase in IDLE_PHASES:
                 if self.now() - self.busy_at >= RESUME_GRACE:
+                    self.idle_at = self.now()
                     if self.paused:
                         self.paused = False
                         self.say("You are not playing any more. Collection resumed.")
@@ -1151,6 +1613,10 @@ class Collector:
             gone = error
         ok = status == 200 and data is not None
         self.failures = 0 if ok else self.failures + 1
+        if not ok and self.fast_on and (status == 429 or self.failures >= 3):
+            self.fast_rest_until = self.now() + FAST_REST       # the client is pushing back: no fast mode for a while
+            self.say("The League client is struggling, so fast mode rests for an hour (normal pace). "
+                     "客户端响应异常，快速模式暂停一小时（恢复正常速度）。")
         # After failures, wait longer and longer (3s, 6s, 12s ... up to MAX_BACKOFF).
         backoff = 0 if ok else min(MAX_BACKOFF, 3 * 2 ** min(self.failures - 1, 10))
         self.next_allowed = self.now() + max(MIN_DELAY, self.delay * random.uniform(0.8, 1.2)) + backoff
@@ -1228,11 +1694,18 @@ class Collector:
 
     # -- uploading ---------------------------------------------------------------
     def apply_policy(self, policy):
-        """What the server can set: pause, go slower, show a short message, the date the season began."""
+        """What the server can set: pause, go slower, switch fast mode off, show a short message,
+        the date the season began."""
         if not isinstance(policy, dict):
             return
         self.policy_at = self.now()
         self.enabled = policy.get("enabled") is not False
+        fast_allowed = policy.get("fast") is not False
+        if self.fast and fast_allowed != self.fast_allowed:
+            self.say("ArenaSweats has switched fast mode back on. 快速模式已恢复。" if fast_allowed else
+                     "ArenaSweats has switched fast mode off for now, so collection goes at the normal pace. "
+                     "ArenaSweats 已暂时关闭快速模式，现按正常速度采集。")
+        self.fast_allowed = fast_allowed
         season = policy.get("season_start")
         if isinstance(season, int) and not isinstance(season, bool) and 0 < season < 2 ** 53:
             self.season_start = season
@@ -1261,10 +1734,22 @@ class Collector:
                 self.say("Signed up with ArenaSweats.")
                 return
             if status == 403:
-                raise Fatal("ArenaSweats is not taking new collectors right now. Please try again another day.")
+                raise Fatal("ArenaSweats is not taking new collectors right now. Please try again another day.\n"
+                            "ArenaSweats 目前不接受新的采集器，请改天再试。")
             log.info("sign-up answered %s", status)
-            self.say("Cannot reach ArenaSweats yet. Trying again in a minute.", once=True)
-            self.sleep(max(60, wait))
+            wait = max(60, wait)
+            self.cannot_reach(status, -(-wait // 60))
+            self.sleep(wait)
+
+    def cannot_reach(self, status, minutes=None):
+        """Say briefly, in English and Simplified Chinese, why ArenaSweats could not be reached and
+        when the next try is. The details are in the log file, which the last line names."""
+        english, chinese = why_unreachable(status, self.server.problem)
+        when = (("Trying again in %d min." % minutes, "%d 分钟后重试。" % minutes) if minutes
+                else ("Trying again shortly.", "稍后重试。"))
+        self.say("Cannot reach ArenaSweats yet: %s. %s\n%s暂时连不上 ArenaSweats：%s。%s\n%sDetails / 详细信息: %s"
+                 % (english, when[0], " " * 9, chinese, when[1], " " * 9, os.path.join(self.data_dir, "collector.log")),
+                 once=True)
 
     def heartbeat(self, state):
         """While it waits, still tell ArenaSweats every 10 minutes what it is doing, so a paused
@@ -1286,7 +1771,7 @@ class Collector:
         elif status in (401, 403):
             raise self.bad_key()
         elif first:
-            self.say("Cannot reach ArenaSweats yet. Trying again shortly.")
+            self.cannot_reach(status)
 
     def upload(self, final=False):
         """Send waiting matches to ArenaSweats, one batch at a time."""
@@ -1399,9 +1884,9 @@ def latest_release(base_url):
     """What ArenaSweats says the newest collector is ({version, sha256, url}), or None.
     The download must come from the same server this collector talks to."""
     base = base_url.rstrip("/")
-    request = urllib.request.Request(base + "/latest", headers={"User-Agent": "arenasweats-collector/" + VERSION})
-    with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
-        data = as_dict(parse_json(response.read(65536)))
+    status, body, _ = request_url(base + "/latest", headers={"User-Agent": "arenasweats-collector/" + VERSION},
+                                  timeout=10)
+    data = as_dict(parse_json(body)) if status == 200 else {}
     path, digest = data.get("path"), data.get("sha256")
     if (version_tuple(data.get("version")) and isinstance(path, str) and re.fullmatch(r"/download/[A-Za-z0-9_.-]{1,80}", path)
             and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
@@ -1415,21 +1900,17 @@ def install_update(release, exe_path):
     it is removed on the next start. Raises on any problem, leaving this program as it was."""
     temp = os.path.join(os.path.dirname(exe_path), ".ArenaSweatsCollector.update")
     old = exe_path + ".old"
-    digest, size = hashlib.sha256(), 0
-    request = urllib.request.Request(release["url"], headers={"User-Agent": "arenasweats-collector/" + VERSION})
+    status, body, _ = request_url(release["url"], headers={"User-Agent": "arenasweats-collector/" + VERSION},
+                                  timeout=60, limit=MAX_UPDATE_BYTES + 1)
+    if status != 200:
+        raise ValueError("the download answered with status %d" % status)
+    if len(body) > MAX_UPDATE_BYTES:
+        raise ValueError("the download is too large")
+    if hashlib.sha256(body).hexdigest() != release["sha256"]:
+        raise ValueError("the download does not match its checksum")
     try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response, open(temp, "wb") as out:
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_UPDATE_BYTES:
-                    raise ValueError("the download is too large")
-                digest.update(chunk)
-                out.write(chunk)
-        if digest.hexdigest() != release["sha256"]:
-            raise ValueError("the download does not match its checksum")
+        with open(temp, "wb") as out:
+            out.write(body)
         if os.path.exists(old):
             os.remove(old)
         os.replace(exe_path, old)
@@ -1448,7 +1929,8 @@ def offer_update(base_url, ask=input, spawn=subprocess.Popen):
     Returns True when the new version was started (this one should then stop)."""
     try:
         release = latest_release(base_url)
-    except (OSError, ValueError, http.client.HTTPException):
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        early_notes.append("update check got no answer: %s" % error)
         return False                        # no answer: carry on with this version
     if not release or version_tuple(release["version"]) <= version_tuple(VERSION):
         return False
@@ -1470,6 +1952,22 @@ def offer_update(base_url, ask=input, spawn=subprocess.Popen):
     print("Updated to %s. Starting it ..." % release["version"])
     spawn([sys.executable] + sys.argv[1:])
     return True
+
+
+FAST_ON = "Fast mode is on (experimental). 快速模式已开启（实验性）。"
+
+
+def ask_fast_mode(ask=input):
+    """Ask at start whether to turn fast mode on. Only a yes turns it on; Enter means no."""
+    print("Fast mode collects about %s times faster. It is experimental: we are not sure it is safe for your "
+          "League account." % FAST_SPEEDUP)
+    print("快速模式的采集速度约为正常速度的 %s 倍。此功能为实验性功能：我们不确定它对你的英雄联盟账号是否安全。"
+          % FAST_SPEEDUP)
+    try:
+        answer = ask("Turn it on? 是否开启？ [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+    return answer in ("y", "yes", "是")
 
 
 def remove_old_program():
@@ -1582,6 +2080,9 @@ def main(argv=None):
                         help="read nothing older than this UTC date, the start of the season (default %(default)s; "
                              "with an upload address, ArenaSweats sets it)")
     parser.add_argument("--data-dir", help="where to keep collected data (default: 'data' beside this program)")
+    parser.add_argument("--fast", action=argparse.BooleanOptionalAction,
+                        help="experimental: collect about %s times faster; we are not sure it is safe for your "
+                             "League account (either flag skips the question at start)" % FAST_SPEEDUP)
     parser.add_argument("--no-update", action="store_true", help="don't check for a newer version at start")
     parser.add_argument("--export", metavar="FILE",
                         help="write the match records held locally to FILE (JSON lines; .gz to compress) and exit")
@@ -1609,6 +2110,8 @@ def main(argv=None):
     log.addHandler(handler)
     log.setLevel(logging.INFO)
     log.info("=== collector %s starting on %s, python %s ===", VERSION, sys.platform, sys.version.split()[0])
+    for text in early_notes:
+        log.info("%s", text)
 
     code, lock, made = 0, None, None
     try:
@@ -1630,6 +2133,12 @@ def main(argv=None):
         else:
             print("It sends the Arena matches it reads to ArenaSweats%s. Close this window to stop."
                   % (", for up to %g min" % opts.minutes if opts.minutes else ""))
+        if server and opts.fast is None and sys.stdin and sys.stdin.isatty():
+            opts.fast = ask_fast_mode()         # after the update offer, so an update never asks twice
+        opts.fast = bool(opts.fast)
+        log.info("fast mode: %s", "on (experimental)" if opts.fast else "off")
+        if opts.fast:
+            print(FAST_ON)
         set_quick_edit(False)
         keep_awake()
         made = Collector(opts, data_dir, server)

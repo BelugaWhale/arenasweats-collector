@@ -44,7 +44,7 @@ MAX_GAME_BYTES = 300 * 1024      # one match record
 MAX_REPORTS = 20                 # match lists reported per work request
 MAX_REPORT_IDS = 3000            # matches named in one match-list report
 REQUESTS_PER_MINUTE = 60         # per key
-GAMES_PER_DAY = 60000            # per key; an honest collector cannot read more than ~45k a day
+GAMES_PER_DAY = 60000            # per key; an honest collector cannot read more than ~45k a day (fast mode: near this)
 SIGNUPS_PER_ADDRESS = 10         # new installs one internet address can sign up a day (many homes in China share one)
 SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close with: policy --signups off)
 ARENA_MODES = {"CHERRY"}
@@ -197,10 +197,12 @@ def date_ms(text):
 
 
 def get_policy(db):
-    """What collectors are told: whether to collect, the slowest pace we ask for, a short message, the season."""
+    """What collectors are told: whether to collect, the slowest pace we ask for, whether fast mode is allowed
+    (collectors whose user turned it on go at half that pace, never under 1 s), a short message, the season."""
     values = dict(db.execute("SELECT name, value FROM settings"))
     return {"enabled": values.get("enabled", "1") == "1",
             "delay": float(values.get("delay", "2")),
+            "fast": values.get("fast", "1") == "1",
             "message": values.get("message", ""),
             "season_start": int(values.get("season_start", date_ms(DEFAULT_SEASON_START)))}
 
@@ -302,7 +304,7 @@ SEEN_EVERY = 60                                 # store a contributor's "last se
 def note_seen(db, contributor, now):
     """Remember when an install last got in touch and what it said it was doing, for health checks."""
     state = request.headers.get("X-Collector-State", "")
-    state = state if re.fullmatch(r"[a-z_]{1,24}", state) else "unknown"
+    state = state if re.fullmatch(r"[a-z_]{1,32}", state) else "unknown"     # "_fast" at the end: fast mode is on
     agent = request.headers.get("User-Agent", "")
     version = agent.split("/", 1)[1] if agent.startswith("arenasweats-collector/") else ""
     version = version if re.fullmatch(r"[0-9A-Za-z.+-]{1,20}", version) else ""
@@ -803,7 +805,7 @@ def cmd_stats(db, _args):
         if relay["last_urgent_at"] else "never"))
     rules = get_policy(db)
     print("Policy: %s, season starts %s UTC" % (
-        {name: rules[name] for name in ("enabled", "delay", "message")},
+        {name: rules[name] for name in ("enabled", "delay", "fast", "message")},
         time.strftime("%Y-%m-%d", time.gmtime(rules["season_start"] / 1000))))
 
 
@@ -811,9 +813,9 @@ def cmd_policy(db, args):
     season = date_ms(args.season_start) if args.season_start else None
     with db:
         before = get_policy(db)["season_start"]
-        signups = {"on": 1, "off": 0}.get(args.signups)
+        signups, fast = {"on": 1, "off": 0}.get(args.signups), {"on": 1, "off": 0}.get(args.fast)
         for name, value in (("enabled", args.enabled), ("delay", args.delay), ("message", args.message),
-                            ("season_start", season), ("signups", signups)):
+                            ("season_start", season), ("signups", signups), ("fast", fast)):
             if value is not None:
                 db.execute("INSERT OR REPLACE INTO settings VALUES(?, ?)", (name, str(value)))
         if season is not None and season < before:
@@ -939,7 +941,7 @@ def relay_status(db, now):
         platforms[platform] = {"held": held, "last_received_at": newest, "hourly_newest_first": hourly,
                                "senders_last_hour": senders[0], "senders_last_day": senders[1]}
     policy = get_policy(db)
-    return {"now": now, "season_start": policy["season_start"], "collecting": policy["enabled"],
+    return {"now": now, "season_start": policy["season_start"], "collecting": policy["enabled"], "fast": policy["fast"],
             "signups": signups_open(db), "waiting": db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],
             "oldest_waiting_received_at": first[0] if first else None,
             "last_export_at": int(values["relay_export_at"]) if "relay_export_at" in values else None,
@@ -1004,6 +1006,8 @@ def main(argv=None):
     policy_parser.add_argument("--on", dest="enabled", action="store_const", const=1, help="collectors may collect")
     policy_parser.add_argument("--off", dest="enabled", action="store_const", const=0, help="all collectors pause")
     policy_parser.add_argument("--delay", type=float, help="slowest pace to ask for, in seconds per request")
+    policy_parser.add_argument("--fast", choices=("on", "off"),
+                               help="whether collectors whose user turned fast mode on may use it (off: normal pace)")
     policy_parser.add_argument("--message", help="short message shown to every collector ('' to clear)")
     policy_parser.add_argument("--signups", choices=("on", "off"),
                                help="whether new installs can get their own key automatically")

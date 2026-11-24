@@ -36,6 +36,13 @@ class CollectorCase(unittest.TestCase):
         self.league_dir = self.fake.write_lockfile(os.path.join(self.tmp.name, "League"))
         self.data_dir = os.path.join(self.tmp.name, "data")
         os.makedirs(self.data_dir)
+        # This computer's own programs and League install are not part of the tests: a League client
+        # running here must never be found and read from.
+        for name, value in (("process_table", lambda: {}), ("running_programs", lambda: []),
+                            ("installer_dirs", lambda: []), ("installed_dirs", lambda: [])):
+            original = getattr(collector, name)
+            setattr(collector, name, value)
+            self.addCleanup(setattr, collector, name, original)
 
     def collector(self, minutes=60, server=None, hours_later=0, **options):
         opts = argparse.Namespace(league_dir=self.league_dir, delay=2.0, minutes=minutes,
@@ -159,6 +166,12 @@ class Gentle(CollectorCase):
         self.assertGreater(len(gaps), 50)
         self.assertGreaterEqual(min(gaps), 2.0 * 0.8 - 0.001)
 
+    def test_the_client_state_is_not_asked_before_every_request(self):
+        self.run_collector()
+        phase = [r for r in self.fake.requests if r[1] == "/lol-gameflow/v1/gameflow-phase"]
+        self.assertGreater(len(history(self.fake.requests)), 50)
+        self.assertLessEqual(len(phase), len(history(self.fake.requests)) / 2)      # was one per request
+
     def test_pace_has_a_hard_floor(self):
         self.run_collector(delay=0.0)
         self.assertGreaterEqual(min(self.gaps(self.fake.requests)), 1.0 - 0.001)   # never above one a second
@@ -216,6 +229,119 @@ class Gentle(CollectorCase):
         made = self.run_collector()
         self.assertIn("Waiting for the League client", self.output.getvalue())
         self.assertEqual(self.stored_ids(made), self.fake.arena_ids())
+
+
+class FastMode(CollectorCase):
+    """Fast mode (experimental, only when the user turns it on): half the gap, with every other limit kept."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.close()
+        self.fake = FakeClient(players=100, arena=400, clock=self.clock)    # enough to keep it reading for a while
+        self.fake.write_lockfile(self.league_dir)
+
+    def gaps(self, requests):
+        times = [when for _, _, when in history(requests)]
+        return [b - a for a, b in zip(times, times[1:])]
+
+    def test_is_off_unless_turned_on(self):
+        made = self.run_collector(minutes=10)
+        self.assertFalse(made.fast_on)
+        self.assertGreaterEqual(min(self.gaps(self.fake.requests)), 2.0 * 0.8 - 0.001)
+
+    def test_halves_the_gap_but_keeps_the_hard_floor(self):
+        made = self.run_collector(minutes=10, fast=True)
+        gaps = self.gaps(self.fake.requests)
+        self.assertGreater(len(gaps), 300)
+        self.assertGreaterEqual(min(gaps), collector.MIN_DELAY - 0.001)      # never above one a second
+        self.assertLess(sorted(gaps)[len(gaps) // 2], 1.2)
+        self.assertEqual(made.delay, collector.MIN_DELAY)
+        self.assertIn("one request every 1.0 seconds", self.output.getvalue())
+        self.fake.requests.clear()
+        self.run_collector(minutes=10, fast=True, delay=0.0)                  # asking for less changes nothing
+        self.assertGreaterEqual(min(self.gaps(self.fake.requests)), collector.MIN_DELAY - 0.001)
+
+    def test_reads_more_in_the_same_time(self):
+        normal = self.run_collector(minutes=5)
+        requests = len(history(self.fake.requests))
+        self.fake.requests.clear()
+        self.data_dir = os.path.join(self.tmp.name, "data-fast")             # start again from nothing
+        os.makedirs(self.data_dir)
+        fast = self.run_collector(minutes=5, fast=True)
+        self.assertGreater(len(history(self.fake.requests)), requests * 1.8)
+        self.assertGreater(len(self.stored_ids(fast)), len(self.stored_ids(normal)) * 1.6)
+
+    def test_a_slower_pace_the_user_chose_is_halved_not_ignored(self):
+        self.run_collector(minutes=10, fast=True, delay=6.0)
+        self.assertGreaterEqual(min(self.gaps(self.fake.requests)), 3.0 * 0.8 - 0.001)
+
+    def test_no_match_history_requests_while_playing(self):
+        start = self.clock.now()
+        self.fake.phase = "InProgress"                                    # already in a game at start
+        self.clock.at(start + 600, lambda: setattr(self.fake, "phase", "None"))
+        self.clock.at(start + 700, lambda: setattr(self.fake, "phase", "ChampSelect"))
+        self.clock.at(start + 1000, lambda: setattr(self.fake, "phase", "Lobby"))
+        self.run_collector(minutes=30, fast=True)
+        times = [when - start for _, _, when in history(self.fake.requests)]
+        for when in times:
+            for begin, end in ((0, 600 + collector.RESUME_GRACE - 5), (700 + 5, 1000 + collector.RESUME_GRACE - 5)):
+                self.assertFalse(begin <= when < end, "request at %.0fs while the player was busy" % when)
+        self.assertTrue(any(600 < when < 700 for when in times))
+        self.assertTrue(any(when > 1000 for when in times))
+        self.assertIn("Paused while you play", self.output.getvalue())
+
+    def test_backs_off_when_requests_fail(self):
+        self.run_collector(minutes=10, fast=True)                         # learn the players first
+        self.fake.fail = lambda path: 500 if "match-history" in path else None
+        before = len(self.fake.requests)
+        made = self.run_collector(minutes=120, hours_later=7, fast=True)
+        gaps = self.gaps(self.fake.requests[before:])
+        self.assertLessEqual(len(gaps), 25)                              # two hours, a couple of dozen tries
+        self.assertGreaterEqual(max(gaps), collector.MAX_BACKOFF)
+        self.assertEqual(gaps[:6], sorted(gaps[:6]))                     # waits grow
+        self.assertGreaterEqual(min(gaps), 2.0 * 0.8 - 0.001)            # and fast mode rests after 3 failures
+        self.assertFalse(made.fast_on)
+
+    def test_rests_at_the_normal_pace_after_the_client_pushes_back(self):
+        self.addCleanup(setattr, collector, "FAST_REST", collector.FAST_REST)
+        collector.FAST_REST = 600
+        start = self.clock.now()
+        self.fake.fail = lambda path: 429 if "/v1/games/" in path and self.clock.now() < start + 60 else None
+        self.run_collector(minutes=30, fast=True)
+        times = [when - start for _, _, when in history(self.fake.requests)]
+        resting = [b - a for a, b in zip(times, times[1:]) if 60 < a < 590]
+        later = [b - a for a, b in zip(times, times[1:]) if a > 700]
+        self.assertTrue(resting and later)
+        self.assertGreaterEqual(min(resting), 2.0 * 0.8 - 0.001)          # the normal pace while resting
+        self.assertLess(sorted(later)[len(later) // 2], 1.2)              # then fast again
+        self.assertEqual(self.output.getvalue().count("fast mode rests for an hour"), 1)
+
+    def test_the_question_defaults_to_no(self):
+        for answer, expected in (("", False), ("n", False), ("no", False), ("whatever", False),
+                                 ("y", True), (" Yes ", True), ("是", True)):
+            asked = []
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(collector.ask_fast_mode(lambda prompt: asked.append(prompt) or answer), expected)
+            self.assertEqual(asked, ["Turn it on? 是否开启？ [y/N] "])
+        self.assertIn("Fast mode collects about %s times faster. It is experimental: we are not sure it is safe "
+                      "for your League account." % collector.FAST_SPEEDUP, output.getvalue())
+        self.assertIn("快速模式的采集速度约为正常速度的 %s 倍。此功能为实验性功能：我们不确定它对你的英雄联盟账号是否安全。"
+                      % collector.FAST_SPEEDUP, output.getvalue())
+
+        def closed(prompt):
+            raise EOFError
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(collector.ask_fast_mode(closed))
+
+    def test_the_flag_turns_it_on_and_says_so_every_start(self):
+        for flags, on in ((["--fast"], True), (["--no-fast"], False), ([], False)):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                collector.main(["--test-run", "--minutes", "0.02", "--league-dir", self.league_dir,
+                                "--data-dir", self.data_dir] + flags)
+            self.assertEqual(collector.FAST_ON in output.getvalue(), on, flags)
+            with open(os.path.join(self.data_dir, "collector.log"), encoding="utf-8") as handle:
+                last = [line for line in handle if "fast mode: " in line][-1]
+            self.assertIn("fast mode: on (experimental)" if on else "fast mode: off", last)
 
 
 class Failures(CollectorCase):
@@ -476,6 +602,147 @@ class HiddenClient(CollectorCase):
         self.assertEqual(made.opts.league_dir, os.path.join(install, "TCLS"))
         self.assertEqual(collector.lockfile_paths(made.opts.league_dir)[0],
                          [os.path.join(install, "LeagueClient", "lockfile")])
+
+
+class PlainLcu(collector.Lcu):
+    """The fake client speaks plain HTTP, where the real one speaks HTTPS."""
+
+    def __init__(self, port, token, scheme="https"):
+        super().__init__(port, token, "http")
+
+
+class ClientPrograms(CollectorCase):
+    """The Tencent client: its lockfile has one field, so the port and password come from
+    LeagueClientUx's command line. Windows' list of running programs is pretend here."""
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.league_dir, "lockfile"), "w") as handle:
+            handle.write("12345")
+        self.client = self.fake
+        self.programs = {}
+        self.start_client(4141, 4242, up=3600)
+        for pid, name in ((77, "SGuard64.exe"), (78, "tcls_core.exe"), (79, "wegame.exe")):
+            self.programs[pid] = collector.Running(pid, name, self.wall() - 7200, 50 << 20, 40 << 20, 300)
+        self.opened, self.refuse = [], False
+
+        def query_program(pid, command_line=False):
+            self.opened.append((pid, command_line))
+            if self.refuse:
+                return None, None, 5
+            line = "LeagueClientUx.exe --app-port=%d --remoting-auth-token=%s" % (self.client.port, self.client.token)
+            return os.path.join(self.league_dir, self.programs[pid].name), line if command_line else None, 0
+        for name, value in (("running_programs", lambda: [(pid, p.name) for pid, p in self.programs.items()]),
+                            ("process_table", lambda: dict(self.programs)), ("query_program", query_program),
+                            ("installer_dirs", lambda: []), ("installed_dirs", lambda: []),
+                            ("scan_drives", lambda: []), ("Lcu", PlainLcu)):
+            original = getattr(collector, name)
+            setattr(collector, name, value)
+            self.addCleanup(setattr, collector, name, original)
+        collector.answers.clear()
+        self.addCleanup(collector.answers.clear)
+
+    def wall(self):
+        return self.real_start + self.clock.now()
+
+    def start_client(self, main_pid, window_pid, up=0):
+        for pid, name, memory in ((main_pid, "LeagueClient.exe", 300), (window_pid, "LeagueClientUx.exe", 200),
+                                  (window_pid + 1, "LeagueClientUxRender.exe", 100),
+                                  (window_pid + 2, "LeagueClientUxRender.exe", 150)):
+            self.programs[pid] = collector.Running(pid, name, self.wall() - up, memory << 20, (memory + 50) << 20, 900)
+
+    def close_client(self):
+        for pid in [pid for pid, p in self.programs.items() if p.name.lower().startswith("leagueclient")]:
+            del self.programs[pid]
+        self.client.close()
+
+    def restart_client(self):
+        self.close_client()
+        self.client = FakeClient(clock=self.clock)
+        self.addCleanup(self.client.close)
+        self.start_client(5151, 5252)
+
+    def run_logged(self, **kwargs):
+        with self.assertLogs(collector.log, "INFO") as logs:
+            made = self.run_collector(**kwargs)
+        return made, logs.output
+
+    def test_the_client_is_opened_once_while_it_runs(self):
+        dropped = []
+
+        def drop(path):         # the connection drops once, 2 minutes in
+            if self.clock.now() > 1000 + 120 and not dropped:
+                dropped.append(path)
+                return True
+            return False
+        self.fake.drop = drop
+        made = self.run_collector()
+        self.assertIn("The League client closed", self.output.getvalue())
+        self.assertEqual(len([r for r in self.fake.requests if r[1] == "/lol-summoner/v1/current-summoner"]), 2)
+        self.assertEqual(self.opened, [(4141, False), (4242, False), (4242, True)])     # was three more each round
+        self.assertEqual(self.stored_ids(made), self.fake.arena_ids())
+
+    def test_a_restarted_client_is_read_again(self):
+        self.clock.at(self.clock.now() + 120, self.restart_client)
+        self.run_collector()
+        self.assertEqual(self.opened, [(4141, False), (4242, False), (4242, True),
+                                       (5151, False), (5252, False), (5252, True)])
+        self.assertTrue(history(self.client.requests))           # collecting from the new client
+
+    def test_a_refusal_is_asked_again_only_now_and_then(self):
+        self.refuse = True
+        self.addCleanup(setattr, sys, "stdin", sys.stdin)
+        sys.stdin = io.StringIO()          # not a console: the collector must not stop to ask for the folder
+        self.run_collector(minutes=60, league_dir=None)
+        self.assertIn("cannot reach it yet", self.output.getvalue())
+        self.assertLessEqual(len(self.opened), 3 * (3600 / collector.QUERY_RETRY + 1))   # was 3 every 10 seconds
+
+    def test_a_new_program_with_the_same_process_id_is_read_again(self):
+        first = {4242: collector.Running(4242, "LeagueClientUx.exe", 100.0, 0, 0, 0)}
+        later = {4242: collector.Running(4242, "LeagueClientUx.exe", 200.0, 0, 0, 0)}
+        for table in (first, first, later, later):
+            collector.query_once(4242, command_line=True, table=table)
+        self.assertEqual(self.opened, [(4242, True), (4242, True)])
+
+    def test_the_client_is_described_every_ten_minutes(self):
+        _, output = self.run_logged(minutes=35)
+        lines = [line for line in output if "League client: LeagueClient pid 4141 up 1h" in line]
+        self.assertGreaterEqual(len(lines), 4)
+        self.assertIn("memory 300 MB, private 350 MB, 900 handles; LeagueClientUx pid 4242 up 1h", lines[-1])
+        self.assertIn("2 LeagueClientUxRender programs, memory 250 MB", lines[-1])
+        self.assertIn("requests to the client", lines[-1])
+
+    def test_the_moment_the_client_closes_is_logged_with_what_the_collector_was_doing(self):
+        self.clock.at(self.clock.now() + 120, self.close_client)
+        _, output = self.run_logged(minutes=30)
+        self.assertIn("Waiting for the League client", self.output.getvalue())
+        closed = [line for line in output if "League client program closed" in line]
+        self.assertEqual(len(closed), 1)
+        for text in ("LeagueClient (pid 4141) after running 1h02m, memory 300 MB", "LeagueClientUx (pid 4242)",
+                     "2 of 2 LeagueClientUxRender programs closed too", "last request to the client",
+                     "Programs still running: tcls_core.exe, wegame.exe", "Crash reporters running: none"):
+            self.assertIn(text, closed[0])
+        gone = [line for line in output if "client gone:" in line]
+        self.assertTrue(gone and "last request to the client" in gone[0], gone)
+        self.assertNotIn(self.fake.token, "\n".join(output))
+
+    @unittest.skipUnless(os.name == "nt", "reads Windows' list of running programs")
+    def test_windows_list_of_programs(self):
+        import subprocess
+        started = time.time()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        time.sleep(1)
+        table = self.original_process_table()
+        me, kid = table[os.getpid()], table[child.pid]
+        self.assertEqual(os.path.normcase(kid.name), os.path.normcase(os.path.basename(sys.executable)))
+        self.assertLess(abs(kid.started - started), 5)
+        self.assertGreater(me.memory, 1 << 20)
+        self.assertGreater(me.private, 1 << 20)
+        self.assertGreater(me.handles, 0)
+
+    original_process_table = staticmethod(collector.process_table)
 
 
 if __name__ == "__main__":

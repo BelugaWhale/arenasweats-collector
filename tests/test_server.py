@@ -8,6 +8,10 @@ import hashlib
 import io
 import json
 import os
+import shutil
+import socket
+import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -731,14 +735,21 @@ class Policy(ServerCase):
     def test_policy_is_served_and_changeable(self):
         headers = {"Authorization": "Bearer " + self.key}
         self.assertEqual(self.client.get("/v1/policy", headers=headers).get_json(),
-                         {"enabled": True, "delay": 2.0, "message": "", "season_start": ingest.date_ms("2026-10-06")})
-        self.admin("policy", "--off", "--delay", "5", "--message", "back soon", "--season-start", "2027-01-15")
+                         {"enabled": True, "delay": 2.0, "fast": True, "message": "",
+                          "season_start": ingest.date_ms("2026-10-06")})
+        self.admin("policy", "--off", "--delay", "5", "--message", "back soon", "--season-start", "2027-01-15",
+                   "--fast", "off")
         self.assertEqual(self.client.get("/v1/policy", headers=headers).get_json(),
-                         {"enabled": False, "delay": 5.0, "message": "back soon",
+                         {"enabled": False, "delay": 5.0, "fast": False, "message": "back soon",
                           "season_start": ingest.date_ms("2027-01-15")})
         self.assertEqual(self.post(self.games).get_json()["policy"]["enabled"], False)
+        self.assertEqual(self.work()["policy"]["fast"], False)
+        self.assertFalse(ingest.relay_status(self.db, self.now)["fast"])
         self.assertIn("Not understood", self.admin("policy", "--season-start", "next week"))
         self.assertIn("season starts 2027-01-15", self.admin("stats"))
+        self.assertIn("'fast': False", self.admin("stats"))
+        self.admin("policy", "--fast", "on")
+        self.assertEqual(self.client.get("/v1/policy", headers=headers).get_json()["fast"], True)
 
 
 class Signups(ServerCase):
@@ -1041,6 +1052,180 @@ class EndToEnd(WithServer):
         self.assertIsNone(collector.Server("https://arenasweats.lol/collector", "").key)    # it signs up instead
 
 
+class Reaching(WithServer):
+    """When ArenaSweats cannot be reached, the collector gets round what it can and says why."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, collector, "_way", collector._way)
+        self.addCleanup(setattr, collector, "save_config", collector.save_config)
+        collector.save_config = lambda **values: None
+
+    def dead_proxy(self):
+        """Windows' settings name a proxy that is not running (nothing listens on port 9)."""
+        self.addCleanup(setattr, collector, "system_proxy", collector.system_proxy)
+        collector.system_proxy = lambda url: "http://user:secret@127.0.0.1:9"
+        collector._way = "proxy"
+        patch = unittest.mock.patch.object(urllib.request, "proxy_bypass", lambda host: False)   # even for 127.0.0.1
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_the_lets_encrypt_roots_are_carried_and_trusted_even_when_windows_has_none(self):
+        found = {hashlib.sha256(ssl.PEM_cert_to_DER_cert("-----BEGIN" + block)).hexdigest()
+                 for block in collector.EXTRA_ROOTS.split("-----BEGIN")[1:]}
+        self.assertEqual(found, set(collector.EXTRA_ROOT_NAMES))
+        self.addCleanup(setattr, collector, "_https", None)
+        with unittest.mock.patch.object(ssl, "create_default_context",
+                                        lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)):   # a store with nothing in it
+            collector._https = None
+            trusted = {dict(item[0] for item in cert["subject"])["commonName"]
+                       for cert in collector.https_context().get_ca_certs()}
+        self.assertEqual(trusted, {"ISRG Root X1", "ISRG Root X2"})
+
+    @unittest.skipUnless(shutil.which("openssl"), "needs the openssl program to make a certificate")
+    def test_an_untrusted_certificate_is_named_as_the_reason(self):
+        cert, key = os.path.join(self.tmp.name, "cert.pem"), os.path.join(self.tmp.name, "key.pem")
+        made = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
+                               "-out", cert, "-days", "2", "-subj", "/CN=127.0.0.1"], capture_output=True)
+        if made.returncode:
+            self.skipTest("openssl could not make a certificate here")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        listener = context.wrap_socket(socket.create_server(("127.0.0.1", 0)), server_side=True)
+        self.addCleanup(listener.close)
+
+        def serve():
+            while listener.fileno() != -1:          # until it is closed at the end of the test
+                try:
+                    listener.accept()[0].close()
+                except OSError:
+                    pass                # the collector refused the certificate, as it should
+
+        threading.Thread(target=serve, daemon=True).start()
+        server = collector.Server("https://127.0.0.1:%d" % listener.getsockname()[1], None)
+        with self.assertLogs("collector", "WARNING") as logged:
+            self.run_collector(minutes=3, server=server)
+        output = self.output.getvalue()
+        self.assertIn("Cannot reach ArenaSweats yet: certificate check failed. Trying again in 1 min.", output)
+        self.assertIn("暂时连不上 ArenaSweats：证书验证失败。1 分钟后重试。", output)
+        self.assertIn(os.path.join(self.data_dir, "collector.log"), output)
+        self.assertEqual(output.count("Cannot reach"), 1)            # said once, not every minute
+        self.assertIn("SSLCertVerificationError", "\n".join(logged.output))
+
+    def test_a_proxy_that_is_not_running_is_gone_round(self):
+        self.dead_proxy()
+        with self.assertLogs("collector", "INFO") as logged:
+            self.run_collector(minutes=30, server=collector.Server(self.url, None))
+        self.assertIn("Signed up with ArenaSweats.", self.output.getvalue())
+        self.assertTrue(self.server_ids())
+        self.assertEqual(collector._way, "direct")                  # tried directly first from then on
+        log_text = "\n".join(logged.output)
+        self.assertIn("answered directly after: proxy 127.0.0.1:9: ConnectionRefusedError", log_text)
+        self.assertNotIn("secret", log_text)
+
+    def test_when_no_way_answers_each_ways_problem_is_named(self):
+        self.dead_proxy()
+        self.run_collector(minutes=3, server=collector.Server("http://127.0.0.1:9", None))
+        output = self.output.getvalue()
+        self.assertIn("Cannot reach ArenaSweats yet: proxy 127.0.0.1:9: connection refused; "
+                      "direct: connection refused.", output)
+        self.assertIn("代理 127.0.0.1:9：连接被拒绝；直连：连接被拒绝。", output)
+        self.assertNotIn("secret", output)
+
+    def test_a_busy_server_is_named_and_its_wait_is_kept(self):
+        self.addCleanup(setattr, ingest, "SIGNUPS_PER_ADDRESS", ingest.SIGNUPS_PER_ADDRESS)
+        ingest.SIGNUPS_PER_ADDRESS = 0
+        asked = []
+        original = collector.Server.call
+        def call(server, method, path, payload=None):
+            asked.append(path)
+            return original(server, method, path, payload)
+        self.addCleanup(setattr, collector.Server, "call", original)
+        collector.Server.call = call
+        self.run_collector(minutes=90, server=collector.Server(self.url, None))
+        output = self.output.getvalue()
+        self.assertIn("Cannot reach ArenaSweats yet: ArenaSweats is busy, status 429. Trying again in 60 min.", output)
+        self.assertIn("ArenaSweats 繁忙，状态码 429。60 分钟后重试。", output)
+        self.assertEqual(asked, ["/v1/register"] * 2)              # at the start and an hour later, as asked
+
+    def test_each_kind_of_problem_has_its_own_words(self):
+        expired = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        expired.verify_code, expired.verify_message = 10, "certificate has expired"
+        cases = [
+            (urllib.error.URLError(expired), "check this PC's date and time", "请检查电脑的日期和时间"),
+            (urllib.error.URLError(TimeoutError("timed out")), "timed out", "超时"),
+            (TimeoutError("The read operation timed out"), "timed out", "超时"),
+            (urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")), "DNS", "DNS"),
+            (urllib.error.URLError(ConnectionResetError(10054, "reset by peer")), "cut off", "中断"),
+            (urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol")), "TLS", "TLS"),
+            (urllib.error.URLError(OSError("Tunnel connection failed: 502 Bad Gateway")), "proxy", "代理"),
+            (urllib.error.URLError(OSError(10051, "network is unreachable")), "no network", "网络不通"),
+        ]
+        for error, english, chinese in cases:
+            words = collector.why_unreachable(0, [("direct", error, 1.0)])
+            self.assertIn(english, words[0], error)
+            self.assertIn(chinese, words[1], error)
+        self.assertEqual(collector.why_unreachable(502)[0], "ArenaSweats server error, status 502")
+        self.assertEqual(collector.why_unreachable(404)[1], "ArenaSweats 返回状态码 404")
+
+    def test_an_update_check_that_gets_no_answer_is_noted_for_the_log(self):
+        self.assertFalse(collector.offer_update("http://127.0.0.1:9"))
+        self.assertIn("update check got no answer: direct: ConnectionRefusedError", collector.early_notes[-1])
+
+
+class FastWithServer(WithServer):
+    """Fast mode with the real ingest application: ArenaSweats still has the last word."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.close()
+        self.fake = FakeClient(players=150, arena=800, clock=self.clock)    # enough to keep it reading for a while
+        self.fake.write_lockfile(self.league_dir)
+
+    def gaps(self, start=0.0):
+        """(when, gap to the next one) for every match-history request, `when` counted from `start`."""
+        times = [when - start for _, _, when in history(self.fake.requests)]
+        return [(a, b - a) for a, b in zip(times, times[1:])]
+
+    @staticmethod
+    def median(values):
+        return sorted(values)[len(values) // 2]
+
+    def test_fast_mode_is_reported_so_we_can_see_who_uses_it(self):
+        self.run_collector(minutes=5, server=self.server(), fast=True)
+        self.assertTrue(self.server_ids())
+        self.assertLess(self.median([gap for _, gap in self.gaps()]), 1.2)
+        self.assertEqual(self.db.execute("SELECT state FROM contributor_seen").fetchone()[0], "collecting_fast")
+        self.assertEqual(ingest.relay_status(self.db, ingest.clock())["installs_seen"]["last_hour"],
+                         {"collecting_fast": 1})
+        self.assertIn("collecting_fast", self.admin("keys"))
+
+    def test_the_server_can_switch_fast_mode_off_for_everyone(self):
+        start = self.clock.now()
+        self.clock.at(start + 300, lambda: self.admin("policy", "--fast", "off"))
+        self.clock.at(start + 900, lambda: self.admin("policy", "--fast", "on"))
+        self.run_collector(minutes=20, server=self.server(), fast=True)
+        gaps = self.gaps(start)
+        before = [gap for at, gap in gaps if at < 300]
+        off = [gap for at, gap in gaps if 300 + 90 < at < 900]           # its next answer from ArenaSweats says so
+        again = [gap for at, gap in gaps if at > 900 + 90]
+        self.assertTrue(before and off and again)
+        self.assertLess(self.median(before), 1.2)
+        self.assertGreaterEqual(min(off), 2.0 * 0.8 - 0.001)             # the normal pace
+        self.assertLess(self.median(again), 1.2)
+        self.assertIn("ArenaSweats has switched fast mode off for now", self.output.getvalue())
+        self.assertIn("ArenaSweats has switched fast mode back on", self.output.getvalue())
+
+    def test_the_server_can_still_slow_it_down_or_stop_it(self):
+        self.admin("policy", "--delay", "6")
+        self.run_collector(minutes=10, server=self.server(), fast=True)
+        self.assertGreaterEqual(min(gap for _, gap in self.gaps()), 3.0 * 0.8 - 0.001)   # half of 6 s, not 1 s
+        self.admin("policy", "--off")
+        before = len(self.fake.requests)
+        self.run_collector(minutes=30, server=self.server(), fast=True, hours_later=7)
+        self.assertEqual(history(self.fake.requests[before:]), [])
+
+
 class Updates(WithServer):
     """A collector offers to update itself from the server it talks to."""
 
@@ -1096,6 +1281,96 @@ class Updates(WithServer):
             self.assertFalse(collector.offer_update(self.url, ask=lambda prompt: "n", spawn=self.fail))
         with open(self.program, "rb") as handle:
             self.assertEqual(handle.read(), b"old program")
+
+    def test_the_question_is_update_now_y_or_n_with_yes_on_enter(self):
+        self.publish("99.0.0", b"new program")
+        self.addCleanup(setattr, sys, "executable", sys.executable)
+        sys.executable = self.program
+        for answer, updates in (("", True), ("Y", True), ("yes", True), ("是", True), ("n", False), ("no", False),
+                                ("否", False)):
+            with open(self.program, "wb") as handle:
+                handle.write(b"old program")
+            asked, started = [], []
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                result = collector.offer_update(self.url, ask=lambda prompt: asked.append(prompt) or answer,
+                                                spawn=started.append)
+            self.assertEqual(result, updates, answer)
+            self.assertEqual(asked, ["Update now? 现在更新？ [Y/n] "])
+            self.assertIn("A new version of the collector is available: 99.0.0 (you have %s).\n"
+                          "有新版本的采集器：99.0.0（当前 %s）。" % (collector.VERSION, collector.VERSION), output.getvalue())
+            with open(self.program, "rb") as handle:
+                self.assertEqual(handle.read(), b"new program" if updates else b"old program")
+            self.assertEqual(started, [[self.program] + sys.argv[1:]] if updates else [])
+            self.assertEqual("Keeping version %s." % collector.VERSION in output.getvalue(), not updates)
+
+    def start(self, typed, *flags):
+        """Start main() as the packaged Windows program does, with `typed` as what the player types (one answer
+        a line). Returns (exit code, what the window showed, the programs it started, its own arguments)."""
+        class Console(io.StringIO):
+            def isatty(self):
+                return True
+
+        class WindowsOs:                    # this computer's os, but named as Windows' until the update offer
+            name = "nt"
+
+            def __getattr__(self, name):
+                return getattr(os, name)
+        started, offer = [], collector.offer_update
+
+        def offer_update(url):
+            collector.os = os               # from here on, what really runs here
+            return offer(url, spawn=started.append)
+        argv = [self.program, "--server", self.url, "--key", self.key, "--league-dir", self.league_dir,
+                "--data-dir", self.data_dir, "--minutes", "0.04"] + list(flags)
+        with contextlib.ExitStack() as stack:
+            for name, value in (("executable", self.program), ("argv", argv), ("frozen", True),
+                                ("stdin", Console(typed))):
+                stack.enter_context(unittest.mock.patch.object(sys, name, value, create=True))
+            stack.enter_context(unittest.mock.patch.object(collector, "offer_update", offer_update))
+            stack.enter_context(unittest.mock.patch.object(collector, "os", WindowsOs()))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            code = collector.main()
+        return code, output.getvalue(), started, argv
+
+    def assertInOrder(self, text, *parts):
+        places = [text.find(part) for part in parts]
+        self.assertNotIn(-1, places, parts)
+        self.assertEqual(places, sorted(places), parts)
+
+    def test_no_to_the_update_then_the_fast_mode_question_then_collection(self):
+        self.publish("99.0.0", b"new program")
+        code, shown, started, _ = self.start("n\ny\n")
+        self.assertEqual((code, started), (0, []))
+        self.assertInOrder(shown, "Update now? 现在更新？ [Y/n] ", "Keeping version", "Turn it on? 是否开启？ [y/N] ",
+                           collector.FAST_ON, "Connected to the League client", "Press Enter to close.")
+        self.assertEqual(shown.count("Turn it on?"), 1)
+        self.assertTrue(history(self.fake.requests))                       # and it collects
+        self.assertEqual(self.db.execute("SELECT state FROM contributor_seen").fetchone()[0], "collecting_fast")
+
+    def test_enter_to_the_fast_mode_question_means_no(self):
+        code, shown, _, _ = self.start("\n")
+        self.assertInOrder(shown, "Turn it on? 是否开启？ [y/N] ", "Connected to the League client")
+        self.assertNotIn(collector.FAST_ON, shown)
+        self.assertEqual(self.db.execute("SELECT state FROM contributor_seen").fetchone()[0], "collecting")
+
+    def test_yes_to_the_update_starts_the_new_version_with_the_same_choice_and_asks_nothing_more(self):
+        self.publish("99.0.0", b"new program")
+        code, shown, started, argv = self.start("\n", "--fast")
+        self.assertEqual(code, 0)
+        self.assertEqual(started, [argv])                                  # the same arguments, --fast included
+        self.assertEqual(started[0][-1], "--fast")
+        self.assertIn("Updated to 99.0.0. Starting it ...", shown)
+        self.assertNotIn("Turn it on?", shown)
+        self.assertEqual(history(self.fake.requests), [])                  # the old version stops there
+
+    def test_the_flags_skip_the_question(self):
+        self.publish(collector.VERSION, b"this version")                   # nothing newer
+        for flag, on in (("--fast", True), ("--no-fast", False)):
+            code, shown, _, _ = self.start("", flag)
+            self.assertEqual(code, 0)
+            self.assertNotIn("Update now?", shown)
+            self.assertNotIn("Turn it on?", shown)
+            self.assertEqual(collector.FAST_ON in shown, on)
 
     def test_a_download_that_fails_its_checksum_changes_nothing(self):
         self.publish("99.0.0", b"tampered program", digest="0" * 64)
@@ -1186,6 +1461,13 @@ class HostileServer(CollectorCase):
             self.assertTrue(any(p.fullmatch(path) for p in collector.LCU_ALLOWED), path)
         work_calls = [path for path in self.served if path == "/v1/work"]
         self.assertLessEqual(len(work_calls), 12 * 3600 / collector.WORK_SECONDS + 1)
+
+    def test_rubbish_answers_cannot_push_fast_mode_below_the_floor(self):
+        server = collector.Server("http://127.0.0.1:%d" % self.http.server_port, "as_key")
+        self.run_collector(minutes=3 * 60, server=server, fast=True)
+        times = [when for _, _, when in history(self.fake.requests)]
+        self.assertGreater(len(times), 20)
+        self.assertGreaterEqual(min(b - a for a, b in zip(times, times[1:])), collector.MIN_DELAY - 0.001)
 
 
 if __name__ == "__main__":

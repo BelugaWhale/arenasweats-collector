@@ -78,7 +78,8 @@ Trust covers what a match says, not its size or shape:
   keeps it equal to the newest GitHub release, checking the release's SHA-256, from the normal
   user's cron every 30 minutes.
 - Every request records when that install was last seen and what it was doing
-  (`X-Collector-State`: collecting, paused, waiting_for_client, client_unreachable, client_failing).
+  (`X-Collector-State`: collecting, paused, waiting_for_client, client_unreachable, client_failing;
+  with `_fast` added when its user turned the experimental fast mode on, such as collecting_fast).
   Collectors check in every 10 minutes even while paused. `ingest.py keys` shows it, and
   `relay status` reports installs seen in the last hour and day by state.
 
@@ -87,7 +88,7 @@ Trust covers what a match says, not its size or shape:
 | | |
 | --- | --- |
 | `POST /v1/register` | No key needed. A new install gets its own key (201 `{"key", "name"}`). |
-| `GET /v1/policy` | Whether to collect, the pace, a short message, the season's start. |
+| `GET /v1/policy` | Whether to collect, the pace, whether fast mode is allowed, a short message, the season's start. |
 | `POST /v1/work` | Takes match-list reports; answers with matches to fetch and lists to read. |
 | `POST /v1/games` | `{"games": [...]}`, gzip allowed. Answers with accepted / duplicates / skipped / rejected. |
 | `GET /healthz` | No key needed. |
@@ -101,6 +102,7 @@ python server/ingest.py disable-key NAME
 python server/ingest.py purge NAME
 python server/ingest.py policy --season-start 2026-10-06
 python server/ingest.py policy --off          # every collector pauses within 10 minutes
+python server/ingest.py policy --fast off     # fast-mode collectors go back to the normal pace (--delay)
 python server/ingest.py policy --signups off  # new installs can no longer get a key
 python server/ingest.py policy --on --delay 3 --message "thanks!"
 python server/ingest.py stats                 # per server: matches held, still to fetch, players to read

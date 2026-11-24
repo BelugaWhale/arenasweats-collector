@@ -21,7 +21,11 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   you're back in the client and not in a match.
 - **Gentle.** It sends one request every couple of seconds, one at a time, and slows down
   further if the client is busy. ArenaSweats can tell it to slow down or stop, but can
-  never make it go faster or do anything else.
+  never make it go faster or do anything else. Only you can, with fast mode.
+- **Fast mode is off unless you turn it on.** Fast mode collects about 1.6 times faster:
+  about one request a second, still one at a time. **It is experimental: we are not sure
+  it is safe for your League account.** It still never runs while you play and still slows
+  down when the client struggles, and ArenaSweats can still slow it down or switch it off.
 - **Your account stays private.** It never reads or sends your password or login. It sends
   only Arena match results and your player ID, which is already in your match records.
 - **Nothing to install.** No administrator rights and no background service. Close the
@@ -38,7 +42,10 @@ It sends the Arena matches it reads to ArenaSweats and keeps going until you clo
 window. While it runs it keeps your PC from going to sleep; the screen can still turn off. The first time, it gets its own upload key from ArenaSweats and saves it in
 `config.json` next to the program.
 
-When a new version is out, it asks whether to update before it starts.
+When a new version is out, it asks whether to update before it starts. Then it asks whether
+to turn on fast mode; pressing Enter keeps it off. To skip that question, add `--fast` or
+`--no-fast` to the end of a shortcut's target. While fast mode is on, it says so every time
+it starts.
 
 If it can't find League by itself, it asks you which folder League is installed in.
 
