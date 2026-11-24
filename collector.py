@@ -7,9 +7,9 @@ WHAT IT DOES
      the client was started with (what Task Manager shows for it).
   2. While you are not playing, slowly asks that client for this season's Arena
      match history: match lists of players, and the full record of Arena matches.
-     Fast mode, which you can turn on at start, waits half as long between requests.
-     It is beta: we are not sure yet that it is safe for your account, so for now
-     use it only with a throwaway account.
+     Fast mode, which you can turn on at start, waits a fifth as long between
+     requests, still one at a time. BETA: please only use it with unimportant
+     accounts for now.
   3. Sends the matches to ArenaSweats (DEFAULT_SERVER below), which tells it which
      players and matches to read next, so no two collectors read the same thing.
      The first time, it asks ArenaSweats for this install's own upload key and
@@ -59,22 +59,25 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 import zipfile
 import zlib
 from collections import Counter, namedtuple
 
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
 KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
 # ---------------------------------------------------------------------------
 # Limits. These keep the collector gentle. The upload server can slow it down
-# or switch it off, but nothing can make it go faster than MIN_DELAY.
+# or switch it off, but nothing can make it go faster than MIN_DELAY, or than
+# FAST_MIN_DELAY in fast mode, which only the user can turn on.
 # ---------------------------------------------------------------------------
-MIN_DELAY = 1.0        # hard floor: at most one match-history request per second, in fast mode too
+MIN_DELAY = 1.0        # hard floor at the normal pace: at most one match-history request per second
 DEFAULT_DELAY = 2.0    # normal gap between match-history requests, in seconds
-FAST_FACTOR = 2        # fast mode (experimental, only when the user turns it on) halves the gap, never below MIN_DELAY
-FAST_SPEEDUP = "1.6"   # matches an hour in fast mode against the normal pace (fake client, real client's answer times)
+FAST_FACTOR = 5        # fast mode (beta, only when the user turns it on) divides the gap by this, still one at a time,
+FAST_MIN_DELAY = 0.4   # never below its own hard floor; ArenaSweats can raise it (policy "fast_delay")
+FAST_SPEEDUP = "3"     # matches an hour in fast mode against the normal pace (fake client, real client's answer times)
 FAST_REST = 3600       # in fast mode, a 429 or 3 failed requests in a row bring back the normal pace for this long
 PAGE_SIZE = 20         # matches per match-list request
 MAX_PAGES = 50         # never read further back than this many pages of one player's list
@@ -170,8 +173,9 @@ class Lcu:
         auth = base64.b64encode(("riot:" + token).encode()).decode()
         self.headers = {"Authorization": "Basic " + auth, "Accept": "application/json"}
         # The client uses its own self-signed certificate on 127.0.0.1, which
-        # cannot be verified. This traffic never leaves this computer.
-        context = ssl.create_default_context()
+        # cannot be verified. This traffic never leaves this computer. (ArenaSweats
+        # is always checked: see https_context.)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         # ProxyHandler({}) = never send these local requests through a proxy.
@@ -907,15 +911,24 @@ class Store:
 # ---------------------------------------------------------------------------
 # Reaching ArenaSweats over the internet
 # ---------------------------------------------------------------------------
-# Python checks ArenaSweats' certificate only against the root certificates Windows already
-# holds. Windows fetches most roots only when one of its own programs first needs them (and
-# internet-cafe PCs, reset at every restart, may never keep them), while browsers bring their
-# own, so a PC whose browser opens arenasweats.lol can still lack the root that ArenaSweats'
-# certificate (from Let's Encrypt) leads to. These two roots are carried here too, besides
-# Windows' own. They are Let's Encrypt's, the same ones as in Mozilla's and every other
-# trusted list.
+# Python checks ArenaSweats' certificate only against root certificates it already holds: unlike
+# Windows' own programs, it cannot fetch a missing root. Windows fetches most roots only when one
+# of its own programs first needs them (a fresh Windows holds none for websites at all;
+# internet-cafe PCs, reset at every restart, and PCs whose updates are blocked may never keep
+# them), while browsers bring their own, so a PC whose browser opens arenasweats.lol can still lack
+# the root that ArenaSweats' certificate (from Let's Encrypt) leads to. So every root a Let's
+# Encrypt certificate can lead to is carried here, besides Windows' own: ISRG Root X1 and X2, and
+# Root YE and YR, the newer roots its certificates lead to now through X1 and X2, and will lead to
+# on their own once Let's Encrypt stops sending that link. All four are Let's Encrypt's (ISRG's).
+# Google Trust Services' two roots in use, GTS Root R1 and R4, are carried too, so that ArenaSweats
+# can move to Google's certificates (see server/README.md, "Certificate") without leaving a
+# collector behind. All six are in Mozilla's and the other trusted lists.
 EXTRA_ROOT_NAMES = {"96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6": "ISRG Root X1",
-                    "69729b8e15a86efc177a57afb7171dfc64add28c2fca8cf1507e34453ccb1470": "ISRG Root X2"}
+                    "69729b8e15a86efc177a57afb7171dfc64add28c2fca8cf1507e34453ccb1470": "ISRG Root X2",
+                    "e14ffcad5b0025731006caa43a121a22d8e9700f4fb9cf852f02a708aa5d5666": "ISRG Root YE",
+                    "e57b7e6f150c419102e8d5c055729ff967b9d1a829bf00cec89ca604ebf4a86f": "ISRG Root YR",
+                    "d947432abde7b7fa90fc2e6b59101b1280e0e1c7e4e40fa3c6887fff57a7f4cf": "GTS Root R1",
+                    "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d": "GTS Root R4"}
 EXTRA_ROOTS = """
 -----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
@@ -962,6 +975,92 @@ zj0EAwMDaAAwZQIwe3lORlCEwkSHRhtFcP9Ymd70/aTSVaYgLXTWNLxBo1BfASdW
 tL4ndQavEi51mI38AjEAi/V3bNTIZargCyzuFJ0nN6T5U6VR5CmD1/iQMVtCnwr1
 /q4AaOeMSQ+2b1tbFfLn
 -----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIB2TCCAWCgAwIBAgIRAKQCa6LvbHwg1AR+XmWmk4AwCgYIKoZIzj0EAwMwLjEL
+MAkGA1UEBhMCVVMxDTALBgNVBAoTBElTUkcxEDAOBgNVBAMTB1Jvb3QgWUUwHhcN
+MjUwOTAzMDAwMDAwWhcNNDUwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzENMAsG
+A1UEChMESVNSRzEQMA4GA1UEAxMHUm9vdCBZRTB2MBAGByqGSM49AgEGBSuBBAAi
+A2IABDwS/6vhrcVqcbBo+wgdI3fwn9x7DNJJOY/lTOti0vkwuRN87RhEhTH17E7X
+yFjWsPYhIPt/wzOqxTd2b+4ZJNy9ID04YywF9U5zasDVyGSNErVNtz8uSGh5izW8
+7j77GaNCMEAwDgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
+BBYEFKPIJlqOoUzQNWP8myPIOq5W809WMAoGCCqGSM49BAMDA2cAMGQCMHhMr8N9
+LdL1VQKs9BdV81r76eXRB6mtjuNjzk6/lBsPNToWLTDzGYgtQKO1jl63uAIwGV7m
+onyF377c+MM1oqVNs17sgu7F9YKZwgLmVbeOMDbKAXHtKMDLbiGllCcs8f47
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIFKTCCAxGgAwIBAgIRAOxGNJNgz0sP+KmC2Tqpyj0wDQYJKoZIhvcNAQELBQAw
+LjELMAkGA1UEBhMCVVMxDTALBgNVBAoTBElTUkcxEDAOBgNVBAMTB1Jvb3QgWVIw
+HhcNMjUwOTAzMDAwMDAwWhcNNDUwOTAyMjM1OTU5WjAuMQswCQYDVQQGEwJVUzEN
+MAsGA1UEChMESVNSRzEQMA4GA1UEAxMHUm9vdCBZUjCCAiIwDQYJKoZIhvcNAQEB
+BQADggIPADCCAgoCggIBANvGJnN78CTJdWL3+eGfsLN5TrNBJs+VH9hRXqRbwxu9
+sGNiB0BD1fcOxbSUQCJIM1xE13Db+5Cw1w0s0EBYsvuIP/6joF0w8cuImbgR1OGg
+YbSQ4OpzI+DG8SGuTlcE873OCS+kh3srlo6vl43M5OJg4Aeo1sfHp6kTJDoIiFBN
+JAY+OKfX/FUvYKuhjT+no49lmqmupSBI5PkBQiqrEGtWU5uxU/cQWHGu8jSjFBzn
+ZqvbNPLMXMLFxCb3WTfrJBXXjqvWG+v4bjzxjjeAtOlU7qarRDvNOyAuQYLln904
+M+faKx8hnLCpJ15ZqaEgcNlY+9MMWcC5yvL2A2j3l9+2buggZX+dOE91zYmIdawT
+vSZuVvlbRrAlLxIB6pwMBjneXCjYQ8+3BCCjssbSNpZU3hTcBDdhfAlEDlYr6pEa
+tnMdmDT5BqnKC92bd0EhM1fbLHioLccLCuievT8ZkPhZrq7Mii7gNXAcUEAR8+lz
+Yal+9zTg7C5DALyVOeG/CqfRAMn1KSHCR0NSA6P8tn/mGRlnCct5rtVCLnVySVpU
+6H1qGg3DgTOuskf8eahTMiYbI5ezPJmO5ertalskQ1utp74+eDy92PI4ftHKTbq9
+IWhH4YZKh3WnJEIt+oQvlYZbY8tpEroKrFB6PFGzrJIDRyts4HqvuH52RFj2zv/B
+AgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1Ud
+DgQWBBTe51tg0CJtQCh9Pw0B/qS1UrRRlDANBgkqhkiG9w0BAQsFAAOCAgEAWHnf
+713Bdkq7t5yN2dNIgQakUb94X9WuyhMEHHkgx4oDpSUlnG0w4g94MoqaEUE31ZjR
+LU7L5LD1g9ujFHTQu8AD215AHMVQFbm6j8hQxdXHAzDajFNQnOlDJrLjzIx176oy
+AjvUtejZx2NNmdb5fd0WGVGsCdoAJ3N8ozo7ajE8t6vfxStZb4BQ9WYJGHUDrv2N
+i5tJF6CNiPnlzs3BUfECRbE4JSk+jvy8+VoGiFE8qsH/j78x2fjgQhAQFV7P7Zxy
+dBTZ1wEkNpZNW2qnaK1SKBLa+xf6E06YRIq5uaI+HWH8SY1y5VbRgzq40EKg3yxP
+06fz+uYAUIFJoLNfhwRCc3Q6pQVuMX3yAjHAes4gk4moGcLQ5p7HAh39yeylZc1J
+41sx/jKwLIkPE6Rr1Nf4pxdsxf9SA4yOEiAkDgq04DVxn8hgYFdUtBCuiuVC2heA
+EiqVEa+8QZjuw8Gj0EbHXcRd1nInvGqRS1o9Is7YBdQN57X1AYveGBNNqjICSb7c
+awuw1EawTDrs13VUlJVEsbQ0/O/1aaV73mCdOQ8azqL2KTv1Ewu1xbquE2S+kdQU
+To9TUwat3wUA6cwXh1EfpS/3fJ0aGah5hdpRyoCLDlsSn8tkrjMfFFX0viC+GxHc
+sI1ANRYvqSFC2X1VRZfDg+wD6E21BccmifG4yWc=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
+CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+MBIGA1UEAxMLR1RTIFJvb3QgUjEwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw
+MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp
+Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwggIiMA0GCSqGSIb3DQEBAQUA
+A4ICDwAwggIKAoICAQC2EQKLHuOhd5s73L+UPreVp0A8of2C+X0yBoJx9vaMf/vo
+27xqLpeXo4xL+Sv2sfnOhB2x+cWX3u+58qPpvBKJXqeqUqv4IyfLpLGcY9vXmX7w
+Cl7raKb0xlpHDU0QM+NOsROjyBhsS+z8CZDfnWQpJSMHobTSPS5g4M/SCYe7zUjw
+TcLCeoiKu7rPWRnWr4+wB7CeMfGCwcDfLqZtbBkOtdh+JhpFAz2weaSUKK0Pfybl
+qAj+lug8aJRT7oM6iCsVlgmy4HqMLnXWnOunVmSPlk9orj2XwoSPwLxAwAtcvfaH
+szVsrBhQf4TgTM2S0yDpM7xSma8ytSmzJSq0SPly4cpk9+aCEI3oncKKiPo4Zor8
+Y/kB+Xj9e1x3+naH+uzfsQ55lVe0vSbv1gHR6xYKu44LtcXFilWr06zqkUspzBmk
+MiVOKvFlRNACzqrOSbTqn3yDsEB750Orp2yjj32JgfpMpf/VjsPOS+C12LOORc92
+wO1AK/1TD7Cn1TsNsYqiA94xrcx36m97PtbfkSIS5r762DL8EGMUUXLeXdYWk70p
+aDPvOmbsB4om3xPXV2V4J95eSRQAogB/mqghtqmxlbCluQ0WEdrHbEg8QOB+DVrN
+VjzRlwW5y0vtOUucxD/SVRNuJLDWcfr0wbrM7Rv1/oFB2ACYPTrIrnqYNxgFlQID
+AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E
+FgQU5K8rJnEaK0gnhS9SZizv8IkTcT4wDQYJKoZIhvcNAQEMBQADggIBAJ+qQibb
+C5u+/x6Wki4+omVKapi6Ist9wTrYggoGxval3sBOh2Z5ofmmWJyq+bXmYOfg6LEe
+QkEzCzc9zolwFcq1JKjPa7XSQCGYzyI0zzvFIoTgxQ6KfF2I5DUkzps+GlQebtuy
+h6f88/qBVRRiClmpIgUxPoLW7ttXNLwzldMXG+gnoot7TiYaelpkttGsN/H9oPM4
+7HLwEXWdyzRSjeZ2axfG34arJ45JK3VmgRAhpuo+9K4l/3wV3s6MJT/KYnAK9y8J
+ZgfIPxz88NtFMN9iiMG1D53Dn0reWVlHxYciNuaCp+0KueIHoI17eko8cdLiA6Ef
+MgfdG+RCzgwARWGAtQsgWSl4vflVy2PFPEz0tv/bal8xa5meLMFrUKTX5hgUvYU/
+Z6tGn6D/Qqc6f1zLXbBwHSs09dR2CQzreExZBfMzQsNhFRAbd03OIozUhfJFfbdT
+6u9AWpQKXCBfTkBdYiJ23//OYb2MI3jSNwLgjt7RETeJ9r/tSQdirpLsQBqvFAnZ
+0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm
+2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb
+bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD
+VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG
+A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw
+WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz
+IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi
+AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi
+QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR
+HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW
+BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D
+9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8
+p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD
+-----END CERTIFICATE-----
 """
 _https = None           # the certificate checking set up by https_context()
 _way = "proxy"          # the way that reached ArenaSweats last: "proxy" (Windows' setting, when there is one) or "direct"
@@ -969,14 +1068,26 @@ early_notes = []        # what happened before the log file was opened; written 
 
 
 def https_context():
-    """Certificate checking for ArenaSweats: Windows' own roots plus EXTRA_ROOTS."""
+    """Certificate checking for ArenaSweats, used for every request to it: EXTRA_ROOTS plus Windows' own roots.
+    The certificate and the name in it are always checked. A Windows store that cannot be read, or holds
+    expired or odd certificates, at worst adds nothing; it can never switch the checking off."""
     global _https
     if _https is None:
-        _https = ssl.create_default_context()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)      # requires a valid certificate for the right name
         try:
-            _https.load_verify_locations(cadata=EXTRA_ROOTS)
+            context.load_verify_locations(cadata=EXTRA_ROOTS)
         except (ssl.SSLError, ValueError) as error:
-            log.warning("could not add the extra root certificates: %s", error)
+            log.warning("could not add the carried root certificates: %s", error)
+        try:
+            # A bad certificate in Windows' store goes to the log, not the screen.
+            with warnings.catch_warnings(record=True) as odd:
+                warnings.simplefilter("always")
+                context.load_default_certs()                    # Windows' roots (elsewhere, the system's)
+            for warning in odd:
+                log.info("Windows certificates: %s", warning.message)
+        except (OSError, ssl.SSLError, ValueError) as error:
+            log.warning("could not read Windows' root certificates; using only the carried ones: %s", error)
+        _https = context
     return _https
 
 
@@ -1187,8 +1298,9 @@ class Collector:
         self.busy_at = float("-inf")       # last time the client was seen busy
         self.paused = False
         self.enabled, self.policy_delay, self.message, self.policy_at = True, 0.0, "", now()
-        self.fast = bool(getattr(opts, "fast", False))     # the user turned fast mode on (experimental)
+        self.fast = bool(getattr(opts, "fast", False))     # the user turned fast mode on (beta)
         self.fast_allowed = True           # ArenaSweats can switch fast mode off for everyone (policy "fast")
+        self.policy_fast_delay = 0.0       # ... or make fast mode keep a longer gap (policy "fast_delay")
         self.fast_rest_until = float("-inf")    # the normal pace until then, after the client pushed back
         if server:
             server.fast = self.fast
@@ -1209,11 +1321,17 @@ class Collector:
         return self.fast and self.fast_allowed and self.now() >= self.fast_rest_until
 
     @property
+    def floor(self):
+        """The shortest gap there may be between two match-history requests: MIN_DELAY, or in fast mode
+        FAST_MIN_DELAY, or the longer one ArenaSweats asks fast mode for."""
+        return max(FAST_MIN_DELAY, self.policy_fast_delay) if self.fast_on else MIN_DELAY
+
+    @property
     def delay(self):
-        """Seconds between match-history requests. The server can raise it and fast mode halves it,
-        but nothing can lower it below MIN_DELAY."""
+        """Seconds between match-history requests. The server can raise it and fast mode divides it by
+        FAST_FACTOR, but nothing can lower it below the floor."""
         delay = max(MIN_DELAY, self.opts.delay, self.policy_delay)
-        return max(MIN_DELAY, delay / FAST_FACTOR) if self.fast_on else delay
+        return max(self.floor, delay / FAST_FACTOR) if self.fast_on else delay
 
     def say(self, text, once=False):
         if once and text == self.last_said:
@@ -1620,7 +1738,7 @@ class Collector:
                      "客户端响应异常，快速模式暂停一小时（恢复正常速度）。")
         # After failures, wait longer and longer (3s, 6s, 12s ... up to MAX_BACKOFF).
         backoff = 0 if ok else min(MAX_BACKOFF, 3 * 2 ** min(self.failures - 1, 10))
-        self.next_allowed = self.now() + max(MIN_DELAY, self.delay * random.uniform(0.8, 1.2)) + backoff
+        self.next_allowed = self.now() + max(self.floor, self.delay * random.uniform(0.8, 1.2)) + backoff
         self.stats["requests"] += 1
         self.stats["failed"] += 0 if ok else 1
         short = re.sub(PUUID, lambda found: found.group(0)[:8], path.split("/lol-match-history/v1/")[-1])
@@ -1695,8 +1813,8 @@ class Collector:
 
     # -- uploading ---------------------------------------------------------------
     def apply_policy(self, policy):
-        """What the server can set: pause, go slower, switch fast mode off, show a short message,
-        the date the season began."""
+        """What the server can set: pause, go slower, switch fast mode off or slow it down, show a short
+        message, the date the season began."""
         if not isinstance(policy, dict):
             return
         self.policy_at = self.now()
@@ -1713,6 +1831,9 @@ class Collector:
         delay = policy.get("delay")
         if isinstance(delay, (int, float)) and not isinstance(delay, bool) and 0 <= delay <= 3600:
             self.policy_delay = min(60.0, float(delay))
+        fast_delay = policy.get("fast_delay")      # fast mode's shortest gap; never below FAST_MIN_DELAY
+        if isinstance(fast_delay, (int, float)) and not isinstance(fast_delay, bool) and 0 <= fast_delay <= 3600:
+            self.policy_fast_delay = min(60.0, float(fast_delay))
         message = policy.get("message")
         if isinstance(message, str) and message != self.message:
             self.message = message
@@ -2042,10 +2163,9 @@ FAST_ON = "Fast mode is on (beta). 快速模式已开启（测试版）。"
 def ask_fast_mode(ask=timed_input):
     """Ask at start whether to turn fast mode on. Only a yes turns it on; Enter, or no answer within ANSWER_SECONDS,
     means no."""
-    print("Fast mode collects about %s times faster. Beta: we are not sure yet that it is safe for your account, "
-          "so for now please use it only with a throwaway account." % FAST_SPEEDUP)
-    print("快速模式的采集速度约为正常速度的 %s 倍。测试版：我们还不确定它对账号是否安全，目前请只在小号上使用。"
+    print("Fast mode collects about %s times faster. BETA: Please only use with unimportant accounts for now."
           % FAST_SPEEDUP)
+    print("快速模式的采集速度约为正常速度的 %s 倍。测试版：目前请只在不重要的账号上使用。" % FAST_SPEEDUP)
     try:
         answer = ask("Activate fast mode? 开启快速模式？ [y/N]  No answer = normal mode / 不回答即普通模式: ")
     except (EOFError, KeyboardInterrupt):
@@ -2167,9 +2287,8 @@ def main(argv=None):
                              "with an upload address, ArenaSweats sets it)")
     parser.add_argument("--data-dir", help="where to keep collected data (default: 'data' beside this program)")
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction,
-                        help="beta: collect about %s times faster; for now use it only with a throwaway account, "
-                             "as we are not sure yet that it is safe (either flag skips the question at start)"
-                             % FAST_SPEEDUP)
+                        help="BETA: collect about %s times faster; please only use with unimportant accounts for now "
+                             "(either flag skips the question at start)" % FAST_SPEEDUP)
     parser.add_argument("--no-update", action="store_true", help="don't check for a newer version at start")
     parser.add_argument("--export", metavar="FILE",
                         help="write the match records held locally to FILE (JSON lines; .gz to compress) and exit")

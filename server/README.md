@@ -62,7 +62,8 @@ Trust covers what a match says, not its size or shape:
 
 - The key is checked before the body is read. Keys are stored only as hashes.
 - Limits: 2 MB per request (4 MB after decompression), 50 matches per upload, 300 KB per
-  match, 60 requests a minute and 60,000 matches a day per key.
+  match, 60 requests a minute and 220,000 matches a day per key (a fast-mode collector reads about
+  100,000 a day and can never pass 216,000; one at the normal pace about 30,000).
 - Uploads wait (503, collectors keep their matches and retry) while more than 300,000 matches are
   waiting for the rankings server or the disk has less than 5 GB free, so a stalled relay or a
   flood cannot fill the disk the website uses.
@@ -79,7 +80,7 @@ Trust covers what a match says, not its size or shape:
   user's cron every 30 minutes.
 - Every request records when that install was last seen and what it was doing
   (`X-Collector-State`: collecting, paused, waiting_for_client, client_unreachable, client_failing;
-  with `_fast` added when its user turned the experimental fast mode on, such as collecting_fast).
+  with `_fast` added when its user turned the beta fast mode on, such as collecting_fast).
   Collectors check in every 10 minutes even while paused. `ingest.py keys` shows it, and
   `relay status` reports installs seen in the last hour and day by state.
 
@@ -88,7 +89,7 @@ Trust covers what a match says, not its size or shape:
 | | |
 | --- | --- |
 | `POST /v1/register` | No key needed. A new install gets its own key (201 `{"key", "name"}`). |
-| `GET /v1/policy` | Whether to collect, the pace, whether fast mode is allowed, a short message, the season's start. |
+| `GET /v1/policy` | Whether to collect, the pace, whether fast mode is allowed and its shortest gap, a short message, the season's start. |
 | `POST /v1/work` | Takes match-list reports; answers with matches to fetch and lists to read. |
 | `POST /v1/games` | `{"games": [...]}`, gzip allowed. Answers with accepted / duplicates / skipped / rejected. |
 | `GET /healthz` | No key needed. |
@@ -103,6 +104,7 @@ python server/ingest.py purge NAME
 python server/ingest.py policy --season-start 2026-10-06
 python server/ingest.py policy --off          # every collector pauses within 10 minutes
 python server/ingest.py policy --fast off     # fast-mode collectors go back to the normal pace (--delay)
+python server/ingest.py policy --fast-delay 1 # fast mode keeps at least 1 s between requests (default 0.4)
 python server/ingest.py policy --signups off  # new installs can no longer get a key
 python server/ingest.py policy --on --delay 3 --message "thanks!"
 python server/ingest.py stats                 # per server: matches held, still to fetch, players to read
@@ -143,6 +145,48 @@ restarts the service, reloads nginx, and puts the nginx files back if nginx reje
 Collectors send to `https://arenasweats.lol/collector` unless their `config.json` says otherwise.
 
 The per-key request limit is counted per gunicorn worker, so the nginx limit is the real ceiling.
+
+## Certificate
+
+The site's certificate is from Let's Encrypt (certbot, nginx plugin, `/etc/letsencrypt/renewal/arenasweats.lol.conf`;
+names arenasweats.lol, www and euw-api; no CAA records). Collectors check it against the roots they carry (0.3.6:
+ISRG Root X1 and X2; 0.3.7 adds Root YE and YR and Google's GTS Root R1 and R4) plus the roots Windows holds. Up to 0.3.4 they had
+only Windows' roots, and a Windows that has never updated its roots holds none for websites at all (checked on
+fresh Windows Server 2019 and 2022 images, the Windows 10 1809 and 21H2 code): only Microsoft's own roots and
+old VeriSign ones that no longer issue. So no certificate from any CA is sure to reach a stuck 0.3.4.
+
+**Optional gamble for stuck 0.3.4 installs:** a Google Trust Services certificate whose chain ends at the old
+GlobalSign Root CA: of the roots a free certificate can lead to, the one a Chinese PC is most likely to hold
+(Baidu's and Taobao's certificates lead to it too). It helps only PCs whose Windows happens to hold it; nobody can
+tell how many. Steps, as root:
+
+1. First release 0.3.7 and wait until `ingest.py keys` shows every install seen in the last days on 0.3.7 or
+   later. Older collectors on a PC without GlobalSign's or Google's roots would lose the connection.
+2. With gcloud, in any Google Cloud project: `gcloud services enable publicca.googleapis.com`, then
+   `gcloud publicca external-account-keys create` (gives keyId and b64MacKey; use within 7 days).
+3. On the web server:
+   ```
+   certbot certonly --nginx --non-interactive --agree-tos -m ADMIN_EMAIL --cert-name arenasweats.lol \
+     -d arenasweats.lol -d www.arenasweats.lol -d euw-api.arenasweats.lol --key-type ecdsa --force-renewal \
+     --server https://dv.acme-v02.api.pki.goog/directory --eab-kid KEY_ID --eab-hmac-key B64_MAC_KEY \
+     --preferred-chain "GlobalSign Root CA" --deploy-hook "systemctl reload nginx"
+   systemctl reload nginx
+   certbot renew --dry-run --cert-name arenasweats.lol
+   ```
+   The paths in the nginx config stay the same. Check the chain with
+   `echo | openssl s_client -connect arenasweats.lol:443 -servername arenasweats.lol -showcerts | grep -E ' s:| i:'`:
+   leaf, WE1, then GTS Root R4 issued by GlobalSign Root CA.
+4. Watch the nginx access log for `POST /collector/v1/register` answered 201 to `arenasweats-collector/0.3.4`.
+   To go back: the same command with `--server https://acme-v02.api.letsencrypt.org/directory` and without the
+   `--eab-*` and `--preferred-chain` options.
+
+Risks: that chain ends by 2028-01-28 (the cross-signature and GlobalSign Root CA expire; Google may stop offering
+it sooner), after which it ends at GTS Root R4, which 0.3.7 carries. Renewals keep coming from Google with the
+stored account (90-day certificates, renewed by the certbot timer). Google's revocation addresses (o.pki.goog,
+c.pki.goog) may be unreachable in mainland China; browsers do not need them, a few Windows programs may wait on
+them. HSTS (one year, includeSubDomains, preload) only needs a valid certificate, so it is unaffected. If CAA
+records are ever added they must name both `letsencrypt.org` and `pki.goog`. bot.arenasweats.lol keeps its own
+certificate. Before switching to any other CA, release a collector that carries its root first.
 
 ## Relay to the rankings server
 

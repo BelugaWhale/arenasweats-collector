@@ -233,7 +233,8 @@ class Gentle(CollectorCase):
 
 
 class FastMode(CollectorCase):
-    """Fast mode (experimental, only when the user turns it on): half the gap, with every other limit kept."""
+    """Fast mode (beta, only when the user turns it on): a fifth of the gap, never below its own floor, still one
+    request at a time, with every other limit kept."""
 
     def setUp(self):
         super().setUp()
@@ -250,31 +251,48 @@ class FastMode(CollectorCase):
         self.assertFalse(made.fast_on)
         self.assertGreaterEqual(min(self.gaps(self.fake.requests)), 2.0 * 0.8 - 0.001)
 
-    def test_halves_the_gap_but_keeps_the_hard_floor(self):
+    def test_a_fifth_of_the_gap_but_never_below_its_own_floor(self):
         made = self.run_collector(minutes=10, fast=True)
         gaps = self.gaps(self.fake.requests)
-        self.assertGreater(len(gaps), 300)
-        self.assertGreaterEqual(min(gaps), collector.MIN_DELAY - 0.001)      # never above one a second
-        self.assertLess(sorted(gaps)[len(gaps) // 2], 1.2)
-        self.assertEqual(made.delay, collector.MIN_DELAY)
-        self.assertIn("one request every 1.0 seconds", self.output.getvalue())
+        self.assertGreater(len(gaps), 600)
+        self.assertEqual(collector.DEFAULT_DELAY / collector.FAST_FACTOR, collector.FAST_MIN_DELAY)
+        self.assertGreaterEqual(min(gaps), collector.FAST_MIN_DELAY - 0.001)     # never above 2.5 a second
+        self.assertLess(sorted(gaps)[len(gaps) // 2], 0.5)
+        self.assertEqual(made.delay, collector.FAST_MIN_DELAY)
+        self.assertIn("one request every 0.4 seconds", self.output.getvalue())
         self.fake.requests.clear()
+        self.data_dir = os.path.join(self.tmp.name, "data-again")            # start again from nothing
+        os.makedirs(self.data_dir)
         self.run_collector(minutes=10, fast=True, delay=0.0)                  # asking for less changes nothing
-        self.assertGreaterEqual(min(self.gaps(self.fake.requests)), collector.MIN_DELAY - 0.001)
+        self.assertGreaterEqual(min(self.gaps(self.fake.requests)), collector.FAST_MIN_DELAY - 0.001)
 
     def test_reads_more_in_the_same_time(self):
+        self.fake.close()
+        self.fake = FakeClient(players=400, arena=2000, clock=self.clock)    # more than fast mode reads in 5 min
+        self.addCleanup(self.fake.close)
+        self.fake.write_lockfile(self.league_dir)
         normal = self.run_collector(minutes=5)
         requests = len(history(self.fake.requests))
         self.fake.requests.clear()
         self.data_dir = os.path.join(self.tmp.name, "data-fast")             # start again from nothing
         os.makedirs(self.data_dir)
         fast = self.run_collector(minutes=5, fast=True)
-        self.assertGreater(len(history(self.fake.requests)), requests * 1.8)
-        self.assertGreater(len(self.stored_ids(fast)), len(self.stored_ids(normal)) * 1.6)
+        self.assertGreater(len(history(self.fake.requests)), requests * 4)    # answers take no time here
+        self.assertGreater(len(self.stored_ids(fast)), len(self.stored_ids(normal)) * 3)
 
-    def test_a_slower_pace_the_user_chose_is_halved_not_ignored(self):
+    def test_normal_mode_is_unchanged(self):
+        made = self.run_collector(minutes=10)
+        gaps = self.gaps(self.fake.requests)
+        self.assertEqual((made.floor, made.delay), (collector.MIN_DELAY, 2.0))
+        self.assertGreaterEqual(min(gaps), 2.0 * 0.8 - 0.001)
+        self.assertTrue(1.9 < sorted(gaps)[len(gaps) // 2] < 2.1)
+        made.apply_policy({"fast_delay": 0.0})                                # fast mode's settings change nothing
+        self.assertEqual((made.floor, made.delay), (collector.MIN_DELAY, 2.0))
+        self.assertIn("one request every 2.0 seconds", self.output.getvalue())
+
+    def test_a_slower_pace_the_user_chose_is_divided_not_ignored(self):
         self.run_collector(minutes=10, fast=True, delay=6.0)
-        self.assertGreaterEqual(min(self.gaps(self.fake.requests)), 3.0 * 0.8 - 0.001)
+        self.assertGreaterEqual(min(self.gaps(self.fake.requests)), 6.0 / collector.FAST_FACTOR * 0.8 - 0.001)
 
     def test_no_match_history_requests_while_playing(self):
         start = self.clock.now()
@@ -314,7 +332,7 @@ class FastMode(CollectorCase):
         later = [b - a for a, b in zip(times, times[1:]) if a > 700]
         self.assertTrue(resting and later)
         self.assertGreaterEqual(min(resting), 2.0 * 0.8 - 0.001)          # the normal pace while resting
-        self.assertLess(sorted(later)[len(later) // 2], 1.2)              # then fast again
+        self.assertLess(sorted(later)[len(later) // 2], 0.5)              # then fast again
         self.assertEqual(self.output.getvalue().count("fast mode rests for an hour"), 1)
 
     def test_the_question_defaults_to_no(self):
@@ -324,11 +342,13 @@ class FastMode(CollectorCase):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(collector.ask_fast_mode(lambda prompt: asked.append(prompt) or answer), expected)
             self.assertEqual(asked, ["Activate fast mode? 开启快速模式？ [y/N]  No answer = normal mode / 不回答即普通模式: "])
-        self.assertIn("Fast mode collects about %s times faster. Beta: we are not sure yet that it is safe for your "
-                      "account, so for now please use it only with a throwaway account." % collector.FAST_SPEEDUP,
-                      output.getvalue())
-        self.assertIn("快速模式的采集速度约为正常速度的 %s 倍。测试版：我们还不确定它对账号是否安全，目前请只在小号上使用。"
-                      % collector.FAST_SPEEDUP, output.getvalue())
+        self.assertEqual(collector.FAST_SPEEDUP, "3")
+        self.assertEqual(output.getvalue(),
+                         "Fast mode collects about 3 times faster. BETA: Please only use with unimportant accounts "
+                         "for now.\n快速模式的采集速度约为正常速度的 3 倍。测试版：目前请只在不重要的账号上使用。\n")
+        for words in ("not sure", "throwaway", "小号", "不确定"):
+            self.assertNotIn(words, output.getvalue())
+            self.assertNotIn(words, collector.__doc__)
 
         def closed(prompt):
             raise EOFError
@@ -350,6 +370,20 @@ class FastMode(CollectorCase):
             os.write(writer, "是\n".encode("utf-8"))
             self.assertEqual(collector.timed_input("Question? ", seconds=5), "是")
         self.assertEqual(output.getvalue(), "Question? \nQuestion? ")
+
+    def test_help_and_readmes_give_the_same_warning(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
+            collector.main(["--help"])
+        self.assertIn("BETA: collect about 3 times faster; please only use with unimportant accounts for now",
+                      " ".join(output.getvalue().split()))
+        texts = {}
+        for path in ("README.md", os.path.join("server", "README.md")):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as handle:
+                texts[path] = " ".join(handle.read().split())
+            self.assertNotIn("throwaway", texts[path], path)
+            self.assertNotIn("not sure", texts[path], path)
+        self.assertIn("Fast mode collects about 3 times faster: about two requests a second, still one at a time. "
+                      "**BETA: Please only use with unimportant accounts for now.**", texts["README.md"])
 
     def test_the_flag_turns_it_on_and_says_so_every_start(self):
         for flags, on in ((["--fast"], True), (["--no-fast"], False), ([], False)):

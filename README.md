@@ -22,11 +22,10 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
 - **Gentle.** It sends one request every couple of seconds, one at a time, and slows down
   further if the client is busy. ArenaSweats can tell it to slow down or stop, but can
   never make it go faster or do anything else. Only you can, with fast mode.
-- **Fast mode is off unless you turn it on.** Fast mode collects about 1.6 times faster:
-  about one request a second, still one at a time. **It is beta: we are not sure yet that
-  it is safe for your account, so for now use it only with a throwaway account.** It still
-  never runs while you play and still slows down when the client struggles, and
-  ArenaSweats can still slow it down or switch it off.
+- **Fast mode is off unless you turn it on.** Fast mode collects about 3 times faster:
+  about two requests a second, still one at a time. **BETA: Please only use with
+  unimportant accounts for now.** It still never runs while you play and still slows down
+  when the client struggles, and ArenaSweats can still slow it down or switch it off.
 - **Your account stays private.** It never reads or sends your password or login. It sends
   only Arena match results and your player ID, which is already in your match records.
 - **Nothing to install.** No administrator rights and no background service. Close the

@@ -5,6 +5,7 @@ import contextlib
 import copy
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import unittest
 import unittest.mock
 import urllib.error
 import urllib.request
+import warnings
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -722,6 +724,16 @@ class Limits(ServerCase):
         self.assertEqual((over.status_code, over.headers["Retry-After"]), (429, "3600"))
         self.assertEqual(self.count("games"), 6)
 
+    def test_the_limits_never_hold_back_an_honest_fast_collector(self):
+        # Fast mode reads at most a match a request, never two requests within FAST_MIN_DELAY; a collector that
+        # could not upload for a while holds at most OUTBOX_LIMIT more.
+        self.assertGreater(ingest.GAMES_PER_DAY, 86400 / collector.FAST_MIN_DELAY + collector.OUTBOX_LIMIT)
+        self.assertEqual(ingest.DEFAULT_FAST_DELAY, collector.FAST_MIN_DELAY)
+        # At most one work request every WORK_SECONDS, a full upload every UPLOAD_BATCH matches, and one more
+        # upload with each work request.
+        most = 60 / collector.WORK_SECONDS * 2 + 60 / collector.FAST_MIN_DELAY / collector.UPLOAD_BATCH
+        self.assertLess(most, ingest.REQUESTS_PER_MINUTE)
+
     def test_database_path_may_be_a_bare_file_name(self):
         here = os.getcwd()
         os.chdir(self.tmp.name)
@@ -735,13 +747,17 @@ class Policy(ServerCase):
     def test_policy_is_served_and_changeable(self):
         headers = {"Authorization": "Bearer " + self.key}
         self.assertEqual(self.client.get("/v1/policy", headers=headers).get_json(),
-                         {"enabled": True, "delay": 2.0, "fast": True, "message": "",
+                         {"enabled": True, "delay": 2.0, "fast": True, "fast_delay": 0.4, "message": "",
                           "season_start": ingest.date_ms("2026-10-06")})
         self.admin("policy", "--off", "--delay", "5", "--message", "back soon", "--season-start", "2027-01-15",
-                   "--fast", "off")
+                   "--fast", "off", "--fast-delay", "1.5")
         self.assertEqual(self.client.get("/v1/policy", headers=headers).get_json(),
-                         {"enabled": False, "delay": 5.0, "fast": False, "message": "back soon",
+                         {"enabled": False, "delay": 5.0, "fast": False, "fast_delay": 1.5, "message": "back soon",
                           "season_start": ingest.date_ms("2027-01-15")})
+        for wrong in ("-1", "nan", "inf", "61"):
+            self.assertIn("Not understood", self.admin("policy", "--fast-delay", wrong))
+        self.assertEqual(ingest.get_policy(self.db)["fast_delay"], 1.5)
+        self.assertIn("'fast_delay': 1.5", self.admin("stats"))
         self.assertEqual(self.post(self.games).get_json()["policy"]["enabled"], False)
         self.assertEqual(self.work()["policy"]["fast"], False)
         self.assertFalse(ingest.relay_status(self.db, self.now)["fast"])
@@ -1070,17 +1086,131 @@ class Reaching(WithServer):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def test_the_lets_encrypt_roots_are_carried_and_trusted_even_when_windows_has_none(self):
+    def windows_store(self, load):
+        """Stand in for Windows' certificate store: `load` runs where the collector reads it."""
+        patch = unittest.mock.patch.object(ssl.SSLContext, "load_default_certs", load)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(setattr, collector, "_https", None)
+        collector._https = None
+
+    def assert_checks_certificates(self, context):
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_every_root_our_certificates_can_lead_to_is_carried_and_trusted_when_windows_has_none(self):
         found = {hashlib.sha256(ssl.PEM_cert_to_DER_cert("-----BEGIN" + block)).hexdigest()
                  for block in collector.EXTRA_ROOTS.split("-----BEGIN")[1:]}
         self.assertEqual(found, set(collector.EXTRA_ROOT_NAMES))
-        self.addCleanup(setattr, collector, "_https", None)
-        with unittest.mock.patch.object(ssl, "create_default_context",
-                                        lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)):   # a store with nothing in it
-            collector._https = None
-            trusted = {dict(item[0] for item in cert["subject"])["commonName"]
-                       for cert in collector.https_context().get_ca_certs()}
-        self.assertEqual(trusted, {"ISRG Root X1", "ISRG Root X2"})
+        self.windows_store(lambda context, purpose=None: None)         # a store with nothing in it
+        context = collector.https_context()
+        trusted = {dict(item[0] for item in cert["subject"])["commonName"]: cert for cert in context.get_ca_certs()}
+        self.assertEqual(set(trusted), {"ISRG Root X1", "ISRG Root X2", "Root YE", "Root YR",    # Let's Encrypt's
+                                        "GTS Root R1", "GTS Root R4"})                          # Google's
+        for name, cert in trusted.items():                                # none runs out for years yet
+            self.assertGreater(ssl.cert_time_to_seconds(cert["notAfter"]), time.time() + 8 * 365 * 86400, name)
+        self.assert_checks_certificates(context)
+
+    def test_a_windows_store_that_cannot_be_read_leaves_the_carried_roots_and_the_checking(self):
+        def broken(context, purpose=None):
+            raise OSError(1450, "Insufficient system resources exist to complete the requested service")
+        self.windows_store(broken)
+        with self.assertLogs("collector", "WARNING") as logged:
+            context = collector.https_context()
+        self.assertEqual(len(context.get_ca_certs()), len(collector.EXTRA_ROOT_NAMES))
+        self.assert_checks_certificates(context)
+        self.assertIn("using only the carried ones", "\n".join(logged.output))
+
+    def test_odd_certificates_in_windows_store_go_to_the_log_not_the_screen(self):
+        def odd(context, purpose=None):
+            warnings.warn("Bad certificate in Windows certificate store: nested asn1 error")
+        self.windows_store(odd)
+        with contextlib.redirect_stderr(io.StringIO()) as screen, self.assertLogs("collector", "INFO") as logged:
+            context = collector.https_context()
+        self.assertEqual(screen.getvalue(), "")
+        self.assertIn("Bad certificate in Windows certificate store", "\n".join(logged.output))
+        self.assertEqual(len(context.get_ca_certs()), len(collector.EXTRA_ROOT_NAMES))
+
+    def test_every_request_to_arenasweats_is_checked_with_the_carried_roots(self):
+        used, opened = [], http.client.HTTPSConnection.__init__
+
+        def watched(connection, *args, context=None, **kwargs):
+            used.append(context)
+            opened(connection, *args, context=context, **kwargs)
+
+        for patch in (unittest.mock.patch.object(http.client.HTTPSConnection, "__init__", watched),
+                      unittest.mock.patch.object(ssl, "create_default_context", side_effect=AssertionError("default")),
+                      unittest.mock.patch.object(ssl, "_create_default_https_context",
+                                                 side_effect=AssertionError("default"))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        nobody = socket.create_server(("127.0.0.1", 0))         # an address where nothing answers
+        url = "https://127.0.0.1:%d" % nobody.getsockname()[1]
+        nobody.close()
+        self.assertEqual(collector.Server(url, None).call("POST", "/v1/register", {"version": "0"})[0], 0)
+        with self.assertRaises(collector.NoAnswer):
+            collector.latest_release(url)                       # the update check
+        with self.assertRaises(collector.NoAnswer):              # the download of an update
+            collector.install_update({"url": url + "/download/ArenaSweatsCollector.exe", "sha256": "0" * 64},
+                                     os.path.join(self.tmp.name, "ArenaSweatsCollector.exe"))
+        self.assertEqual(len(used), 3)
+        self.assertTrue(all(context is collector.https_context() for context in used))
+        self.assert_checks_certificates(collector.https_context())
+        with open(collector.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        for unchecked in ("urlopen(", "create_default_context(", "_create_unverified_context"):
+            self.assertNotIn(unchecked, source)
+
+    def make_certificates(self):
+        """A root of our own and a certificate for 127.0.0.1 from it, made with the openssl program.
+        Returns the paths of (root, certificate, key)."""
+        path = lambda name: os.path.join(self.tmp.name, name)
+        with open(path("leaf.ext"), "w") as handle:
+            handle.write("basicConstraints=CA:FALSE\nsubjectAltName=IP:127.0.0.1\n")
+        for step in (["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", path("root.key"), "-out", path("root.pem"),
+                      "-days", "2", "-subj", "/CN=Test Root", "-addext", "basicConstraints=critical,CA:TRUE",
+                      "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
+                     ["req", "-newkey", "rsa:2048", "-nodes", "-keyout", path("leaf.key"), "-out", path("leaf.csr"),
+                      "-subj", "/CN=127.0.0.1"],
+                     ["x509", "-req", "-in", path("leaf.csr"), "-CA", path("root.pem"), "-CAkey", path("root.key"),
+                      "-CAcreateserial", "-out", path("leaf.pem"), "-days", "2", "-extfile", path("leaf.ext")]):
+            if subprocess.run(["openssl"] + step, capture_output=True).returncode:
+                self.skipTest("openssl could not make the certificates here")
+        return path("root.pem"), path("leaf.pem"), path("leaf.key")
+
+    @unittest.skipUnless(shutil.which("openssl"), "needs the openssl program to make certificates")
+    def test_a_certificate_leading_to_a_carried_root_works_for_sign_up_uploads_and_updates_without_windows(self):
+        root, cert, key = self.make_certificates()
+        with open(root, encoding="ascii") as handle:
+            self.addCleanup(setattr, collector, "EXTRA_ROOTS", collector.EXTRA_ROOTS)
+            collector.EXTRA_ROOTS = handle.read()
+        self.windows_store(lambda context, purpose=None: None)         # Windows holds none of it
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(cert, key)
+        https = make_server("127.0.0.1", 0, ingest.app, threaded=True, ssl_context=tls)
+        threading.Thread(target=https.serve_forever, daemon=True).start()
+        self.addCleanup(https.shutdown)
+        url = "https://127.0.0.1:%d" % https.server_port
+        self.run_collector(minutes=30, server=collector.Server(url, None))
+        self.assertIn("Signed up with ArenaSweats.", self.output.getvalue())
+        self.assertTrue(self.server_ids())
+        downloads = os.path.join(self.tmp.name, "downloads")
+        os.makedirs(downloads)
+        self.addCleanup(os.environ.pop, "COLLECTOR_DOWNLOADS", None)
+        os.environ["COLLECTOR_DOWNLOADS"] = downloads
+        with open(os.path.join(downloads, ingest.PROGRAM), "wb") as handle:
+            handle.write(b"new program")
+        with open(os.path.join(downloads, "latest.json"), "w") as handle:
+            json.dump({"version": "99.0.0", "sha256": hashlib.sha256(b"new program").hexdigest()}, handle)
+        release = collector.latest_release(url)
+        self.assertEqual(release["version"], "99.0.0")
+        program = os.path.join(self.tmp.name, "program", "ArenaSweatsCollector.exe")
+        os.makedirs(os.path.dirname(program))
+        with open(program, "wb") as handle:
+            handle.write(b"old program")
+        collector.install_update(release, program)
+        with open(program, "rb") as handle:
+            self.assertEqual(handle.read(), b"new program")
 
     @unittest.skipUnless(shutil.which("openssl"), "needs the openssl program to make a certificate")
     def test_an_untrusted_certificate_is_named_as_the_reason(self):
@@ -1194,7 +1324,7 @@ class FastWithServer(WithServer):
     def test_fast_mode_is_reported_so_we_can_see_who_uses_it(self):
         self.run_collector(minutes=5, server=self.server(), fast=True)
         self.assertTrue(self.server_ids())
-        self.assertLess(self.median([gap for _, gap in self.gaps()]), 1.2)
+        self.assertLess(self.median([gap for _, gap in self.gaps()]), 0.5)
         self.assertEqual(self.db.execute("SELECT state FROM contributor_seen").fetchone()[0], "collecting_fast")
         self.assertEqual(ingest.relay_status(self.db, ingest.clock())["installs_seen"]["last_hour"],
                          {"collecting_fast": 1})
@@ -1210,16 +1340,48 @@ class FastWithServer(WithServer):
         off = [gap for at, gap in gaps if 300 + 90 < at < 900]           # its next answer from ArenaSweats says so
         again = [gap for at, gap in gaps if at > 900 + 90]
         self.assertTrue(before and off and again)
-        self.assertLess(self.median(before), 1.2)
+        self.assertLess(self.median(before), 0.5)
         self.assertGreaterEqual(min(off), 2.0 * 0.8 - 0.001)             # the normal pace
-        self.assertLess(self.median(again), 1.2)
+        self.assertLess(self.median(again), 0.5)
         self.assertIn("ArenaSweats has switched fast mode off for now", self.output.getvalue())
         self.assertIn("ArenaSweats has switched fast mode back on", self.output.getvalue())
+
+    def test_the_server_can_cap_fast_modes_speed(self):
+        start = self.clock.now()
+        self.clock.at(start + 300, lambda: self.admin("policy", "--fast-delay", "1.5"))
+        self.clock.at(start + 900, lambda: self.admin("policy", "--fast-delay", "0"))    # cannot go under the floor
+        self.run_collector(minutes=20, server=self.server(), fast=True)
+        gaps = self.gaps(start)
+        before = [gap for at, gap in gaps if at < 300]
+        capped = [gap for at, gap in gaps if 300 + 90 < at < 900]         # its next answer from ArenaSweats says so
+        again = [gap for at, gap in gaps if at > 900 + 90]
+        self.assertTrue(before and capped and again)
+        self.assertLess(self.median(before), 0.5)
+        self.assertGreaterEqual(min(capped), 1.5 - 0.001)
+        self.assertLess(self.median(capped), 1.7)
+        self.assertGreaterEqual(min(again), collector.FAST_MIN_DELAY - 0.001)
+        self.assertLess(self.median(again), 0.5)
+
+    def test_our_own_server_never_holds_back_a_fast_collector(self):
+        answers, original = [], collector.Server.call
+
+        def call(server, method, path, payload=None):
+            answer = original(server, method, path, payload)
+            answers.append((self.clock.now(), path, answer[0]))
+            return answer
+        self.addCleanup(setattr, collector.Server, "call", original)
+        collector.Server.call = call
+        self.run_collector(minutes=60, server=self.server(), fast=True)
+        self.assertGreater(len(self.server_ids()), 500)
+        self.assertEqual({status for _, _, status in answers}, {200})
+        times = [when for when, _, _ in answers]
+        busiest = max(sum(1 for other in times if when <= other < when + 60) for when in times)
+        self.assertLess(busiest, ingest.REQUESTS_PER_MINUTE * 2 / 3)          # 23 when this was written
 
     def test_the_server_can_still_slow_it_down_or_stop_it(self):
         self.admin("policy", "--delay", "6")
         self.run_collector(minutes=10, server=self.server(), fast=True)
-        self.assertGreaterEqual(min(gap for _, gap in self.gaps()), 3.0 * 0.8 - 0.001)   # half of 6 s, not 1 s
+        self.assertGreaterEqual(min(gap for _, gap in self.gaps()), 6.0 / collector.FAST_FACTOR * 0.8 - 0.001)
         self.admin("policy", "--off")
         before = len(self.fake.requests)
         self.run_collector(minutes=30, server=self.server(), fast=True, hours_later=7)
@@ -1412,7 +1574,10 @@ class HostileServer(CollectorCase):
         (200, {}, b'{"delay": NaN, "message": "\\ud800\\u0007 hi", "season_start": 1e400}'),
         (200, {}, b'{"delay": true, "policy": [1], "games": 5, "players": "all", "wait": -1}'),
         (200, {}, b'{"accepted": "x", "rejected": 5, "policy": {"delay": "fast", "enabled": null, "season_start": -4}}'),
-        (200, {}, b'{"rejected": [5, null, {"gameId": [1]}, {"gameId": {}}], "policy": {"delay": 0.001}}'),
+        (200, {}, b'{"rejected": [5, null, {"gameId": [1]}, {"gameId": {}}], "policy": {"delay": 0.001, '
+                  b'"fast_delay": 0.001}}'),
+        (200, {}, b'{"enabled": true, "fast_delay": -1}'),
+        (200, {}, b'{"enabled": true, "fast_delay": NaN}'),
         (200, {}, b'{"games": [1, "x", 1e400, -5, 1e3, true, null, {"a": 1}, 99999999999999999999999], "wait": 0}'),
         (200, {}, b'{"players": [{"puuid": "../../x", "since": 5}, {"puuid": 7}, 7, null, [],'
                   b' {"puuid": "' + b"z" * 36 + b'", "since": "a"}, {"puuid": "' + b"y" * 36 + b'", "since": 1e400}]}'),
@@ -1468,7 +1633,7 @@ class HostileServer(CollectorCase):
         self.run_collector(minutes=3 * 60, server=server, fast=True)
         times = [when for _, _, when in history(self.fake.requests)]
         self.assertGreater(len(times), 20)
-        self.assertGreaterEqual(min(b - a for a, b in zip(times, times[1:])), collector.MIN_DELAY - 0.001)
+        self.assertGreaterEqual(min(b - a for a, b in zip(times, times[1:])), collector.FAST_MIN_DELAY - 0.001)
 
 
 if __name__ == "__main__":
