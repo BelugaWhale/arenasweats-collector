@@ -1924,9 +1924,60 @@ def install_update(release, exe_path):
             os.remove(temp)
 
 
-def offer_update(base_url, ask=input, spawn=subprocess.Popen):
-    """When ArenaSweats has a newer collector, ask whether to update; on yes, install and start it.
-    Returns True when the new version was started (this one should then stop)."""
+ANSWER_SECONDS = 10    # a start-up question nobody answers takes its default after this long (admin, 2026-11-24)
+
+
+def timed_input(prompt, seconds=ANSWER_SECONDS):
+    """input() for the start-up questions, so a collector started with nobody at the PC still starts: returns None
+    when nothing is typed within `seconds`. Once a key is pressed it waits for Enter, like input()."""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    if os.name != "nt":
+        import select
+        try:
+            ready = select.select([sys.stdin], [], [], seconds)[0]
+        except (OSError, ValueError):           # not a stream it can wait on: wait for the answer as input() does
+            return input()
+        if not ready:
+            sys.stdout.write("\n")
+            return None
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line.rstrip("\r\n")
+    import msvcrt
+    typed, deadline = [], time.monotonic() + seconds
+    while True:
+        if msvcrt.kbhit():
+            char = msvcrt.getwch()
+            deadline = None                     # someone is typing: wait for Enter
+            if char in ("\x00", "\xe0"):        # an arrow or function key; its second half follows
+                msvcrt.getwch()
+            elif char == "\x03":
+                raise KeyboardInterrupt
+            elif char in ("\r", "\n"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(typed)
+            elif char == "\x08":
+                if typed:
+                    typed.pop()
+                    sys.stdout.write("\b \b")
+            else:
+                typed.append(char)
+                sys.stdout.write(char)
+            sys.stdout.flush()
+        elif deadline is not None and time.monotonic() >= deadline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return None
+        else:
+            time.sleep(0.05)
+
+
+def offer_update(base_url, ask=timed_input, spawn=subprocess.Popen):
+    """When ArenaSweats has a newer collector, ask whether to update; on yes, or no answer within ANSWER_SECONDS,
+    install and start it. Returns True when the new version was started (this one should then stop)."""
     try:
         release = latest_release(base_url)
     except (OSError, ValueError, http.client.HTTPException) as error:
@@ -1937,9 +1988,14 @@ def offer_update(base_url, ask=input, spawn=subprocess.Popen):
     print("A new version of the collector is available: %s (you have %s)." % (release["version"], VERSION))
     print("有新版本的采集器：%s（当前 %s）。" % (release["version"], VERSION))
     try:
-        answer = ask("Update now? 现在更新？ [Y/n] ").strip().lower()
+        answer = ask("Update now? 现在更新？ [Y/n] (updates by itself in %d s / %d 秒后自动更新) "
+                     % (ANSWER_SECONDS, ANSWER_SECONDS))
     except (EOFError, KeyboardInterrupt):
         answer = "n"
+    if answer is None:
+        print("No answer: updating. 无人回答：自动更新。")
+        answer = "y"
+    answer = answer.strip().lower()
     if answer not in ("", "y", "yes", "是"):
         print("Keeping version %s." % VERSION)
         return False
@@ -1957,17 +2013,22 @@ def offer_update(base_url, ask=input, spawn=subprocess.Popen):
 FAST_ON = "Fast mode is on (experimental). 快速模式已开启（实验性）。"
 
 
-def ask_fast_mode(ask=input):
-    """Ask at start whether to turn fast mode on. Only a yes turns it on; Enter means no."""
+def ask_fast_mode(ask=timed_input):
+    """Ask at start whether to turn fast mode on. Only a yes turns it on; Enter, or no answer within ANSWER_SECONDS,
+    means no."""
     print("Fast mode collects about %s times faster. It is experimental: we are not sure it is safe for your "
           "League account." % FAST_SPEEDUP)
     print("快速模式的采集速度约为正常速度的 %s 倍。此功能为实验性功能：我们不确定它对你的英雄联盟账号是否安全。"
           % FAST_SPEEDUP)
     try:
-        answer = ask("Turn it on? 是否开启？ [y/N] ").strip().lower()
+        answer = ask("Turn it on? 是否开启？ [y/N] (normal mode in %d s / %d 秒后以普通模式开始) "
+                     % (ANSWER_SECONDS, ANSWER_SECONDS))
     except (EOFError, KeyboardInterrupt):
         answer = "n"
-    return answer in ("y", "yes", "是")
+    if answer is None:
+        print("No answer: starting in normal mode. 无人回答：以普通模式开始。")
+        return False
+    return answer.strip().lower() in ("y", "yes", "是")
 
 
 def remove_old_program():

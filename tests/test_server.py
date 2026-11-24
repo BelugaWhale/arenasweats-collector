@@ -1287,7 +1287,7 @@ class Updates(WithServer):
         self.addCleanup(setattr, sys, "executable", sys.executable)
         sys.executable = self.program
         for answer, updates in (("", True), ("Y", True), ("yes", True), ("是", True), ("n", False), ("no", False),
-                                ("否", False)):
+                                ("否", False), (None, True)):       # None: nobody answered in time
             with open(self.program, "wb") as handle:
                 handle.write(b"old program")
             asked, started = [], []
@@ -1295,7 +1295,8 @@ class Updates(WithServer):
                 result = collector.offer_update(self.url, ask=lambda prompt: asked.append(prompt) or answer,
                                                 spawn=started.append)
             self.assertEqual(result, updates, answer)
-            self.assertEqual(asked, ["Update now? 现在更新？ [Y/n] "])
+            self.assertEqual(asked, ["Update now? 现在更新？ [Y/n] (updates by itself in 10 s / 10 秒后自动更新) "])
+            self.assertEqual("No answer: updating. 无人回答：自动更新。" in output.getvalue(), answer is None)
             self.assertIn("A new version of the collector is available: 99.0.0 (you have %s).\n"
                           "有新版本的采集器：99.0.0（当前 %s）。" % (collector.VERSION, collector.VERSION), output.getvalue())
             with open(self.program, "rb") as handle:

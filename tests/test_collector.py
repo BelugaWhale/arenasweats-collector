@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -322,7 +323,7 @@ class FastMode(CollectorCase):
             asked = []
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(collector.ask_fast_mode(lambda prompt: asked.append(prompt) or answer), expected)
-            self.assertEqual(asked, ["Turn it on? 是否开启？ [y/N] "])
+            self.assertEqual(asked, ["Turn it on? 是否开启？ [y/N] (normal mode in 10 s / 10 秒后以普通模式开始) "])
         self.assertIn("Fast mode collects about %s times faster. It is experimental: we are not sure it is safe "
                       "for your League account." % collector.FAST_SPEEDUP, output.getvalue())
         self.assertIn("快速模式的采集速度约为正常速度的 %s 倍。此功能为实验性功能：我们不确定它对你的英雄联盟账号是否安全。"
@@ -332,6 +333,22 @@ class FastMode(CollectorCase):
             raise EOFError
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertFalse(collector.ask_fast_mode(closed))
+        with contextlib.redirect_stdout(io.StringIO()) as output:     # nobody at the PC: normal mode
+            self.assertFalse(collector.ask_fast_mode(lambda prompt: None))
+        self.assertIn("No answer: starting in normal mode. 无人回答：以普通模式开始。", output.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "the Windows console is read key by key; this checks the pipe version")
+    def test_an_unanswered_question_gives_up_after_its_time(self):
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, writer)
+        with os.fdopen(reader, "r") as stream, unittest.mock.patch.object(sys, "stdin", stream), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            started = time.monotonic()
+            self.assertIsNone(collector.timed_input("Question? ", seconds=0.2))
+            self.assertLess(time.monotonic() - started, 5)
+            os.write(writer, "是\n".encode("utf-8"))
+            self.assertEqual(collector.timed_input("Question? ", seconds=5), "是")
+        self.assertEqual(output.getvalue(), "Question? \nQuestion? ")
 
     def test_the_flag_turns_it_on_and_says_so_every_start(self):
         for flags, on in ((["--fast"], True), (["--no-fast"], False), ([], False)):
