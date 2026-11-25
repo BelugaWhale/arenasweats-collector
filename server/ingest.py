@@ -48,7 +48,7 @@ GAMES_PER_DAY = 220000           # per key; fast mode's floor (0.4 s between req
                                  # 216,000 a day, plus a held-back outbox (measured: ~100k in fast mode, ~30k normally)
 SIGNUPS_PER_ADDRESS = 10         # new installs one internet address can sign up a day (many homes in China share one)
 SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close with: policy --signups off)
-MAX_PACE_BYTES = 600             # a collector's few numbers about its own pace (see note_pace)
+MAX_PACE_BYTES = 800             # a collector's few numbers about its own pace (see note_pace)
 KEEP_PACE_DAYS = 14              # ... are kept this long
 ARENA_MODES = {"CHERRY"}
 DEFAULT_SEASON_START = "2026-10-06"   # UTC. Change with: ingest.py policy --season-start YYYY-MM-DD
@@ -366,7 +366,10 @@ def check_key():
 
 
 PACE_COUNTS = ("seconds", "requests", "failed", "refused", "paused", "rested", "idle", "expired", "fast", "flight", "most")
-PACE_TIMES = ("top", "page", "match", "calls")       # each: [how many, the middle answer time, a slow one], in ms
+PACE_TIMES = ("match", "calls")  # each: [how many, the middle answer time, a slow one], in ms
+PACE_LISTS = 8                   # "lists": at most this many rows, one for each size of match list asked for: [the size,
+                                 # how many answers, their middle time and a slow one in ms, the matches they listed in
+                                 # all, how many more answers came from the client's saved copy]
 
 
 def clean_pace(text):
@@ -385,6 +388,10 @@ def clean_pace(text):
         times = sent.get(name)
         if isinstance(times, list) and len(times) == 3 and all(is_int(number, 0, 10 ** 9) for number in times):
             report[name] = times
+    lists = sent.get("lists")
+    if (isinstance(lists, list) and len(lists) <= PACE_LISTS and all(
+            isinstance(row, list) and len(row) == 6 and all(is_int(number, 0, 10 ** 9) for number in row) for row in lists)):
+        report["lists"] = lists
     return report or None
 
 
@@ -824,12 +831,15 @@ def cmd_pace(db, args):
         report = json.loads(text)
         count = lambda field: report.get(field, 0)
         times = lambda field: "%d x %d ms (slow %d)" % tuple(report.get(field, [0, 0, 0]))
+        lists = "; ".join("lists of %d: %d x %d ms (slow %d), %.3f s a match listed, %d more from the saved copy" % (
+            size, answers, middle, slow, middle / 1000 * answers / max(listed, 1), saved)
+            for size, answers, middle, slow, listed, saved in report.get("lists", [])) or "no lists"
         print("%s %-16s %-7s %s  %d s: %d requests (%d failed, %d refused), %d at once (most %d); "
-              "first pages %s, further pages %s, matches %s; calls to ArenaSweats %s; "
+              "%s; matches %s; calls to ArenaSweats %s; "
               "paused %d s, at the normal pace after pushback %d s, nothing to read %d s, %d dropped as too old" % (
                   time.strftime("%Y-%m-%d %H:%M", time.localtime(at)), name, version, "fast  " if count("fast") else "normal",
                   count("seconds"), count("requests"), count("failed"), count("refused"), count("flight"), count("most"),
-                  times("top"), times("page"), times("match"), times("calls"),
+                  lists, times("match"), times("calls"),
                   count("paused"), count("rested"), count("idle"), count("expired")))
     if not rows:
         print("No pace numbers received%s." % (" from %s" % args.name if args.name else ""))

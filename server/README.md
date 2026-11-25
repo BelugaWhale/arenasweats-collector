@@ -85,8 +85,9 @@ Trust covers what a match says, not its size or shape:
   `relay status` reports installs seen in the last hour and day by state.
 - Every 5 minutes while it collects, a collector newer than 0.3.7 sends a few numbers about its own pace with
   one of its requests (`X-Collector-Pace`): how many requests it made to the League client, how many
-  failed or were answered 429, how long the client took to answer (first pages of lists, further pages
-  and matches apart), how long requests to ArenaSweats took, the seconds it was paused, at the normal
+  failed or were answered 429, how long the client took to answer (matches, and match lists by the
+  number of matches asked for, with how many matches they listed and how many answers came from the
+  client's saved copy), how long requests to ArenaSweats took, the seconds it was paused, at the normal
   pace after the client pushed back in fast mode, or had nothing to read, and how many requests fast mode
   has on their way at once. Nothing but numbers. They are kept for 14 days; `ingest.py pace` shows them.
 

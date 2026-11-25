@@ -142,18 +142,21 @@ class Keys(ServerCase):
     def test_a_collectors_numbers_about_its_own_pace_are_kept_and_nothing_else(self):
         # These numbers decide how fast collectors may go; junk in them must neither be stored nor break a request.
         headers = {"Authorization": "Bearer " + self.key, "User-Agent": "arenasweats-collector/0.3.8"}
-        report = {"seconds": 300, "requests": 700, "failed": 1, "refused": 0, "top": [150, 1600, 1900],
-                  "page": [280, 700, 900], "match": [270, 60, 80], "calls": [60, 950, 1400], "paused": 0, "rested": 0,
+        report = {"seconds": 300, "requests": 700, "failed": 1, "refused": 0,
+                  "lists": [[20, 3, 1700, 1900, 60, 1], [100, 30, 9000, 12000, 2950, 2]],
+                  "match": [270, 60, 80], "calls": [60, 950, 1400], "paused": 0, "rested": 0,
                   "idle": 4, "expired": 0, "fast": 1, "flight": 3, "most": 4}
-        sent = dict(report, name="Somebody#123", top=[150, 1600, "x"], extra={"a": 1})      # only numbers we know stay
+        sent = dict(report, name="Somebody#123", calls=[60, 950, "x"], extra={"a": 1})      # only numbers we know stay
         headers["X-Collector-Pace"] = json.dumps(sent)
         self.assertEqual(self.client.get("/v1/policy", headers=headers).status_code, 200)
         kept = dict(report)
-        del kept["top"]
+        del kept["calls"]
         row = self.db.execute("SELECT version, report FROM contributor_pace").fetchone()
         self.assertEqual((row[0], json.loads(row[1])), ("0.3.8", kept))
-        for junk in ("x" * 700, "{", "[1, 2]", '"text"', json.dumps({"requests": "many"}), json.dumps({"requests": -1}),
-                     json.dumps({"requests": 1.5}), json.dumps({"requests": True}), "[" * 500):
+        for junk in ("x" * 900, "{", "[1, 2]", '"text"', json.dumps({"requests": "many"}), json.dumps({"requests": -1}),
+                     json.dumps({"requests": 1.5}), json.dumps({"requests": True}), "[" * 500,
+                     json.dumps({"lists": [[100, 30, 9000, 12000, 2950]]}), json.dumps({"lists": [[1, 2, 3, 4, 5, "6"]]}),
+                     json.dumps({"lists": [[1] * 6] * 9}), json.dumps({"lists": {"100": 1}})):
             headers["X-Collector-Pace"] = junk
             self.assertEqual(self.client.get("/v1/policy", headers=headers).status_code, 200, junk[:20])
         self.assertEqual(self.count("contributor_pace"), 1)
@@ -165,6 +168,7 @@ class Keys(ServerCase):
         self.assertIn("alice", shown)
         self.assertIn("300 s: 700 requests (1 failed, 0 refused), 3 at once (most 4)", shown)
         self.assertIn("matches 270 x 60 ms (slow 80)", shown)
+        self.assertIn("lists of 100: 30 x 9000 ms (slow 12000), 0.092 s a match listed, 2 more from the saved copy", shown)
         self.assertIn("No pace numbers received from bob.", self.admin("pace", "bob"))
         self.now += (ingest.KEEP_PACE_DAYS + 1) * 86400                    # old ones go when a new one arrives
         headers["Authorization"] = "Bearer " + self.key
@@ -1589,9 +1593,8 @@ class SeveralAtOnce(SlowAnswers):
         self.run_collector(minutes=11, server=self.server(), fast=True)
         reports = [json.loads(text) for text in seen if text]
         self.assertEqual(len(reports), 2)                                # one every 5 minutes, each sent once
-        kept = [json.loads(row[0]) for row in self.db.execute("SELECT report FROM contributor_pace ORDER BY at")]
-        self.assertEqual(kept, [{name: value for name, value in report.items() if name != "lists"}
-                                for report in reports])                  # and ArenaSweats kept them
+        self.assertEqual([json.loads(row[0]) for row in self.db.execute(
+            "SELECT report FROM contributor_pace ORDER BY at")], reports)    # and ArenaSweats kept them as sent
         for report in reports:
             self.assertEqual(sorted(report), sorted(["seconds", "requests", "failed", "refused", "lists", "match",
                                                      "calls", "paused", "rested", "idle", "expired", "fast", "flight",
