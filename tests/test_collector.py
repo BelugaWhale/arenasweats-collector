@@ -213,7 +213,7 @@ class Gentle(CollectorCase):
         self.run_collector(minutes=30)
         times = [when - start for _, _, when in history(self.fake.requests)]
         self.assertFalse([when for when in times if when < 360 + collector.RESUME_GRACE - 5])
-        self.assertGreater(len(times), 100)
+        self.assertGreater(len(times), 20)      # it collects from then on (each list is one request)
 
     def test_backs_off_when_requests_fail(self):
         self.run_collector()                                              # learn the players first
