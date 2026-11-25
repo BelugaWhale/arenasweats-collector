@@ -2,6 +2,10 @@
 
 It answers the same addresses the real client does, in the same shapes, over plain
 HTTP on 127.0.0.1. Tests point the collector at it with a lockfile.
+
+Like the real client (measured on one, 25 Nov 2026), it gives as many of a player's matches as its first
+match-list request for them asks for, saves that answer, and gives the saved copy to every later request
+for that player whatever places are asked for: see FakeClient.listed.
 """
 
 import base64
@@ -47,6 +51,7 @@ class PretendFlights:
         self.waiting = []                     # (due, order, tag, answer)
         self.count = self.order = 0
         self.most = self.together = 0         # the most requests to the client at once; how many were not sent alone
+        self.flown = []                       # every request to the client: (sent, answered, its address)
 
     def start(self, tag, call):
         self.fake.took = 0.0
@@ -61,6 +66,7 @@ class PretendFlights:
         if isinstance(tag, int):
             self.most = max(self.most, self.flying())
             self.together += self.flying() > 1
+            self.flown.append((self.clock.now(), self.clock.now() + took, self.fake.requests[-1][1]))
 
     def flying(self):
         """How many requests to the client are on their way."""
@@ -108,6 +114,11 @@ class FakeClient:
         self.list_hook = None                 # tests set this to change a match-list page: hook(player, page)
         self.delay = lambda path: 0.0         # tests set this: seconds a match-history answer takes. Without a
         self.took = 0.0                       # pretend clock it is really waited; with one, PretendFlights reads it here
+        self.saved = {}                       # player -> the match list saved for them: (first place, match ids, when)
+        self.saved_for = 6 * 3600             # seconds a saved list is kept (the real client: 7 minutes at least)
+        self.pages = False                    # True: give any stretch of a list that is asked for, as no real client does
+        self.entry_seconds = 0.0              # a match list fetched afresh takes this much longer for every match in it;
+        self.saved_seconds = 0.0              # one from the saved copy takes this long
         self.flying = self.most_at_once = 0   # match-history requests being answered right now, and the most there were
         self.lock = threading.Lock()
         self.requests = []                    # (method, path, pretend time)
@@ -169,6 +180,32 @@ class FakeClient:
         game["participants"] = [p for p in game["participants"] if p["participantId"] == seat]
         return game
 
+    # -- match lists as the real client gives them -------------------------------
+    def listed(self, puuid, begin, end):
+        """What a match-list request is answered with: (the place of the first match, the match ids, whether
+        they come from the saved copy). The first request for a player decides what the client holds for
+        them: it fetches the places asked for, saves them, and answers every later request for that player
+        with that copy, whatever places are asked for."""
+        now = self.clock.now() if self.clock else time.monotonic()
+        if puuid in self.saved and now - self.saved[puuid][2] < self.saved_for and not self.pages:
+            return self.saved[puuid][:2] + (True,)
+        ids = sorted(self.history.get(puuid, []), key=lambda i: -self.games[i]["gameCreation"])[begin:end + 1]
+        self.saved[puuid] = (begin, ids, now)
+        return begin, ids, False
+
+    def forget(self):
+        """Drop the saved match lists, as a restart of the client does. (How long the real client keeps
+        them otherwise is not known: here, `saved_for` seconds.)"""
+        self.saved.clear()
+
+    def wait(self, seconds):
+        """A match-history answer takes `seconds`: really so without a pretend clock; with one,
+        PretendFlights reads the time from `took`."""
+        if self.clock is None:
+            time.sleep(seconds)
+        else:
+            self.took = seconds
+
     # -- answering requests ----------------------------------------------------
     def handle(self, handler, method):
         self.requests.append((method, handler.path, self.clock.now() if self.clock else time.monotonic()))
@@ -177,16 +214,12 @@ class FakeClient:
             self.flying += history
             self.most_at_once = max(self.most_at_once, self.flying)
         try:
-            if history and self.clock is None:
-                time.sleep(self.delay(handler.path))
-            elif history:
-                self.took = self.delay(handler.path)
-            self.answer(handler, method)
+            self.answer(handler, method, history)
         finally:
             with self.lock:
                 self.flying -= history
 
-    def answer(self, handler, method):
+    def answer(self, handler, method, history):
         expected = "Basic " + base64.b64encode(("riot:" + self.token).encode()).decode()
         if handler.headers.get("Authorization") != expected:
             return self.reply(handler, 401, {"errorCode": "RPC_ERROR", "httpStatus": 401, "message": "Unauthorized"})
@@ -198,6 +231,8 @@ class FakeClient:
             return None
         forced = self.fail(handler.path)
         if forced:
+            if history:
+                self.wait(self.delay(handler.path))
             return self.reply(handler, forced, {"errorCode": "RPC_ERROR", "httpStatus": forced, "message": "forced"})
         url = urlparse(handler.path)
         parts = url.path.strip("/").split("/")
@@ -209,13 +244,16 @@ class FakeClient:
             return self.reply(handler, 200, {"locale": "en_AU", "region": self.platform, "webRegion": "oce"})
         if parts[:4] == ["lol-match-history", "v1", "products", "lol"] and parts[-1] == "matches":
             query = parse_qs(url.query)
-            begin, end = int(query["begIndex"][0]), int(query["endIndex"][0])
-            ids = sorted(self.history.get(parts[4], []), key=lambda i: -self.games[i]["gameCreation"])
-            page = [self.summary(i, parts[4]) for i in ids[begin:end + 1]]
+            begin, ids, saved = self.listed(parts[4], int(query["begIndex"][0]), int(query["endIndex"][0]))
+            page = [self.summary(i, parts[4]) for i in ids]
             if self.list_hook:
                 page = self.list_hook(parts[4], page)
+            self.wait(self.saved_seconds if saved else self.delay(handler.path) + self.entry_seconds * len(ids))
             return self.reply(handler, 200, {"accountId": 1, "platformId": self.platform, "games": {
-                "gameCount": len(page), "gameIndexBegin": begin, "gameIndexEnd": end, "games": page}})
+                "gameCount": len(page), "gameIndexBegin": begin, "gameIndexEnd": begin + max(len(ids), 1) - 1,
+                "games": page}})
+        if history:
+            self.wait(self.delay(handler.path))
         if parts[:3] == ["lol-match-history", "v1", "games"] and int(parts[3]) in self.games:
             return self.reply(handler, 200, self.wrong_record.get(int(parts[3]), self.games[int(parts[3])]))
         return self.reply(handler, 404, {"errorCode": "RESOURCE_NOT_FOUND", "httpStatus": 404, "message": "not found"})

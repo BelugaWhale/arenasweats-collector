@@ -858,6 +858,23 @@ class WithServer(CollectorCase):
         self.addCleanup(self.http.shutdown)
         self.url = "http://127.0.0.1:%d" % self.http.server_port
         self.key = self.admin("add-key", "alice").split()[-1]
+        # The endpoint in this checkout does not say yet how many of a list's matches to ask for ("count"). Until
+        # the one that does is merged, every list it hands out is read here as one block of `blocks` matches, as
+        # that endpoint will ask. (A number the endpoint names itself is left alone; None: nothing is added.)
+        self.blocks = 100
+        handed = ingest.app.view_functions["work"]
+
+        def work():
+            response = handed()
+            if response.status_code == 200 and self.blocks:
+                answer = response.get_json()
+                for item in answer["players"]:
+                    if not item["begin"]:
+                        item.setdefault("count", self.blocks)
+                response = ingest.jsonify(answer)
+            return response
+        ingest.app.view_functions["work"] = work
+        self.addCleanup(ingest.app.view_functions.__setitem__, "work", handed)
 
     def admin(self, *args):
         output = io.StringIO()
@@ -996,7 +1013,7 @@ class EndToEnd(WithServer):
                            os.path.join(self.tmp.name, "data2"))}
         os.makedirs(folders[other][1])
         bob = self.admin("add-key", "bob").split()[-1]
-        for fake, minutes in ((self.fake, 0.5), (other, 2), (self.fake, 2), (other, 2), (self.fake, 60), (other, 60)):
+        for fake, minutes in ((self.fake, 0.5), (other, 2), (self.fake, 2), (other, 2), (other, 60), (self.fake, 60)):
             self.league_dir, self.data_dir = folders[fake]
             self.run_collector(minutes=minutes, server=self.server(self.key if fake is self.fake else bob))
         self.assertEqual(self.server_ids(), self.fake.arena_ids())
@@ -1346,7 +1363,8 @@ class FastWithServer(WithServer):
     def setUp(self):
         super().setUp()
         self.fake.close()
-        self.fake = FakeClient(players=150, arena=800, clock=self.clock)    # enough to keep it reading for a while
+        # Enough to keep it reading for a while: a list is read once, one page, so that takes many players.
+        self.fake = FakeClient(players=1500, arena=1500, other=0, clock=self.clock)
         self.fake.write_lockfile(self.league_dir)
 
     def gaps(self, start=0.0):
@@ -1425,19 +1443,13 @@ class FastWithServer(WithServer):
         self.assertEqual(history(self.fake.requests[before:]), [])
 
 
-class SeveralAtOnce(WithServer):
-    """Fast mode sends the next request before the last one is answered. Here the fake client's answers take
-    pretend time (a list 1.5 s, about what Chinese clients were measured to take; a match 0.5 s, longer than
-    theirs, so that every answer keeps the next request waiting whatever the mix of lists and matches), so
-    requests can be on their way together."""
+class SlowAnswers(WithServer):
+    """The fake client's answers take pretend time here (PretendFlights), so requests can be on their way together."""
 
-    def setUp(self):
-        super().setUp()
+    def world(self, **players_and_matches):
         self.fake.close()
-        # Every list is one page here, and there is enough to read for 40 minutes at fast mode's full pace.
-        self.fake = FakeClient(players=3000, arena=3000, other=0, clock=self.clock)
+        self.fake = FakeClient(clock=self.clock, **players_and_matches)
         self.fake.write_lockfile(self.league_dir)
-        self.fake.delay = lambda path: 0.5 if "/games/" in path else 1.5
 
     def collector(self, *args, **kwargs):
         made = super().collector(*args, **kwargs)
@@ -1452,26 +1464,38 @@ class SeveralAtOnce(WithServer):
         times = [when for when, _ in self.starts(since)]
         return [b - a for a, b in zip(times, times[1:])]
 
+
+class SeveralAtOnce(SlowAnswers):
+    """Fast mode sends the next request before the last one is answered. A list takes 1.5 s here, about what
+    Chinese clients were measured to take for 20 matches; a match 0.5 s, longer than theirs, so that every answer
+    keeps the next request waiting whatever the mix of lists and matches."""
+
+    def setUp(self):
+        super().setUp()
+        # Every list is short here, and there is enough to read for 40 minutes at fast mode's full pace.
+        self.world(players=3000, arena=3000, other=0)
+        self.fake.delay = lambda path: 0.5 if "/games/" in path else 1.5
+
     def test_the_normal_pace_still_sends_one_request_at_a_time(self):
         # Every volunteer was promised one gentle request at a time; a slip here would break that for all of them.
         made = self.run_collector(minutes=20, server=self.server())
         self.assertEqual((self.flights.most, self.flights.together, made.flight_limit), (1, 0, 1))
-        starts = self.starts()[1:]              # (but for the first look at my own list, which takes no pretend time)
-        self.assertGreater(len(starts), 150)
-        for (when, path), (after, _) in zip(starts, starts[1:]):       # the gap still runs from the answer
-            self.assertGreaterEqual(after - when, self.fake.delay(path) + 2.0 * 0.8 - 0.001)
+        flown = self.flights.flown
+        self.assertGreater(len(flown), 150)
+        for (_, answered, _), (sent, _, _) in zip(flown, flown[1:]):     # the gap still runs from the answer
+            self.assertGreaterEqual(sent - answered, 2.0 * 0.8 - 0.001)
         self.assertTrue(self.server_ids())
 
     def test_fast_mode_overlaps_requests_within_its_ceiling_and_its_pace(self):
         # Fast mode's two hard limits protect the volunteer's account: never more at once, never closer together.
         start = self.clock.now()
         early = []
-        self.clock.at(start + 20, lambda: early.append(self.flights.most))
+        self.clock.at(start + 5, lambda: early.append(self.flights.most))
         made = self.run_collector(minutes=15, server=self.server(), fast=True)
         self.assertEqual(early, [1])                                     # it starts with one at a time
         self.assertEqual(self.flights.most, collector.FAST_MAX_FLIGHT)   # and works up to the ceiling, not beyond
         self.assertEqual(made.flight, collector.FAST_MAX_FLIGHT)
-        for kind in ("top", "match"):       # how long each kind of request takes alone was measured first
+        for kind in ("list", "match"):      # how long each kind of request takes alone was measured first
             self.assertGreaterEqual(len(made.alone[kind]), collector.FLIGHT_ALONE)
         self.assertGreaterEqual(min(self.gaps()), collector.FAST_MIN_DELAY - 0.001)
         late = self.gaps(start + 600)
@@ -1513,9 +1537,10 @@ class SeveralAtOnce(WithServer):
         self.assertEqual(made.stats["failed"], 4)
         self.assertEqual(self.output.getvalue().count("fast mode rests for an hour"), 1)
         self.assertEqual((self.flights.most, made.flight, made.flight_limit), (1, 1, 1))   # one at a time since the 429
-        resting = self.starts(start + 830)
-        for (when, path), (after, _) in zip(resting, resting[1:]):       # at the normal pace
-            self.assertGreaterEqual(after - when, self.fake.delay(path) + 2.0 * 0.8 - 0.001)
+        resting = [flight for flight in self.flights.flown if flight[0] >= start + 830]
+        self.assertGreater(len(resting), 50)
+        for (_, answered, _), (sent, _, _) in zip(resting, resting[1:]):     # at the normal pace
+            self.assertGreaterEqual(sent - answered, 2.0 * 0.8 - 0.001)
 
     def test_arenasweats_can_allow_fewer_at_once_but_never_more(self):
         # ArenaSweats' setting is the brake for every collector at once; it must work, and must not work as a throttle up.
@@ -1564,20 +1589,27 @@ class SeveralAtOnce(WithServer):
         self.run_collector(minutes=11, server=self.server(), fast=True)
         reports = [json.loads(text) for text in seen if text]
         self.assertEqual(len(reports), 2)                                # one every 5 minutes, each sent once
-        self.assertEqual([json.loads(row[0]) for row in self.db.execute(
-            "SELECT report FROM contributor_pace ORDER BY at")], reports)    # and ArenaSweats kept them as sent
+        kept = [json.loads(row[0]) for row in self.db.execute("SELECT report FROM contributor_pace ORDER BY at")]
+        self.assertEqual(kept, [{name: value for name, value in report.items() if name != "lists"}
+                                for report in reports])                  # and ArenaSweats kept them
         for report in reports:
-            self.assertEqual(sorted(report), sorted(["seconds", "requests", "failed", "refused", "top", "page", "match",
+            self.assertEqual(sorted(report), sorted(["seconds", "requests", "failed", "refused", "lists", "match",
                                                      "calls", "paused", "rested", "idle", "expired", "fast", "flight",
                                                      "most"]))
             for name, value in report.items():
-                for number in value if name in ("top", "page", "match", "calls") else [value]:
+                numbers = [value] if name not in ("lists", "match", "calls") else value
+                for number in [n for row in numbers for n in row] if name == "lists" else numbers:
                     self.assertIs(type(number), int, name)
             self.assertTrue(295 <= report["seconds"] <= 310)
             self.assertGreater(report["requests"], 300)
-            self.assertEqual(report["top"][1:], [1500, 1500])            # how long a list's first page took, in ms
+            # lists asked for as blocks of 100: [100, how many, the middle time and a slow one in ms, the matches
+            # they listed (about 16 each in this world), how many more came from the client's saved copy]
+            (block,) = [row for row in report["lists"] if row[0] == 100]
+            self.assertEqual(block[2:4], [1500, 1500])
+            self.assertTrue(10 * block[1] < block[4] < 25 * block[1], block)
             self.assertEqual(report["match"][1:], [500, 500])
             self.assertTrue(1 <= report["most"] <= report["flight"] <= collector.FAST_MAX_FLIGHT, report)
+        self.assertEqual(reports[0]["lists"][-1][5], 1)                   # my own list: saved by the first look at it
         self.assertGreater(reports[1]["flight"], 1)
 
     def test_real_requests_overlap_in_fast_mode_only(self):
@@ -1586,14 +1618,15 @@ class SeveralAtOnce(WithServer):
         self.addCleanup(setattr, collector, "FLIGHT_CLEAN", collector.FLIGHT_CLEAN)
         self.addCleanup(setattr, collector, "FLIGHT_ALONE", collector.FLIGHT_ALONE)
         collector.FLIGHT_CLEAN, collector.FLIGHT_ALONE = 3, 2             # so that a few seconds are enough
-        fake = FakeClient(players=60, arena=200)                         # no pretend clock: its answers really take time
+        fake = FakeClient(players=60, arena=20)                          # no pretend clock: its answers really take time
         self.addCleanup(fake.close)
         fake.delay = lambda path: 0.02 if "/games/" in path else 0.5
         league_dir = fake.write_lockfile(os.path.join(self.tmp.name, "real", "League"))
-        known = [fake.games[game_id] for game_id in sorted(fake.arena_ids())[:20]]      # so there are lists to hand out
+        known = [fake.games[game_id] for game_id in sorted(fake.arena_ids())[:8]]       # so there are lists to hand out,
         self.assertEqual(ingest.app.test_client().post("/v1/games", json={"games": known}, headers={
-            "Authorization": "Bearer " + self.key}).get_json()["accepted"], 20)
-        for fast, seconds in ((True, 7), (False, 4)):                   # (fast first: it finds lists waiting, not matches)
+            "Authorization": "Bearer " + self.key}).get_json()["accepted"], 8)          # which show a few matches not held
+        for fast, seconds in ((True, 8), (False, 4)):                   # (fast first: it finds lists waiting, not matches)
+            time.sleep(0.6)                 # (a request of the run before may still be on its way)
             fake.most_at_once = 0
             before = len(fake.requests)
             data_dir = os.path.join(self.tmp.name, "real", "data-%s" % fast)
@@ -1612,6 +1645,133 @@ class SeveralAtOnce(WithServer):
             else:
                 self.assertEqual(fake.most_at_once, 1)
                 self.assertGreaterEqual(min(b - a for a, b in zip(times, times[1:])), 2.0 * 0.8 - 0.05)
+
+
+class Blocks(SlowAnswers):
+    """A player's match list is read in ONE request. The real client gives as many matches as its first request
+    for a player asks for and afterwards only its saved copy of those (measured on one, 25 Nov 2026); the fake
+    client does the same. A fresh list takes it 0.25 s for every match listed, as it took that client."""
+
+    def setUp(self):
+        super().setUp()
+        self.world(players=300, arena=600, other=12)                     # lists of 150 matches or so
+        self.reports, original = [], collector.Server.call      # the match-list reports sent to ArenaSweats
+
+        def call(server, method, path, payload=None):
+            self.reports += payload["reports"] if path == "/v1/work" else []
+            return original(server, method, path, payload)
+        collector.Server.call = call
+        self.addCleanup(setattr, collector.Server, "call", original)
+
+    def world(self, **players_and_matches):
+        super().world(**players_and_matches)
+        self.fake.delay = lambda path: 0.05
+        self.fake.entry_seconds = 0.25
+
+    def listed(self, puuid, count):
+        """The matches the client lists for a player when asked for their latest `count`, newest first."""
+        return [self.fake.games[i] for i in sorted(self.fake.history[puuid],
+                                                    key=lambda i: -self.fake.games[i]["gameCreation"])[:count]]
+
+    def test_a_list_is_one_request_and_its_report_says_what_the_client_gave(self):
+        # ArenaSweats plans every later read from these reports: a wrong number here would have it believe lists
+        # were read through that were not, and matches would silently never be collected.
+        self.run_collector(minutes=20, server=self.server())
+        lists = [path for _, path in self.starts() if "/matches?" in path]
+        me = self.fake.me
+        self.assertEqual(lists[0], "/lol-match-history/v1/products/lol/%s/matches?begIndex=0&endIndex=19" % me)
+        others = [path for path in lists if me not in path]
+        self.assertGreater(len(others), 5)
+        self.assertEqual(len(others), len(set(others)))                  # each player's list is asked for once,
+        self.assertTrue(all(path.endswith("?begIndex=0&endIndex=99") for path in others))    # as one block
+        read = {report["puuid"]: report for report in self.reports if report["asked"]}
+        for puuid, report in read.items():
+            listed = self.listed(puuid, 20 if puuid == me else 100)       # (mine: the copy saved by the first look)
+            self.assertEqual((report["asked"], report["listed"], report["failed"]), (100, len(listed), False))
+            self.assertEqual(report["oldest"], listed[-1]["gameCreation"])
+            self.assertEqual(report["newest"], listed[0]["gameCreation"])
+            self.assertEqual(sorted(report["ids"]), sorted(g["gameId"] for g in listed if g["gameMode"] == "CHERRY"))
+            self.assertEqual(report["took"], 0 if puuid == me else 25.05)  # 100 matches at 0.25 s each
+            self.assertEqual(report["next"], 0 if puuid == me else 100)    # the list may go on: only a larger block shows
+        self.assertEqual(len(read), len(others) + 1)
+        # This endpoint then hands out "the following pages" (it names no number for them). The client could only
+        # give its saved copy again, so nothing is asked of it, and the report says the list ends there.
+        further = [report for report in self.reports if not report["asked"]]
+        self.assertTrue(further)
+        for report in further:
+            self.assertEqual((report["begin"], report["listed"], report["ids"], report["next"], report["failed"]),
+                             (100, 0, [], 0, False))
+
+    def test_an_endpoint_that_names_no_number_gets_twenty_and_no_following_page(self):
+        # Collectors and the endpoint are updated at different times: with today's endpoint the new collector must
+        # not ask the client for pages it cannot give, nor leave ArenaSweats waiting for them.
+        self.blocks = None
+        self.run_collector(minutes=20, server=self.server())
+        lists = [path for _, path in self.starts() if "/matches?" in path]
+        self.assertGreater(len(lists), 20)
+        self.assertTrue(all(path.endswith("?begIndex=0&endIndex=19") for path in lists))
+        self.assertEqual(len(lists), len(set(lists)) + 1)                 # only my own list twice: a look, then the read
+        self.assertEqual({(report["asked"], report["listed"], report["next"], report["begin"]) for report in self.reports},
+                         {(20, 20, 0, 0)})
+        self.assertTrue(self.server_ids())
+
+    def test_a_long_list_is_not_taken_for_a_struggling_client(self):
+        # A list of 100 takes a real client 25 s: if that looked like trouble, every collector would crawl or rest.
+        for count, seconds in ((20, 20), (100, 60), (200, 110), (10000, 120)):
+            self.assertEqual(collector.ListRead("p" * 36, 0, min(count, 1000)).timeout if count < 10000 else
+                             collector.LCU_SECONDS_MAX, seconds)       # the time a list is given grows with its size
+        with self.assertLogs(collector.log, "INFO") as logs:
+            made = self.run_collector(minutes=45, server=self.server(), fast=True)
+        self.assertEqual((made.stats["failed"], made.failures), (0, 0))
+        self.assertFalse([line for line in logs.output if "down to" in line or "rests for an hour" in line])
+        self.assertGreaterEqual(made.flight, 3)                          # it was allowed more at once all the same
+        self.assertLessEqual(self.flights.most, collector.FAST_MAX_FLIGHT)
+        self.assertGreaterEqual(min(self.gaps()), collector.FAST_MIN_DELAY - 0.001)
+        lists = [(sent, answered) for sent, answered, path in self.flights.flown if "/matches?" in path]
+        matches = [sent for sent, _, path in self.flights.flown if "/games/" in path]
+        at_once = max(sum(1 for sent, answered in lists if sent <= when < answered) for when, _ in lists)
+        self.assertEqual(at_once, collector.FAST_MAX_FLIGHT - 1)         # one place is kept for the matches,
+        flown = self.flights.flown
+        first = min(sent for place, (sent, _, _) in enumerate(flown)     # when two were first on their way together
+                    if any(other < sent < answered for other, answered, _ in flown[:place]))
+        late = [when for when in matches if when > first]
+        during = [when for when in late if any(sent < when < answered for sent, answered in lists)]
+        self.assertGreater(len(late), 50)
+        self.assertGreater(len(during), len(late) * 0.8)                 # which go on while lists are being answered
+
+    def test_at_the_normal_pace_a_long_list_is_waited_for(self):
+        # One request at a time is the promise: the next one must wait for a list's answer however long that takes.
+        made = self.run_collector(minutes=30, server=self.server())
+        self.assertEqual((made.stats["failed"], self.flights.most), (0, 1))
+        flown = self.flights.flown
+        self.assertGreater(sum(1 for sent, answered, _ in flown if answered - sent >= 20), 5)
+        for (_, answered, _), (sent, _, _) in zip(flown, flown[1:]):
+            self.assertGreaterEqual(sent - answered, 2.0 * 0.8 - 0.001)
+
+
+    def test_a_list_dropped_for_a_game_comes_from_the_saved_copy_afterwards(self):
+        # Nothing may be sent while a game is on; and what the game interrupted must not cost the client a second
+        # long read afterwards, nor be reported as if it had taken no time for the wrong reason.
+        asked, game = [], {}
+
+        def queue_up(player, page):             # a game is queued just after the eighth list was asked for
+            asked.append(player)
+            if len(asked) == 8:
+                game.update(began=self.clock.now(), player=player)
+                self.fake.phase = "ChampSelect"
+                self.clock.at(self.clock.now() + 600, lambda: setattr(self.fake, "phase", "None"))
+            return page
+        self.fake.list_hook = queue_up
+        self.run_collector(minutes=40, server=self.server(), fast=True)
+        starts = self.starts(game["began"])
+        self.assertFalse([when for when, _ in starts if 5 <= when < 600 + collector.RESUME_GRACE - 5])
+        again = [when for when, path in starts if game["player"] in path]
+        self.assertEqual(len(again), 2)                                  # on its way when the game was noticed: dropped,
+        self.assertGreater(again[1], 600)                                # and asked again afterwards,
+        (report,) = [r for r in self.reports if r["puuid"] == game["player"] and r["asked"]]
+        self.assertEqual((report["listed"], report["failed"]), (100, False))    # when it came in full
+        self.assertLess(report["took"], collector.SAVED_SECONDS)         # and at once: the client had saved its answer
+        self.assertEqual(asked.count(game["player"]), 2)
 
 
 class Updates(WithServer):

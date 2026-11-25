@@ -20,11 +20,14 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
 - **Never while you play.** It pauses the moment you queue up, and starts again only once
   you're back in the client and not in a match.
 - **Gentle.** It sends one request every couple of seconds, one at a time, and slows down
-  further if the client is busy. ArenaSweats can tell it to slow down or stop, but can
-  never make it go faster or do anything else. Only you can, with fast mode.
+  further if the client is busy. A request is for one match, or for one player's latest
+  matches: up to 200 of them at once, which the client can take many seconds to answer.
+  ArenaSweats can tell it to slow down or stop, but can never make it go faster or do
+  anything else. Only you can, with fast mode.
 - **Fast mode is off unless you turn it on.** Fast mode collects about 3 times faster:
   about two requests a second, sent without waiting for the last one's answer, so up to four
   can be on their way at once. **BETA: Please only use with unimportant accounts for now.**
+  At most three of the four are match lists, which take the client longest.
   It starts with one request at a time and allows more only while the client keeps answering
   as quickly as before. Two failed requests within a hundred, or slower answers, mean fewer
   at once again. An answer of "too many requests", or three failures in a row, bring back

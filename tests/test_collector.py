@@ -49,6 +49,8 @@ class CollectorCase(unittest.TestCase):
         opts = argparse.Namespace(league_dir=self.league_dir, delay=2.0, minutes=minutes,
                                   since=int((self.real_start - 30 * 86400) * 1000))     # "the season" began 30 days ago
         vars(opts).update(options)
+        if hours_later:
+            self.fake.forget()      # hours later the client (restarted since) no longer has the match lists it saved
         made = collector.Collector(opts, self.data_dir, server, sleep=self.clock.sleep, now=self.clock.now,
                                    wall=lambda: self.real_start + self.clock.now() + hours_later * 3600)
         self.addCleanup(made.close)        # Windows cannot delete the temporary folder while it is open
@@ -141,12 +143,18 @@ class Crawl(CollectorCase):
         self.assertNotIn(old, self.stored_ids(made))
         self.assertNotIn("/lol-match-history/v1/games/%d" % old, [path for _, path, _ in self.fake.requests])
 
-    def test_a_long_history_is_read_back_to_the_season_start(self):
+    def test_a_long_history_is_read_in_one_request(self):
         heavy = self.fake.players[0]
         ids = [self.fake.add_game("CHERRY", 1700, [heavy] + self.fake.players[1:16], age_seconds=3600 * n)
-               for n in range(1, 150)]                                    # 149 more matches: eight pages of history
+               for n in range(1, 60)]                                     # 59 more matches: over 120 in the list
         made = self.run_collector(minutes=180)
         self.assertTrue(set(ids) <= self.stored_ids(made))
+        self.assertGreater(len(self.fake.history[heavy]), collector.OWN_BLOCK)
+        # The client gives as many matches as its first request for a player asks for, and only ever those: so the
+        # list is asked for once, as one block, never page by page.
+        self.assertEqual([path for _, path, _ in self.fake.requests if heavy in path],
+                         ["/lol-match-history/v1/products/lol/%s/matches?begIndex=0&endIndex=%d"
+                          % (heavy, collector.OWN_BLOCK - 1)])
 
     def test_wrong_record_is_not_stored(self):
         target, other = min(self.fake.arena_ids()), max(self.fake.arena_ids())
@@ -255,7 +263,7 @@ class FastMode(CollectorCase):
     def test_a_fifth_of_the_gap_but_never_below_its_own_floor(self):
         made = self.run_collector(minutes=10, fast=True)
         gaps = self.gaps(self.fake.requests)
-        self.assertGreater(len(gaps), 600)
+        self.assertGreater(len(gaps), 400)
         self.assertEqual(collector.DEFAULT_DELAY / collector.FAST_FACTOR, collector.FAST_MIN_DELAY)
         self.assertGreaterEqual(min(gaps), collector.FAST_MIN_DELAY - 0.001)     # never above 2.5 a second
         self.assertLess(sorted(gaps)[len(gaps) // 2], 0.5)
