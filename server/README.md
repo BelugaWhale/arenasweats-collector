@@ -21,96 +21,101 @@ Live at `https://arenasweats.lol/collector/` on the website server.
 - **Nothing from before the season.** Lists are read back to the season's start only, and
   an older match that is sent anyway is not kept. The start is 2026-10-06 UTC until
   changed with `policy --season-start`. Moving it earlier makes every list read so far due
-  again at once, back to the new date (as far as its latest 20 matches go).
-- **A player's list is their latest 20 matches, and no more.** The League client shows a
-  player's latest 20 matches (all modes together). Asked for older places (`begIndex=20`
-  and up) it answers with the same 20, except for the account that is logged in. Measured
-  on 25 Nov 2026 on the 121,500 lists read on HN1 (HN10 and NA1 show the same):
-  - of the 51,865 reads that went on past the first page, 51,619 found nothing there;
-  - of the 154,600 matches that one list read alone can have found, 99.5% were among that
-    player's 20 newest Arena matches: places 15 to 20 brought in about 6,900 matches each,
-    place 21 brought 482 and place 23 brought 20;
-  - 11 players' reads on HN1 and 1 on HN10 did bring in older matches (90 and 12 of them):
-    on HN10, with one collector, that is its own account.
-
-  So a list is read one page at a time (`LIST_PAGES`). Until that day the endpoint asked for
-  three more pages whenever the first showed something new, which was 31% of all client
-  requests on HN1 (156,600 of 510,000). And a match can only be found while it is among the
-  latest 20 of one of its 18 players. A busy player's list turns over in a day or two;
-  someone who stopped playing keeps theirs for good. What no list shows any more cannot be
-  had.
+  again at once, back to the new date.
+- **A list is read in one request, and the first request decides how much of it a client
+  gives.** Measured on a real League client (OC1, 25 Nov 2026): the first request for a
+  player's match list decides how many of their latest matches (all modes together) that
+  client will give. Asked for 20, 50, 100 or 200, it listed 20, 50, 100 and 200, going back
+  to mid-October for 100. It keeps a copy and answers every later request for that player
+  from the copy, in under 0.2 s, whatever places are asked for, also minutes later. A list
+  fetched afresh took about 0.25 s for each match listed. So reading a page of 20 and then
+  the next page, as collectors did up to 0.3.7, never got past the first 20: on HN1, of the
+  51,865 reads that went on past the first page, 51,619 found nothing there, and the extra
+  pages were 31% of all client requests until 25 Nov (156,600 of 510,000).
+  - A collector from 0.3.8 on says the most it can ask for in one request (`block`: 200)
+    and how many lists it has room for (`lists`). Each list it is handed says how many
+    matches to ask for (`count`). A collector up to 0.3.7 is handed one page of 20, as
+    before.
+  - `policy --block N` sets the most any collector is asked for (200 until changed). It is
+    in force from the next request for work, with no restart: `--block 20` is one page for
+    everybody again. Raising it has the lists that were cut short read back again.
+  - How many are asked for. A list not seen back to the season's start yet: 20 for every
+    held match its player is in (200 from 10 held matches on, one page for somebody seen
+    once); once a read has told how fast the list fills, enough for the whole season and
+    half as many again. A list seen that far back before: what should have come in since
+    its last read and half as many again, 20 at least.
+  - Only a read whose oldest match is from before the season counts as back to the
+    season's start. One that listed all it was asked for and still goes on, or fewer than
+    it was asked for (the list's own end, or all that client gives), is left at that
+    (`back` 2, with how many it listed in `depth`). A failed read, an empty list, or an
+    answer from the client's saved copy (10 matches or more in under 0.3 s) is no read at
+    all: it is tried again after 10 minutes, then 20, 40 and so on.
+  - Not known until a client on a Chinese server has reported: whether it gives more than
+    20, how long it takes, and how long it keeps its copy (minutes, or until it is
+    restarted). While a client keeps its copy of a list it cannot fetch that list again,
+    neither further back nor for what is new; only another collector can. `size_days`
+    (below) shows all three.
 - **Whose list to read next:**
   0. ArenaSweats Events games that the rankings server is waiting for go out before anything
      else, until they are held here, every 5 minutes (one may not have ended yet), however
-     many tries that takes. The lists of the players in them are read from the top before
+     many tries that takes. The top of the lists of the players in them is read before
      any other list, each every 10 minutes, until the game is held. Only the rankings
      server's relay key can name these games (`relay urgent`, below); collectors cannot.
-  1. Matches on the wanted list go out first, newest first. While there is a full load of
-     them, no new lists are started.
-  2. Then lists read before that are due again, the most overdue first.
-  3. Then players never read: the ones in the most held matches first, and of those the
-     latest found. While both kinds are waiting, each gets half of the 10 lists handed out
-     per request (`NEW_PLAYERS_PER_ROUND`); when only one kind is, it gets them all.
+  1. Matches on the wanted list go out first, newest first.
+  2. Then lists read before that are due again, the most overdue first. They show what was
+     played since their last read, so with step 1 new matches keep arriving while older
+     ones are caught up on. One place of the 10 handed out per request is kept for step 3,
+     and while there is a full load of matches to fetch, only these lists go out.
+  3. Then lists not seen back to the season's start yet: the players in the most held
+     matches first, and of those the latest found. For a collector from 0.3.8 on that is
+     every player never read and every player only ever read as a page of 20 (on HN1 on
+     25 Nov: 181,000 never read, in 2.6 held matches on average, and 121,000 read as a
+     page, in 30: so those come first). A collector up to 0.3.7 cannot see further back
+     than a page and gets the players never read.
   4. A list is due again when about 10 more Arena matches are expected in it
-     (`TARGET_SEEN`: half of its 20 places), judging by how many its last read showed and
-     how long those took to come in: between 1 hour and 30 days later. One that showed no
-     Arena match comes back after 30 days. A read that fails is tried again after 10
-     minutes, then 20, 40 and so on.
-- **What the reads found is counted.** `read_days` has, per server and day: list pages
-  asked for, reads reported and failed, the Arena matches they showed, and how many of
-  those were held already or had not been seen in any list. `seen_days` splits the matches
-  that were at least two days old when a list showed them by the day they were played:
-  the share of them held already says how complete that day is (it leans high, as the
-  lists read belong to players found through held matches). `stats` prints the last days;
-  `relay status` gives the last 7 days under `reads`.
-- **Out-of-date reports change nothing.** Each stretch of a list is handed out with a
-  token, and the list's progress is only taken from the report carrying the current token.
-  A report that arrives after its stretch went to someone else still adds the matches it
-  saw to the wanted list, but cannot move the list's progress backwards or forwards.
+     (`TARGET_SEEN`), judging by how many its last read showed and how long those took to
+     come in: between 1 hour and 30 days later. One that showed no Arena match comes back
+     after 30 days. A collector up to 0.3.7 that finds nothing newer than at the last read
+     cannot tell whether its client answered from a saved copy: that is not counted as a
+     read, and the list is tried again after as long again as since its last read.
+- **What the reads found is counted.**
+  - `size_days`, per server, day and number of matches asked for (collectors from 0.3.8
+    on): lists handed out, failed, answered from a saved copy, fetched afresh; and of the
+    ones fetched afresh how many listed fewer than asked, how many matches they listed, how
+    many reached the season's start, how many days back their oldest match was, and how
+    long the client took (answers of up to 1, 2, 5, 10, 20, 40, 80 seconds, and longer).
+    They also count the Arena matches those reads showed that no list had shown before.
+    `stats` prints three days of it in one line a size, `relay status` seven days under
+    `reads`, `sizes`. Whether a server's clients give more than 20 is read off it at once:
+    "lists of 200 places: ... 950 fetched afresh; those listed 196 matches each (40 fewer
+    than asked), back 31 days" is a client that gives what it is asked for; "listed 20
+    matches each (950 fewer than asked)" is one that does not, and then `policy --block 20`
+    saves the asking. Many failed: it refuses or times out at that size. Many from the
+    saved copy: copies live long, and lists come back to collectors that read them before.
+    Once a server is caught up, long lists show few new matches each: then a smaller
+    block (60) spares the clients.
+  - `read_days`, per server and day: lists handed out and the places asked for in them,
+    reads reported, failed and from a saved copy, matches listed, lists that reached the
+    season's start, the Arena matches shown, and how many of those were held already or
+    had not been seen in any list.
+  - `seen_days` splits the matches that were at least two days old when a list showed them
+    by the day they were played: the share of them held already says how complete that day
+    is (it leans high, as the lists read belong to players found through held matches).
+- **Out-of-date reports change nothing.** Each list is handed out with a token, and its
+  progress is only taken from the report carrying the current token. A report that arrives
+  after the list went to someone else still adds the matches it saw to the wanted list,
+  but cannot move the list's progress backwards or forwards.
 
-### What the order was measured against
+### What the order and the sizes were tried on
 
-`python server/tools/simulate.py` plays the rules on a made-up world of players shaped like
-HN1's (how much they play, who queues together, lists of 20), prints how well the old rules
-replayed on HN1's real requests of 13-24 Nov give what really happened, and compares rules
-from there. `--endpoint` also plays `ingest.py` itself on the same world; a small run of
-that is one of the tests. At HN1's size, 30 days on from 25 Nov:
-
-| | requests a match: first 30 days, once caught up | days until half, 80% of the season is held | a new match is held after: half, 9 in 10 |
-| --- | --- | --- | --- |
-| HN1, 84,000 requests a day, rules until 25 Nov | 4.6, 7.5 | 2.0, 9.5 | 11 h, 40 h |
-| the same, rules now | 3.0, 3.2 | 1.0, 7.8 | 4 h, 20 h |
-| HN1 with 3 times the requests, rules until 25 Nov | 6.4, 10.4 | 0.8, 2.8 | 5 h, 33 h |
-| the same, rules now | 3.1, 3.2 | 0.5, 2.0 | 3 h, 20 h |
-| new server like HN10, 36,000 a day, rules until 25 Nov | 2.8, 4.8 | 10.8, 23.5 | 21 h, 133 h |
-| the same, rules now | 2.4, 3.5 | 7.0, 16.8 | 4 h, 19 h |
-| that server with 3 times the requests, rules until 25 Nov | 4.9, 9.4 | 3.0, 6.2 | 6 h, 46 h |
-| the same, rules now | 2.5, 3.3 | 2.0, 4.5 | 3 h, 19 h |
-
-What it also says, with the same caution (other seeds and a world twice the size move these
-numbers by a few tenths; how much players play other modes was fitted, not measured):
-
-- HN1 has about 10,000-11,000 Arena matches a day (0.3% of its match-id counter), not the
-  30,000-39,000 that 1% of the counter gives. Only near 11,000 does the replay give the fall
-  in new matches per list (4.0 to 1.1) and the age of the matches received (22 days on
-  24 Nov) that were measured; at 20,000 it gives 2.5 per list and 2 days. The days of
-  12-18 Nov, of which lists read a week later showed 96-100% as held, have 8,500-12,800
-  held each.
-- On 25 Nov HN1 held about 42% of its season, and as much again was still in somebody's
-  latest 20. The rest is out of reach, so no order gets to 95%; 80% is close to the limit.
-- Most of the faster filling comes from reading one page. The order adds: new matches
-  held three to five times sooner, none lost (on a server with one collector the old rules
-  lost 0.8% for good), and less than half the requests once caught up, when HN1's
-  collectors wait about 60% of the time.
-- `TARGET_SEEN` trades requests for delay: 5 gives 4.1 requests a match once caught up and
-  a third less delay, 15 gives 2.8 and a fifth more.
-- Reading every list at least weekly (as before) costs 7.6 requests a match for the same
-  matches. Judging a list by the matches no other list had shown, instead of all it shows,
-  is cheaper (2.5) but loses matches when the players whose lists did the showing stop
-  (94% held).
-- Which kind goes first while both wait (lists due again, players never read) moves the
-  80% mark by a day and the 9-in-10 delay by 7 hours, in opposite directions; half each
-  is the middle.
+`python server/tools/simulate.py` (several minutes; `--quick` for fewer cases) plays
+`ingest.py` itself with made-up collectors on a made-up world of players shaped like HN1's:
+how much they play, who queues together, lists that fill with all modes. Each made-up
+collector has a League client that behaves as the real one measured on 25 Nov: it gives as
+many matches as the first request for a player asks for, answers from its copy after that,
+and takes as long as the list is long. Before that it replays the rules until 25 Nov on the
+requests HN1's collectors really made on 13-24 Nov and prints the result beside what was
+measured, which is how the world was fitted. A small run of it is one of the tests.
 
 ## What is still checked
 
@@ -162,6 +167,7 @@ python server/ingest.py policy --off          # every collector pauses within 10
 python server/ingest.py policy --fast off     # fast-mode collectors go back to the normal pace (--delay)
 python server/ingest.py policy --fast-delay 1 # fast mode keeps at least 1 s between requests (default 0.4)
 python server/ingest.py policy --signups off  # new installs can no longer get a key
+python server/ingest.py policy --block 100    # collectors are asked for at most 100 matches of a list at once (20: a page)
 python server/ingest.py policy --on --delay 3 --message "thanks!"
 python server/ingest.py stats                 # per server: matches held, still to fetch, players to read
 python server/ingest.py export out.jsonl.gz --platform HN1   # records still held here

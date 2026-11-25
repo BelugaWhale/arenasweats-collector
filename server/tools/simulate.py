@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Try out ways of handing out work on a made-up world of Arena players.
+"""Play the rules for handing out work on a made-up world of Arena players.
 
-    python server/tools/simulate.py              # the comparison tables (about a minute)
-    python server/tools/simulate.py --endpoint   # also play the rules through the real ingest.py, as a check
+    python server/tools/simulate.py            # the tables (several minutes)
+    python server/tools/simulate.py --quick    # fewer cases and 14 days instead of 30
 
 The world is shaped like what was measured on HN1 (Ionia) for 12-19 Nov 2026, when nearly every match of
 those days was held: how many Arena matches players play, how many of the 18 in a match play a lot, how
 often the same people queue together. What could not be measured (how much players play other modes, which
-pushes Arena matches out of their latest 20) was set so that today's rules, replayed on the requests HN1's
-collectors really made on 13-24 Nov, give what really happened. Section 2 of the output shows how close
-that comes. Everything is scaled down (HN1 has about 20 times the matches); numbers are printed at HN1's size.
+pushes Arena matches down their lists) was set so that the rules until 25 Nov, replayed on the requests
+HN1's collectors really made on 13-24 Nov, give what really happened. Section 2 of the output shows how
+close that comes. Everything is scaled down (HN1 has about 20 times the matches); numbers are printed at
+HN1's size.
 
-One fact decides most of it: the League client gives a player's latest 20 matches (all modes) and no more.
-Asked for older places it answers with the same 20 (see README.md, "Whose list to read next").
+From 25 Nov on it is ingest.py itself that is played, with made-up collectors. Each has its own League client,
+which behaves as measured on a real one that day: the first request for a player's list decides how many
+matches the client will give for that player; it keeps a copy and answers later requests from the copy; a
+list fetched afresh takes about as long as it has places. How long a copy lives was not known, so the tables
+show several lives. What a request costs a client on the Chinese servers (T_PLACE, T_MATCH) is inferred from
+how fast collectors went there, not measured.
 """
 
 import argparse
@@ -29,7 +34,13 @@ from collections import Counter, defaultdict
 DAY = 86400.0
 LOBBY = 18                      # players in an Arena match
 SLOTS = 48                      # half-hour starting times in a day
-GAMES_PER_ROUND, PLAYERS_PER_ROUND, NEW_PLAYERS_PER_ROUND = 40, 10, 5      # as in ingest.py
+PAGE = 20                       # places in one page of a match list
+GAMES_PER_ROUND = 40            # as in ingest.py
+T_PLACE, T_COPY, T_MATCH = 0.085, 0.05, 1.5    # seconds a client takes: per place of a list fetched afresh, for a
+                                # list answered from its copy, for one match (1.7 s for a page of 20 was inferred)
+NORMAL, FAST = 2.0, 0.4         # seconds a collector waits between two requests; in fast mode it also has
+FLIGHT = 3                      # this many lists on their way at once (0.3.8: about 35 listed matches a second)
+IDLE = 600                      # with nothing to do, a made-up collector asks again this often (a real one: 60 s)
 
 # ---- measured on HN1 (collector_matches on Crane and the endpoint's players table, 25 Nov 2026)
 # Players by Arena matches in 8 days: (up to, % of players, % of seats)
@@ -142,22 +153,29 @@ class World:
         """How many other-mode games player p has played by time t."""
         return int(self.other[p] * min(t, self.quit_at[p]))
 
-    def read(self, p, t, since):
-        """The top of p's match list at time t: (Arena matches among the latest 20 that are newer than `since`,
-        whether all 20 places were newer than `since`)."""
-        times, matches = self.ptimes[p], self.pmatches[p]
-        last = bisect.bisect_right(times, t)
-        others_now = self.others(p, t)
-        found, i = [], last - 1
-        while i >= 0 and times[i] > since and (last - 1 - i) + others_now - self.others(p, times[i]) < 20:
-            found.append(matches[i])
-            i -= 1
-        newer = (last - bisect.bisect_right(times, since)) + others_now - self.others(p, since)
-        return found, newer >= 20
+    def newer(self, p, t, when):
+        """How many matches (all modes) player p's list holds at time t that were played after `when`."""
+        times = self.ptimes[p]
+        return bisect.bisect_right(times, t) - bisect.bisect_right(times, when) + self.others(p, t) - self.others(p, when)
 
-    def listed(self, match, t):
-        """Whether any of the match's players still has it among their latest 20 at time t."""
-        return any(match in self.read(p, t, self.mtime[match] - 1e-9)[0] for p in self.mplayers[match])
+    def read(self, p, t, since, places=PAGE):
+        """The top `places` of p's match list at time t: (the Arena matches among them that are newer than `since`,
+        when the oldest of those places was played, or -1 if that was before the season; whether any of them is
+        newer than `since`)."""
+        oldest, floor = -1.0, since
+        if self.newer(p, t, 0.0) >= places:
+            low, oldest = 0.0, t                    # the oldest place was played between these two
+            for _ in range(14):
+                middle = (low + oldest) / 2
+                low, oldest = (middle, oldest) if self.newer(p, t, middle) >= places else (low, middle)
+            floor = max(since, low)
+        times, matches = self.ptimes[p], self.pmatches[p]
+        found = matches[bisect.bisect_right(times, floor):bisect.bisect_right(times, t)]
+        return found, oldest, self.newer(p, t, since) > 0
+
+    def listed(self, match, t, places=PAGE):
+        """Whether any of the match's players still has it among their latest `places` at time t."""
+        return any(match in self.read(p, t, self.mtime[match] - 1e-9, places)[0] for p in self.mplayers[match])
 
 
 # ---------------------------------------------------------------------------
@@ -241,136 +259,11 @@ class Before(Rules):
         return fetch, items
 
 
-class Proposed(Rules):
-    """ingest.py's rules: lists read before go first when they are due again, with places kept for players never
-    read; those go by the held matches they are in, the latest found first. One page a read. A list is due again
-    when about `target` more Arena matches are expected in it."""
-
-    def __init__(self, world, start, target=10, most=30.0, kept=NEW_PLAYERS_PER_ROUND, order="matches", count="seen"):
-        self.again, self.never, self.rank, self.found = [], [], {}, 0
-        self.target, self.most, self.kept, self.order, self.count = target, most, kept, order, count
-        super().__init__(world, start)
-
-    def meet(self, p, now):
-        self.known[p] = 1
-        self.found += 1
-        key = {"matches": (-self.games[p], -self.found), "latest": (-self.found,), "oldest": (self.found,)}[self.order]
-        if self.order != "oldest" or p not in self.rank:
-            self.rank[p] = key
-            heapq.heappush(self.never, key + (p,))
-
-    def carry_on(self, before):
-        """Take over from the rules before, as the live server does: every player keeps their place and date."""
-        for name in ("held", "asked", "wanted", "held_at", "games", "known", "checked", "due", "since", "log"):
-            setattr(self, name, getattr(before, name))
-        for p in range(self.w.players):
-            if self.checked[p]:
-                heapq.heappush(self.again, (self.due[p], p))
-            elif self.known[p]:
-                self.meet(p, 0.0)
-
-    def work(self, reports, now):
-        for p, job, found, full, _ in reports:
-            missing, new = self.take(found)
-            self.log.append((now, new))
-            if self.checked[p] and not full:
-                span = now - self.checked[p]                 # they came since the last read
-            elif found:
-                span = now - min(self.w.mtime[match] for match in found)     # ... or since the oldest was played
-            else:
-                span = now
-            counted = {"seen": len(found), "new": new}[self.count]
-            self.checked[p], self.since[p] = now, self.reading.pop(p)
-            self.due[p] = now + min(self.most, max(1 / 24, span * self.target / max(counted, 0.5)))
-            heapq.heappush(self.again, (self.due[p], p))
-        fetch = self.fetches()
-        items = []
-        room = PLAYERS_PER_ROUND if len(fetch) < GAMES_PER_ROUND else 0
-
-        def due_again(places):
-            while len(items) < places and self.again and self.again[0][0] <= now:
-                due, p = heapq.heappop(self.again)
-                if due == self.due[p] and p not in self.reading:
-                    items.append(self.hand(p, now))
-
-        due_again(room - self.kept)
-        while len(items) < room and self.never:
-            key = heapq.heappop(self.never)
-            p = key[-1]
-            if self.rank.get(p) == key[:-1] and not self.checked[p] and p not in self.reading:
-                items.append(self.hand(p, now))
-        due_again(room)
-        return fetch, items
 
 
-class Endpoint:
-    """The real ingest.py behind the same two calls, so its rules can be played on the same world."""
-    FIRST_ID = 5_000_000_000
-
-    def __init__(self, world, start):
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        import ingest
-        self.w, self.ingest, self.now = world, ingest, 0.0
-        self.folder = tempfile.TemporaryDirectory()
-        self.before = (os.environ.get("INGEST_DB"), ingest.clock, ingest.REQUESTS_PER_MINUTE)
-        os.environ["INGEST_DB"] = os.path.join(self.folder.name, "ingest.db")
-        ingest.clock = lambda: self.season + self.now * DAY
-        ingest.REQUESTS_PER_MINUTE = 10 ** 9                # one key stands for every collector here
-        self.db = db = ingest.connect()                     # kept open, so SQLite does not tidy up after every request
-        self.season = ingest.get_policy(db)["season_start"] / 1000
-        db.execute("INSERT INTO contributors(name, key_hash, created_at) VALUES('made-up', ?, 0)", (ingest.hash_key("k"),))
-        db.commit()
-        self.client = ingest.app.test_client()
-        self.start, self.held, self.held_at, self.log = start, bytearray(len(world.mtime)), {}, []
-
-    def close(self):
-        """Put ingest.py back as it was and remove the database."""
-        self.db.close()
-        path, self.ingest.clock, self.ingest.REQUESTS_PER_MINUTE = self.before
-        if path is None:
-            del os.environ["INGEST_DB"]
-        else:
-            os.environ["INGEST_DB"] = path
-        self.folder.cleanup()
-
-    def call(self, path, body):
-        answer = self.client.post(path, json=body, headers={"Authorization": "Bearer k"})
-        if answer.status_code != 200:
-            raise RuntimeError("%s answered %s: %s" % (path, answer.status_code, answer.get_data(as_text=True)))
-        return answer.get_json()
-
-    def puuid(self, p):
-        return "made-up-player-%09d" % p
-
-    def upload(self, match, now):
-        self.now = now
-        players = self.w.mplayers[match]
-        game = {"gameId": self.FIRST_ID + match, "platformId": "HN1", "gameMode": "CHERRY", "gameDuration": 1200,
-                "gameCreation": int((self.season + self.w.mtime[match] * DAY) * 1000),
-                "participants": [{"participantId": seat, "championId": 1, "stats": {}} for seat in range(len(players))],
-                "participantIdentities": [{"participantId": seat, "player": {"puuid": self.puuid(p)}}
-                                          for seat, p in enumerate(players)]}
-        if self.call("/v1/games", {"games": [game]})["accepted"] != 1:
-            raise RuntimeError("match %d was handed out twice" % match)
-        self.held[match], self.held_at[match] = 1, now
-
-    def work(self, reports, now):
-        self.now = now
-        body = {"platform": "HN1", "start": self.puuid(self.start), "reports": [
-            {"puuid": self.puuid(p), "job": job, "ids": [self.FIRST_ID + match for match in found],
-             "newest": int((self.season + now * DAY) * 1000), "next": 20 if full else 0, "failed": False}
-            for p, job, found, full, _ in reports]}
-        answer = self.call("/v1/work", body)
-        self.log += [(now, 0)] * len(reports)
-        if any(item["begin"] or item["pages"] != 1 for item in answer["players"]):
-            raise RuntimeError("asked for more than the first page")
-        return ([game_id - self.FIRST_ID for game_id in answer["games"]],
-                [(int(item["puuid"][-9:]), 1, (item["since"] / 1000 - self.season) / DAY, item["job"])
-                 for item in answer["players"]])
-
-
-def collect(rules, now, until, requests_a_day, counts, reports=()):
-    """One collector, standing for all of them, asks for work until `until`. Returns (now, reports not handed in)."""
+def collect_before(rules, now, until, requests_a_day, counts, reports=()):
+    """One collector, standing for all of them, works under the rules until 25 Nov. Every request (a page of 20, a
+    match) takes the same time. Returns (now, the reports not handed in yet)."""
     reports = list(reports)
     while now < until:
         fetch, items = rules.work(reports, now)
@@ -380,14 +273,165 @@ def collect(rules, now, until, requests_a_day, counts, reports=()):
             now += step
             rules.upload(match, now)
         for p, pages, since, job in items:
-            found, full = rules.w.read(p, now, since)
+            found, oldest, _ = rules.w.read(p, now, since)
             now += step * pages
-            reports.append((p, job, found, full, pages == 1))
-            counts[day]["pages"] += pages
+            reports.append((p, job, found, oldest > since, pages == 1))
+            counts[day]["requests"] += pages
+        counts[day]["requests"] += len(fetch)
         counts[day]["fetches"] += len(fetch)
         if not fetch and not items:
             now += 60 / DAY                                  # nothing to do: ask again in a minute
     return now, reports
+
+
+# ---------------------------------------------------------------------------
+# Made-up collectors and their League clients, working for ingest.py itself
+# ---------------------------------------------------------------------------
+class Install:
+    """One collector and its League client. `block`: the most matches of a list it asks for in one request (None: it
+    is a collector up to 0.3.7 and always asks for a page of 20). `share`: the part of its time it has for this
+    made-up world, which is as much smaller than a real server as the world is. Its client keeps a copy of every
+    list it fetched for `life` days, and loses them all when it restarts, every `restarts` days."""
+
+    def __init__(self, name, wait=NORMAL, share=1.0, block=None, life=1 / 24, restarts=None, joined=FIRST_DAY):
+        self.name, self.wait, self.share, self.block, self.joined = name, wait, share, block, joined
+        self.flight = FLIGHT if wait == FAST else 1
+        self.life, self.restarts, self.first_restart = life, restarts, random.Random(name).random() * (restarts or 0)
+        self.copies = {}                                     # player -> (when it was fetched, how many places)
+
+    def copy(self, p, now):
+        """The copy of p's list this client still holds, or None."""
+        made = self.copies.get(p)
+        if made is None or now - made[0] >= self.life:
+            return None
+        if self.restarts and (now - self.first_restart) // self.restarts > (made[0] - self.first_restart) // self.restarts:
+            return None
+        return made
+
+
+class Endpoint:
+    """ingest.py itself, on a database of its own, with the made-up world's clock."""
+    FIRST_ID = 5_000_000_000
+
+    def __init__(self, world, installs, changes=None, start=None):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import ingest
+        self.w, self.ingest, self.now, self.start = world, ingest, 0.0, start
+        self.folder = tempfile.TemporaryDirectory()
+        changes = dict(changes or {}, clock=lambda: self.season + self.now * DAY,
+                       REQUESTS_PER_MINUTE=10 ** 9, GAMES_PER_DAY=10 ** 9)     # (these limits are not what is tried here)
+        self.before = (os.environ.get("INGEST_DB"), {name: getattr(ingest, name) for name in changes})
+        for name, value in changes.items():
+            setattr(ingest, name, value)
+        os.environ["INGEST_DB"] = os.path.join(self.folder.name, "ingest.db")
+        self.db = db = ingest.connect()                     # kept open, so SQLite does not tidy up after every request
+        self.season = ingest.get_policy(db)["season_start"] / 1000
+        for install in installs:
+            db.execute("INSERT INTO contributors(name, key_hash, created_at) VALUES(?, ?, ?)",
+                       (install.name, ingest.hash_key(install.name), int(self.season + install.joined * DAY)))
+        db.commit()
+        self.client = ingest.app.test_client()
+        self.held, self.held_at = bytearray(len(world.mtime)), {}
+
+    def close(self):
+        """Put ingest.py back as it was and remove the database."""
+        self.db.close()
+        path, values = self.before
+        for name, value in values.items():
+            setattr(self.ingest, name, value)
+        if path is None:
+            del os.environ["INGEST_DB"]
+        else:
+            os.environ["INGEST_DB"] = path
+        self.folder.cleanup()
+
+    def call(self, install, path, body, now):
+        self.now = now
+        answer = self.client.post(path, json=body, headers={"Authorization": "Bearer " + install.name})
+        if answer.status_code != 200:
+            raise RuntimeError("%s answered %s: %s" % (path, answer.status_code, answer.get_data(as_text=True)))
+        return answer.get_json()
+
+    def puuid(self, p):
+        return "made-up-player-%09d" % p
+
+    def stamp(self, when):
+        return int((self.season + when * DAY) * 1000)
+
+    def upload(self, install, matches, now):
+        games = [{"gameId": self.FIRST_ID + match, "platformId": "HN1", "gameMode": "CHERRY", "gameDuration": 1200,
+                  "gameCreation": self.stamp(self.w.mtime[match]),
+                  "participants": [{"participantId": seat, "championId": 1, "stats": {}} for seat in range(LOBBY)],
+                  "participantIdentities": [{"participantId": seat, "player": {"puuid": self.puuid(p)}}
+                                            for seat, p in enumerate(self.w.mplayers[match])]} for match in matches]
+        if self.call(install, "/v1/games", {"games": games}, now)["accepted"] != len(matches):
+            raise RuntimeError("a match was handed out twice")
+        for match in matches:
+            self.held[match], self.held_at[match] = 1, now
+
+    def work(self, install, reports, now, more=True):
+        """Hand in reports and ask for work. Returns (matches to fetch, lists to read: (player, since, places, token))."""
+        body = {"platform": "HN1", "more": more, "reports": reports}
+        if install.block:
+            body["block"] = install.block
+        if self.start is not None:                           # (a server with no players yet starts from one account)
+            body["start"] = self.puuid(self.start)
+        answer = self.call(install, "/v1/work", body, now)
+        if any(item["begin"] or item["pages"] != 1 or ("count" in item) != bool(install.block) for item in answer["players"]):
+            raise RuntimeError("a hand-out this collector cannot follow: %s" % answer["players"])
+        return ([game_id - self.FIRST_ID for game_id in answer["games"]],
+                [(int(item["puuid"][-9:]), (item["since"] / 1000 - self.season) / DAY, item.get("count", PAGE), item["job"])
+                 for item in answer["players"]])
+
+    def take_over(self, before, readers):
+        """Start from what the rules until 25 Nov left: the same matches held, the same lists read (each by one of
+        `readers`, whose client fetched a page of 20 then; who it was, the endpoint did not keep)."""
+        matches = sorted(before.held_at, key=before.held_at.get)
+        for first in range(0, len(matches), 50):
+            self.upload(readers[0], matches[first:first + 50], before.held_at[matches[first + 49 if first + 49 < len(matches) else -1]])
+        rng = random.Random(1)
+        for p in range(self.w.players):
+            if before.checked[p]:
+                self.db.execute("UPDATE players SET checked_at = ?, read_to = ?, due_at = ? WHERE puuid = ?", (
+                    self.stamp(before.checked[p]) // 1000, self.stamp(before.since[p]), self.stamp(before.due[p]) // 1000,
+                    self.puuid(p)))
+                rng.choice(readers).copies[p] = (before.since[p], PAGE)
+        self.db.commit()
+
+
+def collect(endpoint, installs, now, until, counts):
+    """The collectors take turns asking the endpoint for work and doing it, each at its own pace, until `until`."""
+    world, turns = endpoint.w, [(now + number * 1e-5, number) for number in range(len(installs))]
+    while turns[0][0] < until:
+        now, number = heapq.heappop(turns)
+        install, day, seconds, reports = installs[number], counts[int(now)], 0.0, []
+        fetch, items = endpoint.work(install, [], now)
+        seconds += len(fetch) * (install.wait + T_MATCH)
+        if fetch:
+            endpoint.upload(install, fetch, now + seconds / DAY)
+        for p, since, places, job in items:
+            at = now + seconds / DAY
+            made = install.copy(p, at)
+            when, held_places = made or (at, places)
+            found, oldest, fresh = world.read(p, when, since, held_places)
+            took = T_COPY if made else T_PLACE * places
+            install.copies[p] = (when, held_places)
+            seconds += (install.wait + took) / install.flight
+            report = {"puuid": endpoint.puuid(p), "job": job, "ids": [endpoint.FIRST_ID + match for match in found],
+                      "newest": endpoint.stamp(when) if fresh else 0, "begin": 0, "failed": False,
+                      "next": places if held_places >= places and oldest > since else 0}
+            if install.block:
+                report.update(asked=places, listed=held_places, oldest=endpoint.stamp(oldest), took=took)
+            reports.append(report)
+            day["places"] += 0 if made else places
+            day["copies"] += 1 if made else 0
+        if reports:                                          # handed in as soon as the round is done
+            endpoint.work(install, reports, now + seconds / DAY, more=False)
+        day["requests"] += len(fetch) + len(items)
+        day["fetches"] += len(fetch)
+        day["seconds"] += seconds
+        # The rest of its time goes to the other worlds this one stands for; with nothing to do, it asks again soon.
+        heapq.heappush(turns, (now + (seconds / install.share if seconds else IDLE) / DAY, number))
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +455,7 @@ def show_world(world):
 
 
 def replay(world, real_matches_a_day, show=True):
-    """Today's rules on the requests HN1's collectors really made on 13-24 Nov. Returns the state on 25 Nov."""
+    """The rules until 25 Nov on the requests HN1's collectors really made on 13-24 Nov. Returns the state on 25 Nov."""
     scale = len(world.mtime) / world.days / real_matches_a_day
     start = next(p for p in range(world.players) if sum(1 for t in world.ptimes[p] if FIRST_DAY - 2 < t < FIRST_DAY) > 10)
     rules, counts = Before(world, start), defaultdict(Counter)
@@ -419,7 +463,7 @@ def replay(world, real_matches_a_day, show=True):
     def requests_a_day(now):
         thousands = REAL_DAYS[min(int(now) - 38, len(REAL_DAYS) - 1)][0]
         return thousands * 1000 * scale * (4 / 3 if int(now) == 38 else 1)         # (the first day began at 06:00)
-    now, reports = collect(rules, FIRST_DAY, NOW, requests_a_day, counts)
+    now, reports = collect_before(rules, FIRST_DAY, NOW, requests_a_day, counts)
     if show:
         print("\n2. The rules until 25 Nov replayed on HN1's real requests, taking %d Arena matches a day (sim / measured)"
               % real_matches_a_day)
@@ -441,75 +485,11 @@ def replay(world, real_matches_a_day, show=True):
         age = sorted(now - world.mtime[m] for m, when in rules.held_at.items() if int(when) == 49)
         print("   age of the matches received on 24 Nov, middle one: %.0f days / 22 days" % age[len(age) // 2])
         past = [m for m, when in enumerate(world.mtime) if when < NOW]
-        print("   so on 25 Nov: %.0f%% of the season's matches held, %.0f%% held or still among some player's latest 20" % (
-            100 * sum(rules.held[m] for m in past) / len(past),
-            100 * sum(1 for m in past if rules.held[m] or world.listed(m, NOW)) / len(past)))
+        print("   so on 25 Nov: %.0f%% of the season's matches held. Held or still among some player's latest 20: %.0f%%; "
+              "latest 100: %.0f%%; latest 200: %.0f%%; latest 1,000: %.0f%%" % ((100 * sum(rules.held[m] for m in past) / len(past),) + tuple(
+                  100 * sum(1 for m in past if rules.held[m] or world.listed(m, NOW, places)) / len(past)
+                  for places in (20, 100, 200, 1000))))
     return rules, scale, now, reports
-
-
-def measure(world, rules, counts, scale, end, requests_a_day):
-    """One line of a comparison table."""
-    days = range(int(NOW), int(end))
-    late = [d for d in days if d >= end - 10]
-    requests = lambda which: sum(counts[d]["fetches"] + counts[d]["pages"] for d in which)
-    played, got = sorted(world.mtime), sorted(rules.held_at.values())
-    share = lambda t: bisect.bisect_right(got, t) / bisect.bisect_right(played, t)
-    reach = lambda level: next(("%4.1f" % (step / 4) for step in range(int((end - NOW) * 4) + 1)
-                                if share(NOW + step / 4) >= level), "   -")
-    new = [m for m, when in enumerate(world.mtime) if NOW + 3 <= when < end - 3]
-    wait = sorted(24 * (rules.held_at[m] - world.mtime[m]) for m in new if rules.held[m]) or [0.0]
-    lost = sum(1 for m in new if not rules.held[m] and not world.listed(m, end))
-    return "%5.2f  %5.2f   %3.0f%%   %s %s %s   %4.0f%% %4.0f%% %4.0f%%   %5.1f%%  %5.1f %5.1f   %4.2f%%" % (
-        requests(days) / max(sum(counts[d]["fetches"] for d in days), 1),
-        requests(late) / max(sum(counts[d]["fetches"] for d in late), 1), 100 * requests(late) / (requests_a_day * len(late)),
-        reach(0.5), reach(0.8), reach(0.95), 100 * share(NOW + 7), 100 * share(NOW + 14), 100 * share(end),
-        100 * len(wait) / len(new), wait[len(wait) // 2], wait[int(len(wait) * 0.9)], 100 * lost / len(new))
-
-
-HEAD = ("%-42s requests a match   days until held:    season held after   new matches: held, hours until  lost\n"
-        "%-42s  all  at end  used   50%%  80%%  95%%     7 d  14 d  %2d d             (middle, 9 in 10)")
-CHOICES = [("as until 25 Nov", None), ("as until 25 Nov, but one page a list", 0), ("as now in ingest.py", {}),
-           ("  but never-read players before the rest", dict(kept=PLAYERS_PER_ROUND)),
-           ("  but of never-read, latest found first", dict(order="latest")),
-           ("  but of never-read, oldest found first", dict(order="oldest")),
-           ("  but due again after 5 more matches", dict(target=5)),
-           ("  but due again after 15 more matches", dict(target=15)),
-           ("  but every list at least every 7 days", dict(most=7.0)),
-           ("  but due by matches no list had shown", dict(count="new"))]
-
-
-def compare(world, title, state, requests_a_day, days, choices=CHOICES):
-    before, scale, now, reports = state
-    end = NOW + days
-    print("\n" + title)
-    print(HEAD % ("", "", days))
-    for label, change in choices:
-        counts = defaultdict(Counter)
-        if isinstance(change, dict):
-            rules = Proposed(world, 0, **change)
-            rules.carry_on(copy.deepcopy(before))
-            collect(rules, now, end, lambda t: requests_a_day * scale, counts)
-        else:
-            rules = copy.deepcopy(before)
-            rules.more_pages = 3 if change is None else change
-            collect(rules, now, end, lambda t: requests_a_day * scale, counts, reports)
-        print("%-42s %s" % (label, measure(world, rules, counts, scale, end, requests_a_day * scale)))
-
-
-def check_endpoint(world, title, state, requests_a_day, days):
-    """ingest.py itself beside its stand-in. Both start on 25 Nov with the same matches held and no list read yet
-    (the real code cannot be handed the stand-in's half-read state)."""
-    before, scale, now, _ = state
-    print("\n" + title)
-    print(HEAD % ("", "", days))
-    for label, make in (("the stand-in used above", Proposed), ("ingest.py itself", Endpoint)):
-        rules, counts = make(world, 0), defaultdict(Counter)
-        for match in sorted(before.held_at, key=before.held_at.get):
-            rules.upload(match, before.held_at[match])
-        collect(rules, now, NOW + days, lambda t: requests_a_day * scale, counts)
-        print("%-42s %s" % (label, measure(world, rules, counts, scale, NOW + days, requests_a_day * scale)))
-        if make is Endpoint:
-            rules.close()
 
 
 def fresh(world, real_matches_a_day, requests_a_day):
@@ -517,8 +497,59 @@ def fresh(world, real_matches_a_day, requests_a_day):
     scale = len(world.mtime) / world.days / real_matches_a_day
     start = next(p for p in range(world.players) if sum(1 for t in world.ptimes[p] if 47.5 < t < 49.67) > 10)
     rules = Before(world, start)
-    now, reports = collect(rules, 49.67, NOW, lambda t: requests_a_day * scale, defaultdict(Counter))
+    now, reports = collect_before(rules, 49.67, NOW, lambda t: requests_a_day * scale, defaultdict(Counter))
     return rules, scale, now, reports
+
+
+def measure(world, rules, counts, end, seconds_a_day, places=PAGE):
+    """One line of a table. `places`: how far down a list the collectors could see (for what counts as lost)."""
+    days = range(int(NOW), int(end))
+    late = [d for d in days if d >= end - 10]
+    total = lambda name, which: sum(counts[d][name] for d in which)
+    played, got = sorted(world.mtime), sorted(rules.held_at.values())
+    share = lambda t: bisect.bisect_right(got, t) / bisect.bisect_right(played, t)
+    reach = lambda level: next(("%4.1f" % (step / 4) for step in range(int((end - NOW) * 4) + 1)
+                                if share(NOW + step / 4) >= level), "   -")
+    new = [m for m, when in enumerate(world.mtime) if NOW + 3 <= when < end - 3]
+    wait = sorted(24 * (rules.held_at[m] - world.mtime[m]) for m in new if rules.held[m]) or [0.0]
+    lost = sum(1 for m in new if not rules.held[m] and not world.listed(m, end, places))
+    return "%5.1f %5.1f  %5.2f   %3.0f%%   %s %s %s   %4.0f%% %4.0f%% %4.0f%%   %5.1f%%  %5.1f %5.1f   %4.2f%%" % (
+        total("seconds", days) / max(total("fetches", days), 1), total("seconds", late) / max(total("fetches", late), 1),
+        total("requests", days) / max(total("fetches", days), 1), 100 * total("seconds", late) / (seconds_a_day * len(late)),
+        reach(0.5), reach(0.8), reach(0.95), 100 * share(NOW + 7), 100 * share(NOW + 14), 100 * share(end),
+        100 * sum(1 for m in new if rules.held[m]) / max(len(new), 1), wait[len(wait) // 2], wait[int(len(wait) * 0.9)],
+        100 * lost / max(len(new), 1))
+
+
+HEAD = ("%-46s client seconds   requests  time   days until held:   season held after   new matches: held, hours until  lost\n"
+        "%-46s a match: all,    a match   used   50%%  80%%  95%%      7 d  14 d  %2d d             (middle, 9 in 10)\n"
+        "%-46s          at end            at end")
+HOUR = 1 / 24
+
+
+def table(world, title, state, cases, days, team, seconds_a_day):
+    """Play each case from 25 Nov and print its line. A case: (label, None for the rules until 25 Nov, or what the
+    collectors are like: (block, life of a client's copies in days, days between client restarts, changes to ingest.py))."""
+    before, scale, now, reports = state
+    end = NOW + days
+    print("\n" + title)
+    print(HEAD % ("", "", days, ""))
+    for label, case in cases:
+        counts = defaultdict(Counter)
+        if case is None:
+            rules = copy.deepcopy(before)
+            collect_before(rules, now, end, lambda t: seconds_a_day * scale / (NORMAL + T_PLACE * PAGE), counts, reports)
+            for day in counts.values():
+                day["seconds"] = day["requests"] * (NORMAL + T_PLACE * PAGE)
+            print("%-46s %s" % (label, measure(world, rules, counts, end, seconds_a_day * scale)))
+            continue
+        block, life, restarts, changes = case
+        installs = [Install("collector-%d" % number, wait, share * scale, block, life, restarts) for number, (wait, share) in enumerate(team)]
+        rules = Endpoint(world, installs, changes)
+        rules.take_over(before, installs[:3])
+        collect(rules, installs, now, end, counts)
+        print("%-46s %s" % (label, measure(world, rules, counts, end, seconds_a_day * scale, block or PAGE)))
+        rules.close()
 
 
 def main():
@@ -527,20 +558,35 @@ def main():
     parser.add_argument("--days", type=int, default=30, help="days played on from 25 Nov")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--real", type=int, default=REAL_MATCHES_A_DAY, help="HN1's Arena matches a day to assume")
-    parser.add_argument("--endpoint", action="store_true", help="also play ingest.py itself (slower)")
+    parser.add_argument("--quick", action="store_true", help="fewer cases, 14 days")
     args = parser.parse_args()
-    world = World(int(NOW) + 2 + args.days, args.matches_a_day, args.seed)
+    days = 14 if args.quick else args.days
+    world = World(int(NOW) + 2 + days, args.matches_a_day, args.seed)
     show_world(world)
     state = replay(world, args.real)
-    compare(world, "3. From 25 Nov on HN1: 4 collectors, 84,000 client requests a day", state, 84000, args.days)
-    compare(world, "4. The same with 3 times the collectors", state, 252000, args.days, CHOICES[:3])
+    cases = [("rules until 25 Nov (as if copies did not matter)", None),
+             ("one page of 20 (collectors up to 0.3.7)", (None, HOUR, None, None)),
+             ("up to 200 in one request (0.3.8)", (200, HOUR, None, None)),
+             ("  the same, clients keep copies until restarted *", (200, 999, 3, None)),
+             ("  the same, and they never restart", (200, 999, None, None))]
+    more = [("up to 100 in one request", (100, HOUR, None, None)),
+            ("up to 60 in one request", (60, HOUR, None, None)),
+            ("up to 1,000, if a client gave that many", (1000, HOUR, None, {"DEFAULT_BLOCK": 1000, "PLACES_PER_ROUND": 4000})),
+            ("up to 200, a first read always 200", (200, HOUR, None, {"FIRST_PLACES": 10 ** 6})),
+            ("up to 200, due again after 5 more matches", (200, HOUR, None, {"TARGET_SEEN": 5}))]
+    hn1 = [(NORMAL, 0.9)] * 4                                # four collectors at the normal pace, on 9 hours in 10
+    print("\n   A client keeps its copy of a list for an hour, except in the lines marked *: there until it is restarted,"
+          "\n   every 3 days. On 25 Nov the first three collectors' clients hold a page of 20 of every list read so far.")
+    table(world, "3. From 25 Nov on HN1: 4 collectors at the normal pace", state, cases if args.quick else cases + more,
+          days, hn1, 4 * 0.9 * DAY)
+    if not args.quick:
+        table(world, "4. The same with 12 collectors", state, cases[:3], days, hn1 * 3, 12 * 0.9 * DAY)
     small = fresh(world, args.real * 0.54, 36000)
-    compare(world, "5. A new server like HN10 (about %d matches a day, 3%% held): 1 fast collector, 36,000 requests a day"
-            % (args.real * 0.54), small, 36000, args.days, CHOICES[:3] + CHOICES[8:9])
-    compare(world, "6. The same with 3 fast collectors", small, 108000, args.days, CHOICES[:3])
-    if args.endpoint:
-        check_endpoint(world, "7. ingest.py itself beside its stand-in (HN1, 84,000 requests a day, no list read yet)",
-                       state, 84000, args.days)
+    one = [(FAST, 0.83)]                                     # one collector in fast mode, on 20 hours a day
+    table(world, "5. A new server like HN10 (about %d matches a day, 3%% held): 1 collector in fast mode" % (args.real * 0.54),
+          small, cases, days, one, 0.83 * DAY)
+    if not args.quick:
+        table(world, "6. The same with 3 collectors in fast mode", small, cases[:3], days, one * 3, 3 * 0.83 * DAY)
 
 
 if __name__ == "__main__":
