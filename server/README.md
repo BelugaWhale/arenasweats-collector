@@ -214,9 +214,18 @@ Trust covers what a match says, not its size or shape:
     `denied`, `gone`, `oserror`, `failed`. `path_hidden.lock_none.cmd_none` or
     `path_seen.lock_badfile.cmd_none` means Windows does not let a normal program reach the
     client: the collector has to run as administrator.
+  - Administrator rights, at the end of the waiting_for_client and client_unreachable codes and
+    as the detail of starting: `admin` (this copy runs as administrator), or what became of
+    asking Windows for them (done when Windows hides the client): `admin_game` (waiting for the
+    match to end first), `admin_asked` (sent just before Windows shows its permission request),
+    `admin_declined`, `admin_timed_out` (nobody answered it; Windows gives up after about two
+    minutes, inferred from the time the answer took), `admin_failed`, `admin_no` (answered n to
+    "Ask Windows again?", or started with `--no-admin`). Once allowed, it is remembered, so that
+    install's next copies report `admin`.
   - error: `error.`, the kind of error and the collector's function it happened in, such as
     `error.keyerror.work_round` (the details are in the volunteer's collector.log); stopped:
-    `ctrl_c`.
+    `ctrl_c`; closed: `window`, `logoff` or `shutdown` (sent in the seconds Windows gives a
+    program whose window is closed).
 
   Until an install has collected anything, a change is sent at once (at most every 10 seconds),
   so an install that is closed within a minute still shows why. After that, collectors check in

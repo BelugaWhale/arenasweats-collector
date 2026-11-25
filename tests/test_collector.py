@@ -823,5 +823,204 @@ class ClientPrograms(CollectorCase):
     original_process_table = staticmethod(collector.process_table)
 
 
+class StubServer:
+    """Stands in for ArenaSweats: answers every check-in and keeps what each one said."""
+
+    def __init__(self):
+        self.key, self.state, self.detail, self.told, self.fast, self.problem, self.pace = (
+            "as_" + "k" * 30, "starting", "", None, False, [], None)
+        self.calls = []
+
+    def call(self, method, path, payload=None, timeout=30):
+        self.told = (self.state, self.detail)
+        self.calls.append((path, self.state, self.detail))
+        return 200, {"enabled": True}, 0
+
+
+class AdminRights(CollectorCase):
+    """The client runs as administrator, so Windows hides it: the collector asks Windows for administrator rights.
+    Windows' permission request, the console and the game program are pretend here."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(self.league_dir, "lockfile"))
+        self.logins, self.outcomes, self.starts, self.saved, self.answers = [], [], [], {}, []
+        self.console, self.game, self.elevated, self.uac_seconds = True, False, False, 0
+
+        def start_elevated(args):
+            self.starts.append((self.clock.now(), list(args)))
+            self.clock.sleep(self.uac_seconds)                  # Windows waits for an answer
+            return self.outcomes.pop(0)
+
+        def save_config(**values):
+            self.saved.update(values)
+            for name in [name for name, value in self.saved.items() if value is None]:
+                del self.saved[name]
+
+        def read_typed():
+            if self.answers and self.clock.now() >= self.answers[0][0]:
+                return self.answers.pop(0)[1]
+            return None
+        for name, value in (("running_client_dirs", lambda: [None]), ("installer_dirs", lambda: []),
+                            ("installed_dirs", lambda: []), ("scan_drives", lambda: []),
+                            ("command_line_logins", lambda: self.logins), ("is_elevated", lambda: self.elevated),
+                            ("start_elevated", start_elevated), ("save_config", save_config),
+                            ("answerable", lambda: self.console), ("read_typed", read_typed),
+                            ("game_running", lambda: self.game)):
+            self.addCleanup(setattr, collector, name, getattr(collector, name))
+            setattr(collector, name, value)
+
+    def run_hidden(self, minutes=30, **options):
+        """Run with League hidden; returns (the stub server, whether a new copy took over)."""
+        server = StubServer()
+        try:
+            self.run_collector(minutes=minutes, server=server, league_dir=None, argv=["--minutes", "30"], **options)
+        except collector.HandedOver:
+            return server, True
+        return server, False
+
+    def details(self, server):
+        return [detail for path, _, detail in server.calls if path == "/v1/policy"]
+
+    def test_hidden_league_asks_windows_and_a_yes_hands_over(self):
+        # Why: this is the only way most Chinese helpers can collect at all; a wrong hand-over leaves them with nothing.
+        self.outcomes = ["started"]
+        start = self.clock.now()
+        server, handed_over = self.run_hidden()
+        self.assertTrue(handed_over)
+        self.assertEqual(self.saved, {"admin": True})
+        when, args = self.starts[0]
+        self.assertEqual(args, ["--minutes", "30", "--elevated", "--no-update", "--no-fast"])
+        self.assertGreaterEqual(when - start, 10)                    # not on the first look: the client may be starting
+        self.assertTrue(self.details(server)[-1].endswith(".admin_asked"))
+        text = self.output.getvalue()
+        self.assertIn("Asking Windows to restart the collector as administrator.", text)
+        self.assertIn("正在请 Windows 以管理员身份重新启动采集器。", text)
+        self.assertIn("This window closes.", text)
+        self.assertNotIn("Stopped before a logged-in League client was found", text)
+
+    def test_a_refusal_puts_up_a_question_and_check_ins_go_on(self):
+        # Why: a helper may be away from the PC; Windows must not be asked again and again, and ArenaSweats must still
+        # see why the install is not collecting while the question stands.
+        self.outcomes = ["declined"]
+        server, handed_over = self.run_hidden()
+        self.assertFalse(handed_over)
+        self.assertEqual(len(self.starts), 1)
+        self.assertEqual(self.saved, {})
+        text = self.output.getvalue()
+        self.assertIn("Windows' permission request was declined.", text)
+        self.assertIn("Ask Windows again? [Y/n]", text)
+        self.assertIn("要再请 Windows 试一次吗？[Y/n]", text)
+        later = [detail for detail in self.details(server) if detail.endswith(".admin_declined")]
+        self.assertGreaterEqual(len(later), 3)                       # at once, then every 10 minutes
+
+    def test_yes_to_the_question_asks_windows_again(self):
+        # Why: the helper's yes must lead straight to Windows' request again, or they cannot ever start collecting.
+        self.outcomes = ["declined", "started"]
+        answered_at = self.clock.now() + 120
+        self.answers = [(answered_at, "")]                           # just Enter means yes
+        _, handed_over = self.run_hidden()
+        self.assertTrue(handed_over)
+        self.assertEqual(len(self.starts), 2)
+        self.assertLess(self.starts[1][0] - answered_at, 2)          # within a second of the answer
+        self.assertIn("Asking Windows again to restart the collector as administrator.", self.output.getvalue())
+
+    def test_no_to_the_question_stops_asking_for_this_run(self):
+        # Why: a helper who says no must not be asked again in the same run.
+        self.outcomes = ["declined"]
+        self.answers = [(self.clock.now() + 120, "n")]
+        server, _ = self.run_hidden()
+        self.assertEqual(len(self.starts), 1)
+        self.assertEqual(self.output.getvalue().count("Ask Windows again?"), 1)
+        self.assertIn("OK. It will ask again the next time it is started.", self.output.getvalue())
+        self.assertTrue(self.details(server)[-1].endswith(".admin_no"))
+
+    def test_not_while_a_match_is_on(self):
+        # Why: Windows' permission request takes over the whole screen, and must never interrupt a match.
+        self.outcomes = ["started"]
+        self.game = True
+        start = self.clock.now()
+        self.clock.at(start + 600, lambda: setattr(self, "game", False))
+        _, handed_over = self.run_hidden()
+        self.assertTrue(handed_over)
+        self.assertGreaterEqual(self.starts[0][0] - start, 600)
+        self.assertIn("Waiting for the match to end before asking Windows", self.output.getvalue())
+
+    def test_nobody_at_the_console_still_gets_windows_request_once(self):
+        # Why: Windows' own request needs no console, but with nobody to type an answer it must not be raised again.
+        self.console = False
+        self.outcomes = ["declined"]
+        self.uac_seconds = 120                                       # nobody answered: Windows gave up
+        server, _ = self.run_hidden()
+        self.assertEqual(len(self.starts), 1)
+        text = self.output.getvalue()
+        self.assertIn("Nobody answered Windows' permission request.", text)
+        self.assertIn("It asks Windows again the next time the collector is started.", text)
+        self.assertNotIn("Ask Windows again?", text)
+        self.assertIn("choose 'Run as administrator'", text)
+        self.assertTrue(self.details(server)[-1].endswith(".admin_timed_out"))
+
+    def test_already_administrator_never_asks(self):
+        # Why: an administrator copy that asked Windows again would start copy after copy.
+        self.elevated = True
+        server, _ = self.run_hidden(minutes=5)
+        self.assertEqual(self.starts, [])
+        self.assertIn("cannot reach it yet. It keeps trying.", self.output.getvalue())
+        self.assertEqual(self.details(server)[0], "admin")                     # said when it starts
+        self.assertTrue(self.details(server)[-1].endswith(".admin"))
+
+    def test_a_client_that_becomes_reachable_drops_the_question(self):
+        # Why: the question must never stand in the way of collecting once the client can be reached.
+        self.outcomes = ["declined"]
+        self.clock.at(self.clock.now() + 120,
+                      lambda: setattr(self, "logins", [(self.fake.port, self.fake.token, "http")]))
+        self.addCleanup(setattr, collector, "Lcu", collector.Lcu)
+        collector.Lcu = PlainLcu
+        made = self.run_collector(minutes=10, league_dir=None)
+        self.assertIn("no need to answer", self.output.getvalue())
+        self.assertTrue(self.stored_ids(made))
+
+    def test_a_saved_yes_refused_at_start_puts_up_the_question_without_asking_windows(self):
+        # Why: Windows was asked once already at start; asking again by itself would repeat the request unasked.
+        self.outcomes = []
+        server, _ = self.run_hidden(minutes=5, admin_start="declined")
+        self.assertEqual(self.starts, [])
+        self.assertIn("Ask Windows again? [Y/n]", self.output.getvalue())
+        self.assertEqual(self.details(server)[0], "admin_declined")
+
+    def main_with(self, config, *flags):
+        """main() with config.json holding `config`; returns (exit code, what the window showed)."""
+        self.addCleanup(setattr, collector, "load_config", collector.load_config)
+        collector.load_config = lambda folder: dict(config)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = collector.main(["--test-run", "--minutes", "0.01", "--data-dir", self.data_dir] + list(flags))
+        return code, output.getvalue()
+
+    def test_a_saved_yes_starts_as_administrator_before_anything_else(self):
+        # Why: the update and fast-mode questions must be asked once, in the administrator copy, not twice.
+        self.outcomes = ["started"]
+        code, text = self.main_with({"admin": True})
+        self.assertEqual(code, 0)
+        self.assertEqual(self.starts[0][1],
+                         ["--test-run", "--minutes", "0.01", "--data-dir", self.data_dir, "--elevated"])
+        self.assertIn("Starting as administrator, as you chose: Windows hides League from it otherwise.", text)
+        self.assertNotIn("ArenaSweats collector", text)                         # nothing else ran here
+        self.outcomes = ["declined"]
+        code, text = self.main_with({"admin": True})
+        self.assertIn("Windows did not start it as administrator, so this time it runs without administrator", text)
+        self.assertIn("ArenaSweats collector", text)
+        self.assertEqual(self.saved, {})                                        # the saved yes is not touched
+
+    def test_no_admin_forgets_the_saved_yes(self):
+        # Why: the helper needs a way back that works without editing files.
+        code, text = self.main_with({"admin": True, "key": "x"}, "--no-admin")
+        self.assertEqual(self.starts, [])
+        self.assertIn("Forgot the choice to start as administrator.", text)
+        self.saved = {"admin": True}
+        self.main_with({"admin": True}, "--no-admin")
+        self.assertEqual(self.saved, {})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -41,9 +41,9 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   client not found", and a few numbers about its own pace: how many requests it made,
   how many failed, and how long the client took to answer. Never a file or folder name,
   nor anything that identifies you or your PC.
-- **Nothing to install.** No background service, and no administrator rights unless
-  Windows hides the League client from it (see below). Close the window and it stops.
-  Delete its folder and it's gone.
+- **Nothing to install.** No background service. Close the window and it stops. Delete its
+  folder and it's gone. It runs as administrator only if you allow it when Windows asks, which
+  happens only when Windows hides the League client from it (see below).
 - **Open source.** The download is built by GitHub straight from the code in this
   repository, so what you run is exactly what you can read here.
 
@@ -63,9 +63,13 @@ the PC. To skip the fast mode question, add `--fast` or `--no-fast` to the end o
 shortcut's target. While fast mode is on, it says so every time it starts.
 
 If Windows hides the League client from it (this happens when League itself runs as
-administrator), it says so and asks you to start it with right-click > "Run as
-administrator". That is the only case in which it needs administrator rights. Where knowing
-the folder League is installed in is enough, it asks for that as well; with no answer
-within 2 minutes it keeps looking by itself.
+administrator), it asks Windows to restart it as administrator, never during a match, and
+Windows shows its own permission request. If you allow it, that is remembered in
+`config.json` and it starts as administrator by itself from then on; to undo that, start it
+once with `--no-admin`, or delete the `"admin"` line from `config.json`. If the request is
+declined or nobody answers, it does not ask Windows again by itself: it asks you in its
+window whether to, and keeps looking for League meanwhile. As administrator it makes exactly
+the same read-only requests, and nothing else. Where knowing the folder League is installed in is enough, it
+asks for that as well; with no answer within 2 minutes it keeps looking by itself.
 
 MIT licence; see [`LICENSE`](LICENSE).
