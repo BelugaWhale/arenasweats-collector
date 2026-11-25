@@ -41,8 +41,9 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   client not found", and a few numbers about its own pace: how many requests it made,
   how many failed, and how long the client took to answer. Never a file or folder name,
   nor anything that identifies you or your PC.
-- **Nothing to install.** No administrator rights and no background service. Close the
-  window and it stops. Delete its folder and it's gone.
+- **Nothing to install.** No background service, and no administrator rights unless
+  Windows hides the League client from it (see below). Close the window and it stops.
+  Delete its folder and it's gone.
 - **Open source.** The download is built by GitHub straight from the code in this
   repository, so what you run is exactly what you can read here.
 
@@ -61,9 +62,10 @@ counting down 10 seconds; pressing Enter, or no answer, keeps it off. So it stil
 the PC. To skip the fast mode question, add `--fast` or `--no-fast` to the end of a
 shortcut's target. While fast mode is on, it says so every time it starts.
 
-If Windows hides the League client from it (this happens when the client runs as
-administrator), it suggests starting it with right-click > "Run as administrator", or asks
-which folder League is installed in. With no answer within 2 minutes it keeps looking by
-itself.
+If Windows hides the League client from it (this happens when League itself runs as
+administrator), it says so and asks you to start it with right-click > "Run as
+administrator". That is the only case in which it needs administrator rights. Where knowing
+the folder League is installed in is enough, it asks for that as well; with no answer
+within 2 minutes it keeps looking by itself.
 
 MIT licence; see [`LICENSE`](LICENSE).

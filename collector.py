@@ -35,9 +35,9 @@ WHAT IT NEVER DOES
     made, how many failed, how long the client took to answer: see pace_report).
   - It keeps the computer awake while it runs (the screen can still turn off),
     and stops a click in its window from freezing it.
-  - It needs no administrator rights and installs nothing. (When the League
-    client runs as administrator, Windows hides where it is installed; the
-    collector then looks in the usual places and, failing that, asks.)
+  - It installs nothing, and needs administrator rights only when Windows
+    hides the League client from it, which happens when the client itself
+    runs as administrator. It then says so, and why.
 
 Only the Python standard library is used, so this one file is the whole program.
 """
@@ -1587,12 +1587,20 @@ class Collector:
                 self.say(both("Found the League client. Waiting for you to log in.",
                               "已找到英雄联盟客户端，等待你登录。"), once=True)
             elif running:
-                self.say(both("The League client is open, but the collector cannot reach it yet. If this does not "
-                              "change within a minute,\n         close this window and start the collector again with "
-                              "right-click > 'Run as administrator'.",
-                              "英雄联盟客户端已打开，但采集器暂时连接不上它。如果一分钟后仍是这样，"
-                              "请关闭此窗口，右键点击采集器，选择“以管理员身份运行”。"), once=True)
-                if hidden and rounds >= 2 and self.folder_asks < 3 and sys.stdin and sys.stdin.isatty():
+                # Windows keeps a normal program away from a client that runs as administrator: it will not say
+                # where the client is, or (the Tencent client, whose lockfile holds no password) how to log in to it.
+                tencent_lockfile = "badfile" in by_lockfile
+                if hidden or (tencent_lockfile and not by_command_line):
+                    self.say(both("Windows hides the League client from the collector, because League runs as "
+                                  "administrator.\n         To collect: close this window, right-click the collector "
+                                  "and choose 'Run as administrator'.",
+                                  "英雄联盟以管理员身份运行，所以 Windows 不让采集器看到它。\n         "
+                                  "要开始采集：请关闭此窗口，右键点击采集器，选择“以管理员身份运行”。"), once=True)
+                else:
+                    self.say(both("The League client is open, but the collector cannot reach it yet. It keeps trying.",
+                                  "英雄联盟客户端已打开，但采集器暂时连接不上它，正在继续尝试。"), once=True)
+                if (hidden and not tencent_lockfile and rounds >= 2 and self.folder_asks < 3
+                        and sys.stdin and sys.stdin.isatty()):
                     self.ask_for_folder()
                     continue
             else:
@@ -1635,13 +1643,9 @@ class Collector:
         """Ask where League is installed, when the client is open but Windows will not say where. Nobody may be at
         the PC, so after FOLDER_SECONDS without an answer it carries on looking (and checking in) by itself."""
         self.folder_asks += 1
-        print(both("Windows does not let the collector see the League client. This happens when the client runs\n"
-                   "as administrator. Close this window and start the collector with right-click >\n"
-                   "'Run as administrator', or tell the collector the folder League is installed in. To find it,\n"
-                   "right-click your League shortcut and choose 'Open file location'.",
-                   "Windows 不让采集器看到英雄联盟客户端，这通常是因为客户端以管理员身份运行。请关闭此窗口，右键点击采集器，"
-                   "选择“以管理员身份运行”；\n或者告诉采集器英雄联盟的安装文件夹：右键点击英雄联盟的快捷方式，"
-                   "选择“打开文件所在的位置”即可找到。", 0))
+        print(both("Or tell the collector the folder League is installed in: right-click your League shortcut and "
+                   "choose 'Open file location'.",
+                   "也可以告诉采集器英雄联盟的安装文件夹：右键点击英雄联盟的快捷方式，选择“打开文件所在的位置”。", 0))
         set_quick_edit(True)            # so the folder can be pasted with a right-click
         try:
             answer = timed_input("Paste the folder and press Enter / 粘贴文件夹路径后按回车: ", FOLDER_SECONDS)

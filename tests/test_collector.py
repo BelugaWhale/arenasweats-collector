@@ -656,7 +656,9 @@ class HiddenClient(CollectorCase):
 
     def test_says_the_client_is_open_but_out_of_reach(self):
         made = self.run_collector(minutes=2, league_dir=None)
-        self.assertIn("The League client is open, but the collector cannot reach it yet.", self.output.getvalue())
+        self.assertIn("Windows hides the League client from the collector, because League runs as administrator.",
+                      self.output.getvalue())
+        self.assertIn("choose 'Run as administrator'", self.output.getvalue())
         self.assertNotIn("Waiting for the League client", self.output.getvalue())
         self.assertEqual(self.stored_ids(made) if made.store else set(), set())
 
@@ -672,8 +674,8 @@ class HiddenClient(CollectorCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             made.ask_for_folder()
-        self.assertIn("Run as administrator", output.getvalue())
-        self.assertIn("以管理员身份运行", output.getvalue())
+        self.assertIn("Open file location", output.getvalue())
+        self.assertIn("打开文件所在的位置", output.getvalue())
         self.assertEqual(saved, {"league_dir": os.path.join(install, "TCLS")})
         self.assertEqual(made.opts.league_dir, os.path.join(install, "TCLS"))
         self.assertEqual(collector.lockfile_paths(made.opts.league_dir)[0],
