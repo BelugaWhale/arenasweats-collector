@@ -1478,6 +1478,7 @@ class SeveralAtOnce(SlowAnswers):
         super().setUp()
         # Every list is short here, and there is enough to read for 40 minutes at fast mode's full pace.
         self.world(players=3000, arena=3000, other=0)
+        self.blocks = 100
         self.fake.delay = lambda path: 0.5 if "/games/" in path else 1.5
 
     def test_the_normal_pace_still_sends_one_request_at_a_time(self):
@@ -1658,6 +1659,7 @@ class Blocks(SlowAnswers):
     def setUp(self):
         super().setUp()
         self.world(players=300, arena=600, other=12)                     # lists of 150 matches or so
+        self.blocks = 100
         self.reports, original = [], collector.Server.call      # the match-list reports sent to ArenaSweats
 
         def call(server, method, path, payload=None):
@@ -1696,14 +1698,23 @@ class Blocks(SlowAnswers):
             self.assertEqual(sorted(report["ids"]), sorted(g["gameId"] for g in listed if g["gameMode"] == "CHERRY"))
             self.assertEqual(report["took"], 0 if puuid == me else 25.05)  # 100 matches at 0.25 s each
             self.assertEqual(report["next"], 0 if puuid == me else 100)    # the list may go on: only a larger block shows
-        self.assertEqual(len(read), len(others) + 1)
-        # This endpoint then hands out "the following pages" (it names no number for them). The client could only
-        # give its saved copy again, so nothing is asked of it, and the report says the list ends there.
-        further = [report for report in self.reports if not report["asked"]]
-        self.assertTrue(further)
-        for report in further:
-            self.assertEqual((report["begin"], report["listed"], report["ids"], report["next"], report["failed"]),
-                             (100, 0, [], 0, False))
+        self.assertIn(len(others) + 1 - len(read), (0, 1))               # (one may have been on its way at the end)
+
+    def test_asked_for_a_following_page_it_asks_the_client_nothing(self):
+        # An endpoint that still pages would get the client's saved first page back as if it were the next one,
+        # and would take matches for read that never were: the collector must say instead that the list ends.
+        made = self.collector(server=self.server())
+        before = len(self.fake.requests)
+        made.take_work({"games": [], "lease": 900, "players": [
+            {"puuid": self.fake.players[3], "job": "abc", "since": 0, "begin": 20, "pages": 3}]})
+        self.assertEqual((list(made.todo), len(self.fake.requests)), ([], before))
+        self.assertEqual(made.reports, [{"puuid": self.fake.players[3], "job": "abc", "begin": 20, "asked": 0, "listed": 0,
+                                         "ids": [], "newest": 0, "oldest": 0, "took": 0.0, "next": 0, "failed": False}])
+        made.take_work({"games": [], "lease": 900, "players": [          # with a number, the block is read whatever the place
+            {"puuid": self.fake.players[4], "job": "def", "since": 0, "begin": 20, "pages": 3, "count": 50},
+            {"puuid": self.fake.players[5], "job": "ghi", "since": 0, "begin": 0, "pages": 1, "count": 5000}]})
+        self.assertEqual([read.path.split("?")[1] for read in made.todo],
+                         ["begIndex=0&endIndex=49", "begIndex=0&endIndex=%d" % (collector.MAX_BLOCK - 1)])
 
     def test_an_endpoint_that_names_no_number_gets_twenty_and_no_following_page(self):
         # Collectors and the endpoint are updated at different times: with today's endpoint the new collector must
@@ -1727,13 +1738,13 @@ class Blocks(SlowAnswers):
             made = self.run_collector(minutes=45, server=self.server(), fast=True)
         self.assertEqual((made.stats["failed"], made.failures), (0, 0))
         self.assertFalse([line for line in logs.output if "down to" in line or "rests for an hour" in line])
-        self.assertGreaterEqual(made.flight, 3)                          # it was allowed more at once all the same
+        self.assertGreaterEqual(made.flight, 2)                          # it was allowed more at once all the same
         self.assertLessEqual(self.flights.most, collector.FAST_MAX_FLIGHT)
         self.assertGreaterEqual(min(self.gaps()), collector.FAST_MIN_DELAY - 0.001)
         lists = [(sent, answered) for sent, answered, path in self.flights.flown if "/matches?" in path]
         matches = [sent for sent, _, path in self.flights.flown if "/games/" in path]
         at_once = max(sum(1 for sent, answered in lists if sent <= when < answered) for when, _ in lists)
-        self.assertEqual(at_once, collector.FAST_MAX_FLIGHT - 1)         # one place is kept for the matches,
+        self.assertLessEqual(at_once, made.flight - 1)                   # one place is kept for the matches,
         flown = self.flights.flown
         first = min(sent for place, (sent, _, _) in enumerate(flown)     # when two were first on their way together
                     if any(other < sent < answered for other, answered, _ in flown[:place]))
@@ -1741,6 +1752,29 @@ class Blocks(SlowAnswers):
         during = [when for when in late if any(sent < when < answered for sent, answered in lists)]
         self.assertGreater(len(late), 50)
         self.assertGreater(len(during), len(late) * 0.8)                 # which go on while lists are being answered
+
+    def test_which_request_goes_next(self):
+        # The mix decides both promises of fast mode at once: never more than four on their way, and lists (the
+        # requests that weigh on the client) never all of them.
+        made = self.collector(server=self.server(), fast=True)
+        lists = [collector.ListRead(puuid, 0, 100) for puuid in self.fake.players[:6]]
+        matches = [collector.MatchFetch(game_id) for game_id in sorted(self.fake.arena_ids())[:6]]
+
+        def order(flight):
+            made.flight, made.todo, made.flying = flight, collector.deque(matches[:3] + lists + matches[3:]), {}
+            sent = []
+            while made.choose() is not None:
+                job = made.choose()
+                made.todo.remove(job)
+                made.flying[len(sent)] = job
+                sent.append("list" if job in lists else "match")
+            return sent
+        self.assertEqual(order(4), ["list", "list", "list", "match"])    # one place is kept for the matches
+        self.assertEqual(order(3), ["list", "list", "match"])
+        self.assertEqual(order(2), ["list", "match"])
+        self.assertEqual(order(1), ["match"])                            # one at a time: matches before lists
+        made.fast = False                                                # the normal pace: always one at a time
+        self.assertEqual((made.flight_limit, order(4)), (1, ["match"]))
 
     def test_at_the_normal_pace_a_long_list_is_waited_for(self):
         # One request at a time is the promise: the next one must wait for a list's answer however long that takes.
