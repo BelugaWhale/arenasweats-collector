@@ -2149,6 +2149,8 @@ class Collector:
             self.say("ArenaSweats has switched fast mode back on. 快速模式已恢复。" if fast_allowed else
                      "ArenaSweats has switched fast mode off for now, so collection goes at the normal pace. "
                      "ArenaSweats 已暂时关闭快速模式，现按正常速度采集。")
+        if fast_allowed != self.fast_allowed:
+            self.flight = 1         # when fast mode comes back, it starts with one request at a time again
         self.fast_allowed = fast_allowed
         season = policy.get("season_start")
         if isinstance(season, int) and not isinstance(season, bool) and 0 < season < 2 ** 53:

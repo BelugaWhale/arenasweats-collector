@@ -1520,6 +1520,10 @@ class SeveralAtOnce(WithServer):
         self.admin("policy", "--fast-flight", "50")
         made = self.run_collector(minutes=15, server=self.server(), fast=True, hours_later=1)
         self.assertEqual((self.flights.most, made.flight_limit), (collector.FAST_MAX_FLIGHT, collector.FAST_MAX_FLIGHT))
+        made.apply_policy({"fast": False})
+        self.assertEqual(made.flight_limit, 1)
+        made.apply_policy({"fast": True})                                # switched back on: one at a time again at first
+        self.assertEqual((made.fast_on, made.flight_limit), (True, 1))
 
     def test_a_game_starting_stops_requests_and_drops_the_ones_on_their_way(self):
         # "Never while you play" is the collector's first promise: nothing may be sent or taken in once a game is queued.
