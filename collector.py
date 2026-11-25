@@ -134,7 +134,11 @@ FOLDER_SECONDS = 120   # an unanswered question for the League folder gives up a
 TEST_MINUTES = 15      # length of a test run (no upload address set)
 MAX_LCU_BYTES = 8 * 1024 * 1024
 
-IDLE_PHASES = {"None", "Lobby"}   # client states in which collection is allowed
+# Client states in which collection is allowed: the client is open and you are not in a match: on its home screen,
+# in a lobby, or on the post-game screen after a match (EndOfGame, where a client left after a game stays for
+# hours). Right after a match (WaitingForStats, then the honor vote, PreEndOfGame) it stays paused: those pass
+# by themselves within a minute or two.
+IDLE_PHASES = {"None", "Lobby", "EndOfGame"}
 PHASE_SECONDS = 5                 # while it is idle, the client's state is asked at most this often
 ARENA_MODES = {"CHERRY"}          # Riot's internal name for Arena
 
@@ -2090,7 +2094,7 @@ class Collector:
 
     # -- reading match history -------------------------------------------------
     def wait_until_idle(self):
-        """Return only when the client is idle (not in queue, champion select, a game or post-game).
+        """Return only when the client is idle (not in queue, champion select, a game or just after one).
         While it stays idle, its state is asked at most every PHASE_SECONDS, not before every request."""
         if not self.paused and self.now() - self.idle_at < PHASE_SECONDS:
             return

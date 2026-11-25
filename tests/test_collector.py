@@ -187,7 +187,7 @@ class Gentle(CollectorCase):
     def test_no_match_history_requests_while_playing(self):
         start = self.clock.now()
         self.fake.phase = "InProgress"                                    # already in a game at start
-        self.clock.at(start + 600, lambda: setattr(self.fake, "phase", "EndOfGame"))
+        self.clock.at(start + 600, lambda: setattr(self.fake, "phase", "PreEndOfGame"))     # the honor vote
         self.clock.at(start + 660, lambda: setattr(self.fake, "phase", "None"))
         self.clock.at(start + 760, lambda: setattr(self.fake, "phase", "ChampSelect"))
         self.clock.at(start + 1000, lambda: setattr(self.fake, "phase", "Lobby"))
@@ -201,6 +201,19 @@ class Gentle(CollectorCase):
         self.assertTrue(any(660 < when < 760 for when in times))
         self.assertTrue(any(when > 1000 for when in times))
         self.assertIn("Paused while you play", self.output.getvalue())
+
+    def test_collects_on_the_post_game_screen_but_not_just_after_the_match(self):
+        # Why: the README promises "never while you play"; a client left on the post-game screen used to keep the
+        # collector paused for hours, and the states just after a match must still pause it.
+        start = self.clock.now()
+        self.fake.phase = "InProgress"
+        self.clock.at(start + 300, lambda: setattr(self.fake, "phase", "WaitingForStats"))
+        self.clock.at(start + 330, lambda: setattr(self.fake, "phase", "PreEndOfGame"))
+        self.clock.at(start + 360, lambda: setattr(self.fake, "phase", "EndOfGame"))        # then left for good
+        self.run_collector(minutes=30)
+        times = [when - start for _, _, when in history(self.fake.requests)]
+        self.assertFalse([when for when in times if when < 360 + collector.RESUME_GRACE - 5])
+        self.assertGreater(len(times), 100)
 
     def test_backs_off_when_requests_fail(self):
         self.run_collector()                                              # learn the players first
