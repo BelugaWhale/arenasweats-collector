@@ -1343,7 +1343,7 @@ class Server:
         self.key = key or None      # None until this install has signed up (Collector.sign_up)
         self.state = "starting"     # what this collector is doing, sent with every request (see Collector.heartbeat)
         self.detail = ""            # ... and when it is not collecting why: a short fixed code, never a path or name
-        self.told = None            # the (state, detail) that ArenaSweats last received
+        self.told = None            # the (state, detail) last sent to ArenaSweats (answered or not: no retry)
         self.problem = []           # after a call that got no answer: what went wrong (NoAnswer.tries)
         log.info("network: %s", network_setup(self.url))
         self.fast = False           # the user turned fast mode on: "_fast" is added to the state sent
@@ -1355,7 +1355,7 @@ class Server:
         Status 0 = unreachable; `problem` then says why."""
         headers = {"Accept": "application/json", "User-Agent": "arenasweats-collector/" + VERSION,
                    "X-Collector-State": self.state + ("_fast" if self.fast else ""), "X-Collector-Detail": self.detail}
-        told = (self.state, self.detail)
+        self.told = (self.state, self.detail)
         pace, self.pace = self.pace, None
         if self.key:
             headers["Authorization"] = "Bearer " + self.key
@@ -1372,7 +1372,6 @@ class Server:
             log.warning("%s %s got no answer: %s", method, path, error)
             return 0, None, 0
         self.problem = []
-        self.told = told
         retry = answer_headers.get("Retry-After")
         wait = int(retry) if retry and re.fullmatch(r"[0-9]{1,5}", retry) else 0
         return status, parse_json(raw), min(3600, wait)
