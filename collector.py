@@ -2891,6 +2891,7 @@ def install_update(release, exe_path):
 
 
 ANSWER_SECONDS = 10    # a start-up question nobody answers takes its default after this long (admin, 2026-11-24)
+ADMIN_SECONDS = 30     # ... and the administrator question, the first one asked, after this long (admin, 2026-11-26)
 
 
 def timed_input(prompt, seconds=ANSWER_SECONDS):
@@ -3023,12 +3024,12 @@ def ask_fast_mode(ask=timed_input):
 def ask_admin(ask=timed_input):
     """Ask at start whether to run as administrator, which the Chinese client needs (it runs as administrator, and
     Windows then hides it from a program that does not). Only a yes is yes; Enter, or no answer within
-    ANSWER_SECONDS, is no."""
+    ADMIN_SECONDS, is no."""
     print("League on Chinese servers runs as administrator, and Windows then hides it from the collector.")
     print("Run the collector as administrator? Your yes is remembered. [y/N]")
     print("国服英雄联盟以管理员身份运行，Windows 因此不让采集器看到它。")
     try:
-        answer = ask("以管理员身份运行采集器吗？你的“是”会被记住。[y/N]  No answer = no / 不回答即否: ")
+        answer = ask("以管理员身份运行采集器吗？你的“是”会被记住。[y/N]  No answer = no / 不回答即否: ", ADMIN_SECONDS)
     except (EOFError, KeyboardInterrupt):
         answer = "n"
     if answer is None:

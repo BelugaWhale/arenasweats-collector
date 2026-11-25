@@ -845,7 +845,7 @@ class AdminRights(CollectorCase):
 
     def setUp(self):
         super().setUp()
-        self.outcomes, self.starts, self.saved, self.asked = [], [], {}, []
+        self.outcomes, self.starts, self.saved, self.asked, self.waited = [], [], {}, [], []
         self.answer, self.console, self.elevated, self.config = None, True, False, {}
 
         def start_elevated(args):
@@ -859,6 +859,7 @@ class AdminRights(CollectorCase):
 
         def timed_input(prompt, seconds=10):
             self.asked.append(prompt)
+            self.waited.append(seconds)
             return self.answer
         for name, value in (("start_elevated", start_elevated), ("save_config", save_config),
                             ("timed_input", timed_input), ("answerable", lambda: self.console),
@@ -886,6 +887,7 @@ class AdminRights(CollectorCase):
         self.assertEqual(self.saved, {"admin": True})
         self.assertEqual(self.starts, [["--test-run", "--minutes", "0.01", "--data-dir", self.data_dir, "--elevated"]])
         self.assertIn("Run the collector as administrator? Your yes is remembered. [y/N]", text)
+        self.assertEqual(self.waited, [collector.ADMIN_SECONDS])        # it waits 30 s for an answer, not 10
         self.assertNotIn("ArenaSweats collector", text)                 # nothing else ran in this copy
         self.outcomes = ["started"]
         code, text = self.start()                                       # a later start: no question

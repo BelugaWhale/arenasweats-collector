@@ -36,11 +36,8 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   still slow it down, allow fewer requests at once or switch it off, but can never allow
   more than four.
 - **Your account stays private.** It never reads or sends your password or login. It sends
-  only Arena match results, your player ID, which is already in your match records,
-  short fixed codes for what it is doing, such as "paused while you play" or "League
-  client not found", and a few numbers about its own pace: how many requests it made,
-  how many failed, and how long the client took to answer. Never a file or folder name,
-  nor anything that identifies you or your PC.
+  Arena match results, your player ID, which is already in your match records, and a
+  little about the collector itself: what it is doing and how fast.
 - **Nothing to install.** No background service. Close the window and it stops. Delete its
   folder and it's gone. It runs as administrator only if you say yes when it asks (see
   below).
@@ -64,7 +61,7 @@ shortcut's target. While fast mode is on, it says so every time it starts.
 
 Before those questions it asks whether to run as administrator, which League on Chinese
 servers needs (it runs as administrator, and Windows then hides it from other programs),
-again counting down 10 seconds; no answer means no, and it asks again at the next start. A
+counting down 30 seconds; no answer means no, and it asks again at the next start. A
 yes is remembered in `config.json`, and from then on it starts as administrator by itself
 (Windows asks your permission each time); to undo that, start it once with `--no-admin`, or
 delete the `"admin"` line from `config.json`. As administrator it makes exactly the same
