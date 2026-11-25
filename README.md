@@ -69,7 +69,8 @@ Windows shows its own permission request. If you allow it, that is remembered in
 once with `--no-admin`, or delete the `"admin"` line from `config.json`. If the request is
 declined or nobody answers, it does not ask Windows again by itself: it asks you in its
 window whether to, and keeps looking for League meanwhile. As administrator it makes exactly
-the same read-only requests, and nothing else. Where knowing the folder League is installed in is enough, it
-asks for that as well; with no answer within 2 minutes it keeps looking by itself.
+the same read-only requests, and nothing else. Where knowing the folder League is installed
+in can help (Riot's own client; the Chinese client's folder cannot help), a line in its
+window offers to take it, and it keeps looking meanwhile.
 
 MIT licence; see [`LICENSE`](LICENSE).

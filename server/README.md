@@ -209,11 +209,20 @@ Trust covers what a match says, not its size or shape:
     runs from; hidden when it runs as administrator), then `lock_` and the result for the first
     lockfile found and `cmd_` and the result for the client's command line. Results: `none`
     (nothing found), `login` and the client's status (it answered, nobody logged in yet, such
-    as `login404`), `badfile` (no port and password in it, as in the Tencent client's lockfile),
-    `refused` (nothing listening: a lockfile left from an earlier start), `reset`, `tls`,
-    `denied`, `gone`, `oserror`, `failed`. `path_hidden.lock_none.cmd_none` or
-    `path_seen.lock_badfile.cmd_none` means Windows does not let a normal program reach the
+    as `login404`), `forbidden` (it answered 403: something refuses this program; China's
+    anti-cheat may do that to programs it does not know, unconfirmed), `empty` (an empty
+    lockfile: the Tencent client leaves it so), `riotclient` (the Riot Client's lockfile, not
+    the League client's), `badfile` (another lockfile without a port and password), `refused`
+    (nothing listening: a lockfile left from an earlier start), `reset`, `tls`, `denied`,
+    `gone`, `oserror`, `failed`. `path_hidden.lock_none.cmd_none` or
+    `path_seen.lock_empty.cmd_none` means Windows does not let a normal program reach the
     client: the collector has to run as administrator.
+  - collecting: `found_` and the step of the collector's own search that found the client in
+    use: `running` (the running client's folder), `installer` (Windows' list of installed
+    programs), `usual` (Riot's or Tencent's records of the install, or a usual place:
+    `英雄联盟...`, `LOL` or `League of Legends` in a drive's top, `WeGameApps`, `腾讯游戏`,
+    `Program Files`, ...), `scan` (the drives searched), `cmdline` (the client's command line),
+    `typed` (only the folder the person typed in led to it). Never the folder itself.
   - Administrator rights, at the end of the waiting_for_client and client_unreachable codes and
     as the detail of starting: `admin` (this copy runs as administrator), or what became of
     asking Windows for them (done when Windows hides the client): `admin_game` (waiting for the

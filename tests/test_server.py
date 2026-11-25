@@ -1277,6 +1277,16 @@ class EndToEnd(WithServer):
         collector.save_config = lambda **values: None
         return told
 
+    def test_how_the_client_was_found_reaches_arenasweats(self):
+        # Why: without this nobody can tell which steps of the search real installs need, and where it fails.
+        self.addCleanup(setattr, collector, "installed_dirs", collector.installed_dirs)
+        collector.installed_dirs = lambda: [self.league_dir]
+        self.run_collector(minutes=2, server=self.server(), league_dir=None)
+        self.assertEqual(self.db.execute("SELECT state, detail FROM contributor_seen").fetchone(),
+                         ("collecting", "found_usual"))
+        self.assertIn("collecting 0.3.", self.admin("keys"))
+        self.assertIn("why: found_usual", self.admin("keys"))
+
     def test_an_install_that_finds_no_client_says_why_at_once(self):
         # Why: installs that never found a client looked like "collecting" and went quiet, so nobody could tell
         # why they sent nothing; this is what shows it now, even for one that is closed within a minute.
@@ -1291,16 +1301,15 @@ class EndToEnd(WithServer):
         self.assertIn("请打开英雄联盟并登录", self.output.getvalue())
 
     def test_a_client_that_is_open_but_out_of_reach_says_which_step_failed(self):
-        # Why: the Tencent client's lockfile holds no password, so a refused command line leaves it unreachable;
-        # the code must say so, or the fix (run as administrator) cannot be told apart from other causes.
+        # Why: the Tencent client's lockfile is empty, so a refused command line leaves it unreachable; the code
+        # must say so, or the fix (run as administrator) cannot be told apart from other causes.
         told = self.told()
-        with open(os.path.join(self.league_dir, "lockfile"), "w") as handle:
-            handle.write("12345")                                                       # the Tencent client's
+        open(os.path.join(self.league_dir, "lockfile"), "w").close()                  # the Tencent client's: empty
         for name, value in (("running_client_dirs", lambda: [self.league_dir]), ("command_line_logins", lambda: [])):
             self.addCleanup(setattr, collector, name, getattr(collector, name))
             setattr(collector, name, value)
         self.run_collector(minutes=1, server=self.server())
-        self.assertIn(("client_unreachable", "path_seen.lock_badfile.cmd_none"),
+        self.assertIn(("client_unreachable", "path_seen.lock_empty.cmd_none"),
                       [(state, detail) for state, detail, _ in told])
         self.assertIn("以管理员身份运行", self.output.getvalue())
 

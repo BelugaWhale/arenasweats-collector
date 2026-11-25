@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import urllib.parse
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -665,19 +666,21 @@ class HiddenClient(CollectorCase):
     def test_the_folder_typed_in_is_used_and_remembered(self):
         install = os.path.join(self.tmp.name, "WeGameApps", "英雄联盟")
         self.fake.write_lockfile(os.path.join(install, "LeagueClient"))
+        os.makedirs(os.path.join(install, "TCLS"))
+        open(os.path.join(install, "TCLS", "Client.exe"), "w").close()
         saved = {}
-        self.addCleanup(setattr, collector, "save_config", collector.save_config)
-        collector.save_config = lambda **values: saved.update(values)
-        self.addCleanup(setattr, collector, "timed_input", collector.timed_input)
-        collector.timed_input = lambda prompt, seconds: '"%s"' % os.path.join(install, "TCLS")   # the shortcut's folder
+        for name, value in (("save_config", lambda **values: saved.update(values)), ("answerable", lambda: True)):
+            self.addCleanup(setattr, collector, name, getattr(collector, name))
+            setattr(collector, name, value)
         made = self.collector(league_dir=None)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            made.ask_for_folder()
+            made.offer_folder()
+            self.assertTrue(made.take_folder('"%s"' % os.path.join(install, "TCLS")))      # the shortcut's folder
         self.assertIn("Open file location", output.getvalue())
         self.assertIn("打开文件所在的位置", output.getvalue())
-        self.assertEqual(saved, {"league_dir": os.path.join(install, "TCLS")})
-        self.assertEqual(made.opts.league_dir, os.path.join(install, "TCLS"))
+        self.assertEqual(saved, {"league_dir": install})
+        self.assertEqual(made.opts.league_dir, install)
         self.assertEqual(collector.lockfile_paths(made.opts.league_dir)[0],
                          [os.path.join(install, "LeagueClient", "lockfile")])
 
@@ -690,13 +693,12 @@ class PlainLcu(collector.Lcu):
 
 
 class ClientPrograms(CollectorCase):
-    """The Tencent client: its lockfile has one field, so the port and password come from
+    """The Tencent client: its lockfile is empty, so the port and password come from
     LeagueClientUx's command line. Windows' list of running programs is pretend here."""
 
     def setUp(self):
         super().setUp()
-        with open(os.path.join(self.league_dir, "lockfile"), "w") as handle:
-            handle.write("12345")
+        open(os.path.join(self.league_dir, "lockfile"), "w").close()      # empty, as the Tencent client leaves it
         self.client = self.fake
         self.programs = {}
         self.start_client(4141, 4242, up=3600)
@@ -834,7 +836,7 @@ class StubServer:
     def call(self, method, path, payload=None, timeout=30):
         self.told = (self.state, self.detail)
         self.calls.append((path, self.state, self.detail))
-        return 200, {"enabled": True}, 0
+        return 200, {"enabled": True} if path == "/v1/policy" else {"games": [], "players": [], "wait": 600}, 0
 
 
 class AdminRights(CollectorCase):
@@ -1020,6 +1022,244 @@ class AdminRights(CollectorCase):
         self.saved = {"admin": True}
         self.main_with({"admin": True}, "--no-admin")
         self.assertEqual(self.saved, {})
+
+
+def make_shortcut(path, target=None, start_in=None):
+    """A Windows shortcut (.lnk) as Windows writes one: the target's path in its LinkInfo (as Unicode), and/or a
+    'Start in' folder."""
+    flags = 0x80 | (0x02 if target else 0) | (0x10 if start_in else 0)
+    data = (76).to_bytes(4, "little") + bytes(16) + flags.to_bytes(4, "little") + bytes(52)
+    if target:
+        wide = target.encode("utf-16-le") + b"\0\0"
+        volume = (16).to_bytes(4, "little") + bytes(12)
+        offsets = [0x24, 0x24 + 16, 0, 0x24 + 17, 0x24 + 18, 0x24 + 18 + len(wide)]   # volume, path, -, suffix ...
+        body = volume + b"\0" + b"\0" + wide + b"\0\0"
+        head = (0x24 + len(body)).to_bytes(4, "little") + (0x24).to_bytes(4, "little") + (1).to_bytes(4, "little")
+        data += head + b"".join(offset.to_bytes(4, "little") for offset in offsets) + body
+    if start_in:
+        data += len(start_in).to_bytes(2, "little") + start_in.encode("utf-16-le")
+    with open(path, "wb") as handle:
+        handle.write(data + bytes(4))
+
+
+class PastedFolders(unittest.TestCase):
+    """Whatever form a helper pastes League's place in, it leads to the install."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.install = os.path.join(self.root, "WeGameApps", "英雄联盟（含经典模式）")
+        for folder, program in (("LeagueClient", "LeagueClient.exe"), ("LeagueClient", "LeagueClientUx.exe"),
+                                ("Game", "League of Legends.exe"), ("Launcher", "Client.exe")):
+            os.makedirs(os.path.join(self.install, folder), exist_ok=True)
+            open(os.path.join(self.install, folder, program), "w").close()
+        open(os.path.join(self.install, "LeagueClient", "lockfile"), "w").close()
+
+    def found(self, text):
+        return collector.find_install(text)
+
+    def test_the_install_a_folder_in_it_or_a_folder_one_or_two_above_it(self):
+        # Why: a helper whose paste is not understood cannot collect, and most will not try twice.
+        for place in (self.install, os.path.join(self.install, "LeagueClient"), os.path.join(self.install, "Game"),
+                      os.path.join(self.install, "Launcher"), os.path.join(self.root, "WeGameApps"), self.root):
+            self.assertEqual(self.found(place), (self.install, None), place)
+
+    def test_only_league_named_folders_with_leagues_files_are_found_below(self):
+        # Why: a folder that merely looks like League's must never be taken for it.
+        other = os.path.join(self.tmp.name, "other")
+        for name in ("英雄联盟", "LOL", "League of Legends", "Lollipop"):
+            os.makedirs(os.path.join(other, name, "LeagueClient"))
+        open(os.path.join(other, "LOL", "LeagueClient", "LeagueClient.exe"), "w").close()      # only LOL has a file
+        open(os.path.join(other, "Lollipop", "LeagueClient", "LeagueClient.exe"), "w").close()
+        self.assertEqual(self.found(other), (os.path.join(other, "LOL"), None))
+
+    def test_a_file_in_it(self):
+        # Why: "Open file location" and copying a program's path give a file, not a folder.
+        for name in ("LeagueClient/LeagueClient.exe", "LeagueClient/LeagueClientUx.exe", "Game/League of Legends.exe",
+                     "Launcher/Client.exe", "LeagueClient/lockfile"):
+            self.assertEqual(self.found(os.path.join(self.install, *name.split("/"))), (self.install, None), name)
+
+    def test_quotes_spaces_trailing_slashes_addresses_and_full_width_signs(self):
+        # Why: "Copy as path" adds quotes, browsers give file:/// addresses, Chinese keyboards type full-width signs.
+        place = os.path.join(self.install, "Launcher")
+        for text in ('"%s"' % place, "'%s'" % place, "\u201c%s\u201d" % place, "\u300c%s\u300d" % place,
+                     "  %s \u3000" % place, place + "/", place + "//", "file://" + place,
+                     "file://" + urllib.parse.quote(place), "file://localhost" + place, place.replace("/", "\uff0f")):
+            self.assertEqual(self.found(text), (self.install, None), text)
+        self.assertEqual(collector.half_width("\uff24\uff1a\u3001WeGameApps\u3001英雄联盟（含经典模式）"),
+                         "D:\\WeGameApps\\英雄联盟（含经典模式）")             # the folder's own brackets are kept
+        self.assertEqual(collector.half_width("\uff37\uff45\uff27\uff41\uff4d\uff45", everything=True), "WeGame")
+        self.assertEqual(collector.clean_pasted("file:///D:/WeGameApps/%E8%8B%B1%E9%9B%84%E8%81%94%E7%9B%9F"),
+                         "D:/WeGameApps/英雄联盟")
+        for drive in ("D:", "d:", "D:\\", "D:/", '"D:"'):
+            self.assertEqual(collector.clean_pasted(drive), drive.strip('"')[:2] + "\\", drive)       # a bare drive
+
+    @unittest.skipUnless(os.name == "nt", "Windows' own slashes and drives")
+    def test_back_and_forward_slashes_and_a_bare_drive(self):
+        # Why: people paste either slash, trailing ones, and a drive alone, on Windows.
+        for text in (self.install.replace("/", "\\"), self.install.replace("\\", "/"), self.install + "\\",
+                     self.install + "\\\\"):
+            self.assertEqual(os.path.normcase(self.found(text)[0]), os.path.normcase(self.install), text)
+        self.assertEqual(os.path.normpath(collector.clean_pasted("C:")), "C:\\")
+
+    def test_a_shortcut(self):
+        # Why: the League shortcut on the desktop is what most helpers have at hand.
+        target = os.path.join(self.root, "to-client.lnk")
+        make_shortcut(target, target=os.path.join(self.install, "Launcher", "Client.exe"))
+        self.assertEqual(self.found(target), (self.install, None))
+        start_in = os.path.join(self.root, "start-in.lnk")
+        make_shortcut(start_in, start_in=os.path.join(self.install, "Launcher"))
+        self.assertEqual(self.found('"%s"' % start_in), (self.install, None))
+        broken = os.path.join(self.root, "broken.lnk")
+        with open(broken, "wb") as handle:
+            handle.write(b"not a shortcut")
+        self.assertEqual(self.found(broken), (None, "shortcut"))
+
+    def test_a_place_without_league(self):
+        # Why: a wrong folder must be said to be wrong, never taken as League's.
+        os.makedirs(os.path.join(self.root, "Music", "Songs"))
+        for text in (os.path.join(self.root, "Music"), os.path.join(self.root, "nothing-here"), "", "   "):
+            self.assertEqual(self.found(text), (None, "nowhere"), text)
+
+
+class Lockfiles(CollectorCase):
+    def test_only_the_league_clients_lockfile_is_used(self):
+        # Why: the Tencent client's empty lockfile and the Riot Client's lockfile must each be told apart, and the
+        # Riot Client's must never be taken for a League client waiting for a login.
+        path = os.path.join(self.tmp.name, "lockfile")
+        for text, code in (("", "empty"), ("Riot Client:9:5555:abc:https", "riotclient"), ("12345", "badfile"),
+                           ("LeagueClient:9:notaport:abc:https", "badfile")):
+            with open(path, "w") as handle:
+                handle.write(text)
+            with self.assertRaises(collector.BadLockfile) as raised:
+                collector.read_lockfile(path)
+            self.assertEqual(raised.exception.code, code, text)
+            self.assertEqual(collector.failure_code(raised.exception), code)
+        with open(path, "w") as handle:
+            handle.write("LeagueClient:9:5555:abc:https")
+        self.assertEqual(collector.read_lockfile(path).base, "https://127.0.0.1:5555")
+
+    def test_a_refusal_with_403_is_not_taken_for_a_login_wait(self):
+        # Why: China's anti-cheat may refuse unknown programs with 403; telling the helper to log in would mislead.
+        self.fake.fail = lambda path: 403 if path == "/lol-summoner/v1/current-summoner" else None
+        seen = []
+        made = self.collector(minutes=1)
+        made.heartbeat = lambda state, detail="": seen.append(detail)
+        self.output = io.StringIO()
+        with contextlib.redirect_stdout(self.output):
+            made.run()
+        self.assertNotIn("Waiting for you to log in", self.output.getvalue())
+        self.assertIn("lock_forbidden", seen[-1])
+
+
+class DefaultSearch(unittest.TestCase):
+    """Where the collector looks for League by itself."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def make(self, *parts, program="LeagueClient/LeagueClient.exe"):
+        folder = os.path.join(self.tmp.name, *parts)
+        if program:
+            os.makedirs(os.path.join(folder, os.path.dirname(program)), exist_ok=True)
+            open(os.path.join(folder, *program.split("/")), "w").close()
+        else:
+            os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def test_the_usual_places_on_each_drive(self):
+        # Why: most Chinese installs sit in one of these places; missing them leaves the helper to find it alone.
+        wanted = {self.make("WeGameApps", "英雄联盟（含经典模式）"), self.make("英雄联盟(26)", program="TCLS/Client.exe"),
+                  self.make("Program Files (x86)", "腾讯游戏", "英雄联盟", program="Launcher/Client.exe"),
+                  self.make("GameFile", "TencentGames", "英雄联盟", program="Game/League of Legends.exe"),
+                  self.make("Riot Games", "League of Legends", program="LeagueClient.exe")}
+        self.make("WeGameApps", "英雄联盟备份", program=None)                     # no League file in it
+        self.make("Downloads", "英雄联盟")                                         # not a usual place
+        self.assertEqual(set(collector.usual_places([self.tmp.name])), wanted)
+
+    def test_riots_records(self):
+        # Why: Riot's installer says exactly where League is; reading it wrong would hide the install.
+        riot = os.path.join(self.tmp.name, "Riot Games")
+        os.makedirs(os.path.join(riot, "Metadata", "league_of_legends.live"))
+        with open(os.path.join(riot, "Metadata", "league_of_legends.live",
+                               "league_of_legends.live.product_settings.yaml"), "w") as handle:
+            handle.write('product_install_full_path: "D:/Riot Games/League of Legends"\n')
+        with open(os.path.join(riot, "RiotClientInstalls.json"), "w") as handle:
+            json.dump({"associated_client": {"E:/LoL/": "E:/Riot Client/RiotClientServices.exe"},
+                       "rc_default": "C:/Riot Games/Riot Client/RiotClientServices.exe"}, handle)
+        self.assertEqual(collector.riot_records(riot), ["D:/Riot Games/League of Legends", "E:/LoL/"])
+
+
+class FolderLine(CollectorCase):
+    """Windows hides Riot's own client and no lockfile was found: the window takes League's folder, while the
+    collector keeps looking. Never for the Tencent client, whose lockfile cannot help."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(self.league_dir, "lockfile"))
+        self.install = os.path.join(self.tmp.name, "Riot Games", "League of Legends")
+        os.makedirs(self.install)
+        open(os.path.join(self.install, "LeagueClient.exe"), "w").close()
+        self.answers, self.saved, self.hidden, self.programs = [], {}, True, []
+
+        def read_typed():
+            if self.answers and self.clock.now() >= self.answers[0][0]:
+                return self.answers.pop(0)[1]
+            return None
+
+        def running_client_dirs():
+            collector.related_running[:] = self.programs
+            return [None] if self.hidden else []
+        for name, value in (("answerable", lambda: True), ("read_typed", read_typed),
+                            ("save_config", lambda **values: self.saved.update(values)),
+                            ("running_client_dirs", running_client_dirs), ("command_line_logins", lambda: []),
+                            ("scan_drives", lambda roots=None, seconds=0: []), ("is_elevated", lambda: True),
+                            ("game_running", lambda: False)):
+            self.addCleanup(setattr, collector, name, getattr(collector, name))
+            setattr(collector, name, value)
+
+    def test_the_line_is_offered_where_a_folder_can_help(self):
+        # Why: it must reach the helpers it can help, and only them.
+        self.run_collector(minutes=2, league_dir=None)
+        self.assertIn("Or paste the folder League is installed in and press Enter, for example "
+                      "C:\\Riot Games\\League of Legends.", self.output.getvalue())
+        self.assertIn("也可以粘贴英雄联盟的安装文件夹并按回车", self.output.getvalue())
+
+    def test_never_where_a_folder_cannot_help(self):
+        # Why: a folder cannot give the Tencent client's login, and asking for one sends helpers the wrong way.
+        self.hidden = False
+        self.run_collector(minutes=5, league_dir=None)                                     # no League program
+        self.assertNotIn("paste the folder", self.output.getvalue())
+        self.hidden, self.programs = True, ["wegame.exe"]
+        self.run_collector(minutes=2, league_dir=None)                                     # the Tencent client
+        self.assertNotIn("paste the folder", self.output.getvalue())
+
+    def test_a_wrong_folder_keeps_the_line_and_a_right_one_collects_and_says_how(self):
+        # Why: check-ins must go on while the line stands, and the found step must reach ArenaSweats.
+        start = self.clock.now()
+        self.answers = [(start + 30, os.path.join(self.tmp.name, "nothing")), (start + 90, self.install)]
+        self.clock.at(start + 60, lambda: self.fake.write_lockfile(self.install))      # League opens meanwhile
+        server = StubServer()
+        made = self.run_collector(minutes=10, league_dir=None, server=server)
+        text = self.output.getvalue()
+        self.assertIn("No League was found in or near that folder.", text)
+        self.assertIn("League found in %s." % self.install, text)
+        self.assertEqual(self.saved, {"league_dir": self.install})
+        self.assertTrue(made.store is not None)
+        self.assertTrue([call for call in server.calls if call[1] == "client_unreachable"])    # checked in meanwhile
+        self.assertIn("found_typed", [call[2] for call in server.calls])
+
+    def test_how_the_client_was_found_is_said_while_collecting(self):
+        # Why: this shows which of the search's steps installs need, so the search can be fixed where it fails.
+        self.hidden = False
+        self.fake.write_lockfile(self.install)
+        self.addCleanup(setattr, collector, "installed_dirs", collector.installed_dirs)
+        collector.installed_dirs = lambda: [self.install]
+        server = StubServer()
+        self.run_collector(minutes=3, league_dir=None, server=server)
+        self.assertEqual({detail for _, state, detail in server.calls if state == "collecting"}, {"found_usual"})
 
 
 if __name__ == "__main__":

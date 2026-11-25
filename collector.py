@@ -30,9 +30,10 @@ WHAT IT NEVER DOES
     id (the same id that is in your match records; a server with no players
     yet starts from it), short fixed codes for what the collector is doing
     and, when it is not collecting, why (such as paused in champion select, or
-    the client's folder hidden): never a path, a name or an error message;
-    and a few numbers about the collector's own pace (how many requests it
-    made, how many failed, how long the client took to answer: see pace_report).
+    the client's folder hidden) and which step of its own search found the
+    client: never a path, a name or an error message; and a few numbers about
+    the collector's own pace (how many requests it made, how many failed, how
+    long the client took to answer: see pace_report).
   - It keeps the computer awake while it runs (the screen can still turn off),
     and stops a click in its window from freezing it.
   - It installs nothing. Only when Windows hides the League client from it
@@ -49,6 +50,7 @@ import base64
 import calendar
 import contextlib
 import errno
+import glob
 import gzip
 import hashlib
 import http.client
@@ -132,7 +134,8 @@ UPLOAD_BATCH = 20      # matches per upload
 POLICY_SECONDS = 600   # how often to ask the server whether collection should continue
 PACE_SECONDS = 300     # how often ArenaSweats is told a few numbers about this collector's own pace (see pace_report)
 CHANGE_SECONDS = 10    # before collection starts, a change in why it has not is told at once, but not more often
-FOLDER_SECONDS = 120   # an unanswered question for the League folder gives up after this long, and looking goes on
+FOLDER_EXAMPLE = "C:\\Riot Games\\League of Legends"    # the example of a League folder the window shows (a folder
+                                                          # helps only Riot's own client: see Collector.connect)
 TEST_MINUTES = 15      # length of a test run (no upload address set)
 MAX_LCU_BYTES = 8 * 1024 * 1024
 
@@ -257,12 +260,27 @@ class Lcu:
         return status, parse_json(body)
 
 
+class BadLockfile(ValueError):
+    """A lockfile that cannot give the League client's port and password. `code` says which kind (see read_lockfile)."""
+
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code = code
+
+
 def read_lockfile(path):
-    """While it runs, the client keeps a file holding 'name:pid:port:token:protocol'."""
+    """While it runs, the League client keeps a file holding 'LeagueClient:pid:port:token:protocol'. Refused: an
+    empty one (empty: the Tencent client writes it so, 0 bytes), the Riot Client's own (riotclient: a different
+    program, whose password the League client does not take), and any other shape (badfile)."""
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        parts = handle.read().strip().split(":")
-    if len(parts) < 5 or not parts[2].isdigit():
-        raise ValueError("unexpected lockfile format (%d fields)" % len(parts))
+        text = handle.read().strip()
+    parts = text.split(":")
+    if not text:
+        raise BadLockfile("empty", "the lockfile is empty")
+    if parts[0].lower().startswith("riot client"):
+        raise BadLockfile("riotclient", "the Riot Client's lockfile, not the League client's")
+    if parts[0] != "LeagueClient" or len(parts) < 5 or not parts[2].isdigit():
+        raise BadLockfile("badfile", "unexpected lockfile format (%d fields)" % len(parts))
     return Lcu(int(parts[2]), parts[3], "http" if parts[4] == "http" else "https")
 
 
@@ -556,7 +574,7 @@ def installer_dirs():
                     try:
                         with winreg.OpenKey(key, winreg.EnumKey(key, index)) as entry:
                             if any(word in registry_text(entry, "DisplayName").lower() for word in LEAGUE_FOLDER_WORDS):
-                                for field in ("InstallLocation", "DisplayIcon", "UninstallString"):
+                                for field in ("InstallLocation", "InstallSource", "DisplayIcon", "UninstallString"):
                                     folder = folder_in(registry_text(entry, field))
                                     if folder and folder not in dirs:
                                         dirs.append(folder)
@@ -565,42 +583,86 @@ def installer_dirs():
     return dirs
 
 
+# Folders a League install is usually found in, on each of the computer's own drives ("" is a drive's top).
+INSTALL_PARENTS = ("", "WeGameApps", "WeGameApps\\WeGameApps", "WeGame", "Software\\WeGameApps",
+                   "GameFile\\TencentGames", "Program Files", "Program Files (x86)", "腾讯游戏",
+                   "Program Files\\腾讯游戏", "Program Files (x86)\\腾讯游戏", "Tencent", "Program Files\\Tencent",
+                   "Program Files (x86)\\Tencent", "Games", "Riot Games")
+INSTALLS_CHECK = 600    # the usual places are looked through again at most this often (their lockfiles every round)
+_installed = ([], float("-inf"))     # what installed_dirs found last, and when
+
+
 def installed_dirs():
-    """Folders where League is usually installed, for when the running client's path is not available."""
+    """Folders where League is installed, for when the running client's path is not available: from the records
+    Riot's and Tencent's installers keep, and from the usual places on each drive. That reads a few folders on
+    each drive, so it is done again at most every INSTALLS_CHECK seconds."""
+    global _installed
     if sys.platform == "darwin":
         return ["/Applications/League of Legends.app/Contents/LoL"]
     if os.name != "nt":
         return []
+    if time.monotonic() - _installed[1] < INSTALLS_CHECK:
+        return list(_installed[0])
     dirs = []
-    # Riot's installer records the folder in this file.
-    settings = os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "Riot Games", "Metadata",
-                            "league_of_legends.live", "league_of_legends.live.product_settings.yaml")
+    riot = os.path.join(os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "Riot Games")
+    for folder in riot_records(riot) + tencent_records() + usual_places(fixed_drives()):
+        folder = os.path.normpath(folder.strip()) if folder.strip() else None
+        if folder and folder not in dirs:
+            dirs.append(folder)
+    _installed = (dirs, time.monotonic())
+    return list(dirs)
+
+
+def riot_records(riot):
+    """Installs Riot's installer recorded in its folder `riot` (ProgramData\\Riot Games): the settings file of each
+    League product (live, pbe), and the list of Riot Client installs (other Riot games' folders in it hold no
+    League lockfile, so they cost a look and no more)."""
+    found = []
+    products = os.path.join(glob.escape(riot), "Metadata", "league_of_legends*", "*.product_settings.yaml")
+    for settings in glob.glob(products):
+        try:
+            with open(settings, "r", encoding="utf-8", errors="replace") as handle:
+                place = re.search(r'product_install_full_path:\s*"?([^"\r\n]+)', handle.read())
+            if place:
+                found.append(place.group(1).replace("\\\\", "\\"))
+        except OSError:
+            pass
     try:
-        with open(settings, "r", encoding="utf-8", errors="replace") as handle:
-            found = re.search(r'product_install_full_path:\s*"?([^"\r\n]+)', handle.read())
-        if found:
-            dirs.append(os.path.normpath(found.group(1).strip().replace("\\\\", "\\")))
+        with open(os.path.join(riot, "RiotClientInstalls.json"), "r", encoding="utf-8", errors="replace") as handle:
+            found += [folder for folder in as_dict(as_dict(parse_json(handle.read())).get("associated_client"))
+                      if isinstance(folder, str)]
     except OSError:
         pass
-    # The Chinese (Tencent) installer records the folder in the registry.
+    return found
+
+
+def tencent_records():
+    """Installs Tencent's installer recorded in the registry (Windows only)."""
     try:
         import winreg
-        for root, key in ((winreg.HKEY_CURRENT_USER, r"Software\Tencent\LOL"),
-                          (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tencent\LOL")):
-            try:
-                with winreg.OpenKey(root, key) as opened:
-                    dirs.append(str(winreg.QueryValueEx(opened, "InstallPath")[0]))
-            except OSError:
-                pass
     except ImportError:
-        pass
-    # Common folder names on every drive.
-    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-        if os.path.isdir(letter + ":\\"):
-            for name in (r"Riot Games\League of Legends", "WeGameApps\\英雄联盟", "英雄联盟",
-                         "腾讯游戏\\英雄联盟", "Program Files\\腾讯游戏\\英雄联盟"):
-                dirs.append(letter + ":\\" + name)
-    return dirs
+        return []
+    found = []
+    for root, key, name in ((winreg.HKEY_CURRENT_USER, r"Software\Tencent\LOL", "InstallPath"),
+                            (winreg.HKEY_CURRENT_USER, r"Software\Tencent\LOL", "setup"),
+                            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tencent\LOL", "InstallPath"),
+                            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tencent\LOL", "InstallPath")):
+        try:
+            with winreg.OpenKey(root, key) as opened:
+                value = registry_text(opened, name)
+        except OSError:
+            continue
+        if name == "setup":                         # <install>\TCLS\Client.exe: the install is one folder up
+            value = ntpath.dirname(folder_in(value) or "")
+        found.append(value)
+    return found
+
+
+def usual_places(drives):
+    """League installs in the usual places (INSTALL_PARENTS) on `drives`: a folder named as league_name, confirmed
+    by one of League's files."""
+    return [folder for drive in drives for parent in INSTALL_PARENTS
+            for folder in installs_in(os.path.join(drive, *parent.split("\\")))]
 
 
 def fixed_drives():
@@ -674,10 +736,172 @@ def existing_lockfiles(*groups):
     return paths
 
 
+QUOTES = "\"'“”‘’「」『』"     # straight, curly and Chinese corner quotes
+
+
+def clean_pasted(text):
+    """What someone pasted, as a path: spaces and quotes around it removed (also full-width ones), a file:///
+    address (plain or %-encoded) turned into the path it names, and a bare drive (D:) into that drive's top
+    (D:\\). Slashes and trailing slashes are left to normpath."""
+    text = (text or "").strip().strip("\u3000").strip(QUOTES).strip()
+    if text.lower().startswith("file:"):
+        text = urllib.parse.unquote(re.sub(r"^file:(//(localhost)?)?/*", "", text, flags=re.I))
+        if not re.match(r"[A-Za-z]:", text) and os.name != "nt":
+            text = "/" + text                       # file:///home/... elsewhere than Windows
+    if re.fullmatch(r"[A-Za-z]:[\\/]?", text):
+        text = text[:2] + "\\"
+    return text
+
+
+def half_width(text, everything=False):
+    """Signs typed by accident with a Chinese keyboard, as the ordinary ones: full-width slashes and colons, a
+    full-width drive letter (Ｄ：＼), and the Chinese enumeration comma (、), which that keyboard types for a
+    backslash. Other full-width characters are kept, since folder names have them (英雄联盟（含经典模式）),
+    unless `everything`."""
+    text = text.replace("\u3001", "\\")
+    if everything:
+        return "".join(chr(ord(char) - 0xFEE0) if "\uff01" <= char <= "\uff5e" else char for char in text)
+    text = text.replace("\uff3c", "\\").replace("\uff0f", "/").replace("\uff1a", ":")
+    if text[:2] and "\uff21" <= text[0] <= "\uff5a" and text[1] == ":":
+        text = chr(ord(text[0]) - 0xFEE0) + text[1:]
+    return text
+
+
+def shortcut_places(path):
+    """The places a Windows shortcut (.lnk) names that exist, read from the file itself (no other program needed):
+    its target, then its 'Start in' folder. None when it cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(1 << 20)
+        flags = int.from_bytes(data[20:24], "little")
+        unicode = bool(flags & 0x80)
+        at = 76                                                     # after the header
+        if flags & 0x01:                                            # a list of shell items: skipped
+            at += 2 + int.from_bytes(data[at:at + 2], "little")
+        found = []
+        if flags & 0x02:                                            # where the target is (LinkInfo)
+            info = data[at:at + int.from_bytes(data[at:at + 4], "little")]
+            header = int.from_bytes(info[4:8], "little")
+            if int.from_bytes(info[8:12], "little") & 0x01:          # on a local drive
+                if header >= 0x24:
+                    start = end = int.from_bytes(info[28:32], "little")
+                    while info[end:end + 2] not in (b"\0\0", b""):     # two bytes a character, up to a 0
+                        end += 2
+                    found.append(info[start:end].decode("utf-16-le"))
+                else:
+                    start = int.from_bytes(info[16:20], "little")
+                    found.append(info[start:info.index(b"\0", start)].decode("mbcs" if os.name == "nt" else "utf-8"))
+            at += len(info)
+        for bit in (0x04, 0x08, 0x10):                              # name, relative path, 'Start in' folder
+            if flags & bit:
+                count = int.from_bytes(data[at:at + 2], "little")
+                size = count * 2 if unicode else count
+                text = data[at + 2:at + 2 + size].decode("utf-16-le" if unicode else "mbcs" if os.name == "nt"
+                                                          else "utf-8")
+                at += 2 + size
+                if bit == 0x10:
+                    found.append(text)
+    except (OSError, ValueError, IndexError, LookupError):
+        return None
+    return [place for place in found if place and os.path.exists(place)]
+
+
+# One of these files confirms a League install: a Tencent install has the first ones (older ones TCLS, newer ones
+# Launcher), Riot's own install has LeagueClient.exe at its top.
+LEAGUE_FILES = ("LeagueClient\\LeagueClient.exe", "LeagueClient\\LeagueClientUx.exe", "TCLS\\Client.exe",
+                "Launcher\\Client.exe", "WeGameLauncher\\launcher.exe", "Game\\League of Legends.exe",
+                "LeagueClient.exe")
+
+
+def has_league_files(folder):
+    return any(os.path.isfile(os.path.join(folder, *name.split("\\"))) for name in LEAGUE_FILES)
+
+
+def league_name(name):
+    """A folder name League is installed under: 英雄联盟 and anything after it (英雄联盟(26), 英雄联盟（含经典模式）),
+    LOL or League of Legends."""
+    return name.startswith("英雄联盟") or name.lower() in ("lol", "league of legends")
+
+
+def installs_in(parent):
+    """League installs directly in `parent`: folders with such a name, confirmed by one of League's files."""
+    try:
+        with os.scandir(parent) as entries:
+            names = sorted(entry.name for entry in entries if entry.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
+    return [os.path.join(parent, name) for name in names
+            if league_name(name) and has_league_files(os.path.join(parent, name))]
+
+
+def installs_below(folder):
+    """League installs one or two folders below `folder`, such as the WeGame library or a drive's top."""
+    found = installs_in(folder)
+    if not found:
+        try:
+            with os.scandir(folder) as entries:
+                children = sorted(entry.path for entry in entries if entry.is_dir(follow_symlinks=False))
+        except OSError:
+            children = []
+        for child in children[:500]:
+            found += installs_in(child)
+    return found
+
+
+def install_root(folder, levels=3):
+    """The League install that `folder` is, or is up to `levels` folders inside: the highest folder that holds one
+    of League's files, or None."""
+    found = None
+    for _ in range(levels + 1):
+        if has_league_files(folder):
+            found = folder
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    return found
+
+
+def find_install(text, look_below=True):
+    """The League install someone pasted the place of: the install folder, a folder inside it, a folder one or two
+    levels above it (such as the WeGame library or a drive), a file in it (LeagueClient.exe, the game, the
+    launcher's Client.exe, the lockfile) or a shortcut to one, with or without quotes, either slash, trailing
+    slashes, a file:/// address, a bare drive or full-width characters. Returns (folder, None), or (None, why):
+    "shortcut" (one that cannot be read) or "nowhere". `look_below`: also look one or two folders down."""
+    def install_at(place):
+        if os.path.isfile(place):
+            place = os.path.dirname(place)
+        if not os.path.isdir(place):
+            return None
+        folder = install_root(place)
+        if folder is None and look_below:                   # a folder above the install
+            below = installs_below(place)
+            running = [found for found in below if existing_lockfiles(([found], 0))]
+            folder = (running or below or [None])[0]
+        return folder
+    tried = []
+    for place in (clean_pasted(text), half_width(clean_pasted(text)), half_width(clean_pasted(text), everything=True)):
+        place = os.path.normpath(place) if place else place
+        if not place or place in tried:
+            continue
+        tried.append(place)
+        if place.lower().endswith(".lnk") and os.path.isfile(place):
+            places = shortcut_places(place)
+            if not places:
+                return None, "shortcut"
+            folder = next((found for found in map(install_at, places) if found), None)
+            return (folder, None) if folder else (None, "nowhere")
+        folder = install_at(place)
+        if folder:
+            return folder, None
+    return None, "nowhere"
+
+
 def given_folder(league_dir):
-    """A folder typed in by the user: quotes removed, and a file path turned into its folder."""
-    league_dir = (league_dir or "").strip().strip('"')
-    return os.path.dirname(league_dir) if os.path.isfile(league_dir) else league_dir
+    """The install for a folder typed in by the user (see find_install, without looking below), or the folder as
+    typed when it does not lead to one (League's files may not be there yet)."""
+    folder, _ = find_install(league_dir, look_below=False)
+    return folder or os.path.normpath(half_width(clean_pasted(league_dir)))
 
 
 def lockfile_paths(league_dir=None):
@@ -686,13 +910,26 @@ def lockfile_paths(league_dir=None):
     Returns (paths, client_running, hidden): whether a League client program is running,
     and whether Windows would not say where it is installed."""
     running = running_client_dirs()
-    given = [given_folder(league_dir)] if league_dir else []
-    groups = [(given, 2), ([folder for folder in running if folder], 0), (installer_dirs(), 2), (installed_dirs(), 0)]
-    paths = existing_lockfiles(*groups)
+    found_by.clear()
+    for step, folders, parents in (("running", [folder for folder in running if folder], 0),
+                                   ("installer", installer_dirs(), 2), ("usual", installed_dirs(), 0)):
+        for path in existing_lockfiles((folders, parents)):
+            found_by.setdefault(path, step)
+    typed = existing_lockfiles(([given_folder(league_dir)] if league_dir else [], 2))
+    paths = typed + [path for path in found_by if path not in typed]       # the folder typed in first
+    for path in typed:
+        found_by.setdefault(path, "typed")
     if running and not paths:
         paths = existing_lockfiles((scan_drives(), 0))
+        for path in paths:
+            found_by.setdefault(path, "scan")
     note("lockfile search", "found: %s" % (paths or "none"))
     return paths, bool(running), None in running
+
+
+found_by = {}   # lockfile -> which step of the search found it, when the folder typed in was not needed for it:
+                # running (the running client's folder), installer (Windows' list of installed programs), usual (a
+                # usual place), scan (the drives searched), or typed (only the folder typed in led to it)
 
 
 # ---------------------------------------------------------------------------
@@ -1389,8 +1626,11 @@ class Server:
 # ---------------------------------------------------------------------------
 def failure_code(error):
     """A try at reaching the client that failed: refused (nothing listens on its port, as with a lockfile left
-    over from an earlier start), reset, tls, denied (Windows would not let the file be read), gone, badfile (a
-    lockfile that does not hold a port and password, as the Tencent client's), or oserror / failed."""
+    over from an earlier start), reset, tls, denied (Windows would not let the file be read), gone, a lockfile
+    that cannot give a port and password (empty: the Tencent client's; riotclient: the Riot Client's; badfile:
+    another shape), or oserror / failed."""
+    if isinstance(error, BadLockfile):
+        return error.code
     cause = error.__context__ if isinstance(error, ClientGone) else error      # ClientGone keeps only the text
     cause = error_reason(cause) if isinstance(cause, urllib.error.URLError) else cause
     for kind, code in ((ConnectionRefusedError, "refused"), (ConnectionResetError, "reset"), (ssl.SSLError, "tls"),
@@ -1468,7 +1708,7 @@ class Collector:
         self.wrong_records, self.failed_fetches, self.rests = Counter(), Counter(), Counter()   # per match id
         self.rest_until = {}               # match id -> when a match that keeps failing may be tried again
         self.owed = {}                     # match id -> list entry, for matches still to be fetched after a failure
-        self.last_said, self.last_status, self.folder_asks, self.described = None, now(), 0, False
+        self.last_said, self.last_status, self.described = None, now(), False
         self.watch, self.last_lcu = ClientWatch(now, wall), None     # for the log: the client's programs
         self.idle_at = float("-inf")       # last time the client was seen idle
         self.ended = False                 # why it stops has been told to ArenaSweats (tell_end)
@@ -1477,7 +1717,11 @@ class Collector:
         # When Windows hides the client (see admin_round): what to do next (raise: ask Windows for administrator
         # rights; question: put up the question whether to; None: nothing more this run), the code that tells
         # ArenaSweats how that went, and whether the question is up.
-        self.admin_next, self.admin_code, self.standing, self.admin_quiet, self.admin_asks = "raise", "", False, False, 0
+        self.admin_next, self.admin_code, self.admin_quiet, self.admin_asks = "raise", "", False, 0
+        self.standing = None               # the line that stays up for an answer, one at a time: admin (the question
+                                           # whether to ask Windows again) or folder (where League is installed)
+        self.folder_given = False          # a folder typed in this run led to League
+        self.found_code = ""               # which step of the search found the client in use (report_found)
         if self.elevated:
             self.admin_next, self.admin_code = None, "admin"
         elif self.elevated is None or getattr(opts, "elevated", False):
@@ -1594,6 +1838,7 @@ class Collector:
             for path in paths:
                 by_lockfile.append(self.try_client(path, lambda path=path: read_lockfile(path)))
                 if by_lockfile[-1] == "connected":
+                    self.report_found(found_by.get(path, "typed"))
                     return self.drop_question()
             answered = any(result.startswith("login") for result in by_lockfile)
             if running and not answered:
@@ -1601,6 +1846,7 @@ class Collector:
                 for login in command_line_logins():         # (port, password, protocol)
                     by_command_line.append(self.try_client("the client's command line", lambda login=login: Lcu(*login)))
                     if by_command_line[-1] == "connected":
+                        self.report_found("cmdline")
                         return self.drop_question()
                 answered = any(result.startswith("login") for result in by_command_line)
             rounds += 1
@@ -1622,13 +1868,13 @@ class Collector:
                               "已找到英雄联盟客户端，等待你登录。"), once=True)
             elif running:
                 # Windows keeps a normal program away from a client that runs as administrator: it will not say
-                # where the client is, or (the Tencent client, whose lockfile holds no password) how to log in to it.
-                tencent_lockfile = "badfile" in by_lockfile
+                # where the client is, or (the Tencent client, whose lockfile is empty) how to log in to it.
+                tencent_lockfile = any(code in ("empty", "badfile") for code in by_lockfile)
                 needs_admin = hidden or (tencent_lockfile and not by_command_line)
                 if not needs_admin or self.elevated:
                     self.say(both("The League client is open, but the collector cannot reach it yet. It keeps trying.",
                                   "英雄联盟客户端已打开，但采集器暂时连接不上它，正在继续尝试。"), once=True)
-                elif self.admin_next or self.standing:
+                elif self.admin_next or self.standing == "admin":
                     if rounds >= 2:         # a moment later: a client that is still starting can look the same
                         self.admin_round(state, steps)      # on a yes to Windows, a new copy takes over
                 elif not self.admin_quiet:  # nothing more it can do itself this run: say what would help
@@ -1637,10 +1883,13 @@ class Collector:
                                   "and choose 'Run as administrator'.",
                                   "英雄联盟以管理员身份运行，所以 Windows 不让采集器看到它。\n         "
                                   "要开始采集：请关闭此窗口，右键点击采集器，选择“以管理员身份运行”。"), once=True)
-                if (hidden and not tencent_lockfile and rounds >= 2 and self.folder_asks < 3 and not self.standing
-                        and self.admin_next is None and sys.stdin and sys.stdin.isatty()):
-                    self.ask_for_folder()
-                    continue
+                # A folder can lead to the client only where Windows hides where the client is and no lockfile
+                # was found, and only for Riot's own client: the Tencent client's lockfile is empty, so its
+                # folder cannot help (it is known by its lockfile, or by WeGame or TCLS running).
+                tencent = tencent_lockfile or any(word in name.lower() for name in related_running
+                                                  for word in ("wegame", "tcls"))
+                if hidden and not by_lockfile and not tencent and rounds >= 2 and self.admin_next is None:
+                    self.offer_folder()
             else:
                 self.say(both("Waiting for the League client. Open League and log in.",
                               "正在等待英雄联盟客户端。请打开英雄联盟并登录。"), once=True)
@@ -1656,7 +1905,7 @@ class Collector:
         answered: Windows is not asked again by itself in this run; instead a question stays up, "Ask Windows
         again? [Y/n]", while the collector keeps looking and checking in (wait_round reads the answer). As
         administrator it makes exactly the same requests."""
-        if self.standing:
+        if self.standing == "admin":
             return
         if self.admin_next == "question":       # Windows was asked at start already
             self.admin_next = None
@@ -1709,38 +1958,87 @@ class Collector:
         """Put up the question whether to ask Windows again; it stays up, without a time limit (wait_round)."""
         print("The collector needs administrator rights to keep collecting, because Windows hides League. "
               "Ask Windows again? [Y/n]")
-        sys.stdout.write("采集器需要管理员权限才能继续采集，因为 Windows 不让它看到英雄联盟。要再请 Windows 试一次吗？[Y/n] ")
-        sys.stdout.flush()
-        self.standing = True
+        print("采集器需要管理员权限才能继续采集，因为 Windows 不让它看到英雄联盟。要再请 Windows 试一次吗？[Y/n]")
+        typed.clear()                       # it takes the place of the folder line, if that was up
+        self.standing = "admin"
 
     def wait_round(self, seconds):
-        """Wait before looking for the client again. While the question is up, its answer is taken within a
-        second, and a yes asks Windows straight away."""
+        """Wait before looking for the client again. While a line is up for an answer, the answer is taken within
+        a second: a yes to Windows' question asks Windows straight away, and a folder that leads to League is
+        looked at straight away."""
         for _ in range(int(seconds)):
             if self.standing:
                 answer = read_typed()
-                if answer is not None:
-                    self.standing = False
+                if answer is not None and self.standing == "admin":
+                    self.standing = None
                     if answer.strip().lower() in ("", "y", "yes", "是"):
                         self.admin_next = "raise"
                         return
                     self.admin_code, self.admin_quiet = "admin_no", True
                     print(both("OK. It will ask again the next time it is started.", "好的。下次启动时会再问。", 0))
+                elif answer is not None and self.take_folder(answer):
+                    return
             self.sleep(1)
 
     def drop_question(self):
-        """The client can be reached after all: the question, if it is up, is no longer needed."""
-        if self.standing:
-            self.standing = False
-            typed.clear()
-            print()
+        """The client can be reached: the line that was up for an answer, if any, is no longer needed."""
+        if self.standing == "admin":
             self.say(both("The collector can reach League now, so there is no need to answer.",
                           "采集器现在能连接到英雄联盟了，不用再回答。"))
+        self.standing = None
+        typed.clear()
+
+    def offer_folder(self):
+        """Put up a line that takes League's folder, where that can lead to the client (see connect). It stays up
+        while the collector keeps looking and checking in; an answer is optional (wait_round reads it). Only one
+        line is up at a time, only when somebody can type, and not again once a folder led to League."""
+        if self.standing or self.folder_given or not answerable():
+            return
+        print(both("Or paste the folder League is installed in and press Enter, for example " + FOLDER_EXAMPLE
+                   + ".\nTo find it: right-click your League shortcut and choose 'Open file location'.",
+                   "也可以粘贴英雄联盟的安装文件夹并按回车，例如 " + FOLDER_EXAMPLE + "。\n"
+                   "查找方法：右键点击英雄联盟的快捷方式，选择“打开文件所在的位置”。", 0))
+        typed.clear()
+        self.standing = "folder"
+
+    def take_folder(self, answer):
+        """An answer to the folder line. True when it leads to a League install (the line goes); otherwise one
+        line says why and the line stays."""
+        if not answer.strip():
+            return False
+        folder, problem = find_install(answer)
+        if problem == "shortcut":
+            print(both("That is a shortcut that cannot be read. Paste the folder instead: right-click the shortcut "
+                       "and choose 'Open file location'.",
+                       "这是一个无法读取的快捷方式。请改为粘贴文件夹：右键点击快捷方式，选择“打开文件所在的位置”。", 0))
+            return False
+        if folder is None:
+            print(both("No League was found in or near that folder. Paste another one, or leave it: the collector "
+                       "keeps looking.",
+                       "在该文件夹及附近没有找到英雄联盟。可以再粘贴一个文件夹，或者不用管：采集器会继续查找。", 0))
+            return False
+        log.info("folder given: %s", folder)
+        self.standing, self.folder_given = None, True
+        self.opts.league_dir = folder
+        save_config(league_dir=folder)
+        if existing_lockfiles(([folder], 2)):
+            print(both("League found in %s." % folder, "已在 %s 找到英雄联盟。" % folder, 0))
+        else:
+            print(both("That is League's folder, but League is not running from it. Open League and log in; the "
+                       "collector keeps looking there.",
+                       "这是英雄联盟的文件夹，但英雄联盟没有从这里运行。请打开英雄联盟并登录，采集器会继续在这里查找。", 0))
+        return True
+
+    def report_found(self, step):
+        """Note which step of the search found the client in use, sent with the state while it collects (found_ and
+        running, installer, usual, scan, cmdline or typed), so it is known what real installs need. No path."""
+        self.found_code = "found_" + step
+        self.set_state("collecting", self.found_code)
 
     def try_client(self, where, make):
         """Try one way of reaching the client. Returns "connected" (and in use), "login" and the status the
-        client answered with when nobody is logged in yet (such as login404), or why it could not be reached
-        (see failure_code)."""
+        client answered with when nobody is logged in yet (such as login404), forbidden (it answered 403), or why
+        it could not be reached (see failure_code)."""
         try:
             lcu = make()
             status, me = lcu.get("/lol-summoner/v1/current-summoner")
@@ -1753,34 +2051,9 @@ class Collector:
             return "connected"
         log.info("client via %s not ready: status %s, player id %s", where, status,
                  "missing" if not puuid else "in an unexpected format")
+        if status == 403:           # not a client waiting for a login: something refuses this program (China's
+            return "forbidden"      # anti-cheat may answer so to programs it does not know; unconfirmed)
         return "login%d" % status
-
-    def ask_for_folder(self):
-        """Ask where League is installed, when the client is open but Windows will not say where. Nobody may be at
-        the PC, so after FOLDER_SECONDS without an answer it carries on looking (and checking in) by itself."""
-        self.folder_asks += 1
-        print(both("Or tell the collector the folder League is installed in: right-click your League shortcut and "
-                   "choose 'Open file location'.",
-                   "也可以告诉采集器英雄联盟的安装文件夹：右键点击英雄联盟的快捷方式，选择“打开文件所在的位置”。", 0))
-        set_quick_edit(True)            # so the folder can be pasted with a right-click
-        try:
-            answer = timed_input("Paste the folder and press Enter / 粘贴文件夹路径后按回车: ", FOLDER_SECONDS)
-        except EOFError:
-            self.folder_asks = 3
-            return
-        finally:
-            set_quick_edit(False)
-        if answer is None:
-            print("No answer: the collector keeps looking. 无人回答：采集器继续查找。")
-            return
-        folder = given_folder(answer)
-        if folder and existing_lockfiles(([folder], 2)):
-            log.info("folder given: %s", folder)
-            self.opts.league_dir = folder
-            save_config(league_dir=folder)
-        elif folder:
-            print(both("No League client was found in or near that folder. Check the client is open and logged in.",
-                       "在该文件夹及附近没有找到英雄联盟客户端。请确认客户端已打开并已登录。", 0))
 
     def use_client(self, lcu, puuid, path):
         self.lcu = lcu
@@ -2254,7 +2527,7 @@ class Collector:
         """Return only when collecting is allowed: you are not playing and ArenaSweats has not switched it off."""
         while True:
             self.wait_until_idle()
-            self.set_state("collecting" if self.enabled else "switched_off")
+            self.set_state(*(("collecting", self.found_code) if self.enabled else ("switched_off",)))
             if self.server and self.now() - self.policy_at >= POLICY_SECONDS:
                 self.refresh_policy()
                 continue                # that took a moment, so look at the client again
