@@ -48,6 +48,8 @@ GAMES_PER_DAY = 220000           # per key; fast mode's floor (0.4 s between req
                                  # 216,000 a day, plus a held-back outbox (measured: ~100k in fast mode, ~30k normally)
 SIGNUPS_PER_ADDRESS = 10         # new installs one internet address can sign up a day (many homes in China share one)
 SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close with: policy --signups off)
+MAX_PACE_BYTES = 600             # a collector's few numbers about its own pace (see note_pace)
+KEEP_PACE_DAYS = 14              # ... are kept this long
 ARENA_MODES = {"CHERRY"}
 DEFAULT_SEASON_START = "2026-10-06"   # UTC. Change with: ingest.py policy --season-start YYYY-MM-DD
 DEFAULT_FAST_DELAY = 0.4         # fast mode's shortest gap between requests, s. Change with: policy --fast-delay S
@@ -91,6 +93,10 @@ CREATE TABLE IF NOT EXISTS signups(at INTEGER NOT NULL, address TEXT NOT NULL);
 -- When each install last got in touch, and what it said it was doing (collecting, paused, ...).
 CREATE TABLE IF NOT EXISTS contributor_seen(
     contributor_id INTEGER PRIMARY KEY, seen_at INTEGER NOT NULL, state TEXT NOT NULL, version TEXT NOT NULL);
+-- What installs say about their own pace, every few minutes while they collect (see note_pace).
+CREATE TABLE IF NOT EXISTS contributor_pace(
+    contributor_id INTEGER NOT NULL, at INTEGER NOT NULL, version TEXT NOT NULL, report TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS contributor_pace_by_time ON contributor_pace(at);
 CREATE TABLE IF NOT EXISTS contributors(
     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, key_hash TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0);
@@ -356,6 +362,48 @@ def check_key():
             return fail(429, "too many requests", **{"Retry-After": "60"})
         times.append(now)
     note_seen(g.db, row[0], now)
+    return None
+
+
+PACE_COUNTS = ("seconds", "requests", "failed", "refused", "paused", "rested", "idle", "expired", "fast", "flight", "most")
+PACE_TIMES = ("top", "page", "match", "calls")       # each: [how many, the middle answer time, a slow one], in ms
+
+
+def clean_pace(text):
+    """A collector's numbers about its own pace (collector.py, pace_report) as a dict, or None when they are not
+    usable. Only the names above are kept, and only whole numbers."""
+    if len(text) > MAX_PACE_BYTES:
+        return None
+    try:
+        sent = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(sent, dict):
+        return None
+    report = {name: sent[name] for name in PACE_COUNTS if is_int(sent.get(name), 0, 10 ** 9)}
+    for name in PACE_TIMES:
+        times = sent.get(name)
+        if isinstance(times, list) and len(times) == 3 and all(is_int(number, 0, 10 ** 9) for number in times):
+            report[name] = times
+    return report or None
+
+
+@app.before_request
+def note_pace():
+    """Keep the numbers a collector sends about its own pace with one request every few minutes
+    (X-Collector-Pace), so we can see where its time goes: `ingest.py pace` shows them."""
+    text = request.headers.get("X-Collector-Pace")
+    report = clean_pace(text) if text and "contributor" in g else None
+    if report is None:
+        return None
+    agent = request.headers.get("User-Agent", "")
+    version = agent.split("/", 1)[1] if agent.startswith("arenasweats-collector/") else ""
+    version = version if re.fullmatch(r"[0-9A-Za-z.+-]{1,20}", version) else ""
+    now = int(clock())
+    with g.db:
+        g.db.execute("DELETE FROM contributor_pace WHERE at < ?", (now - KEEP_PACE_DAYS * 86400,))
+        g.db.execute("INSERT INTO contributor_pace VALUES(?, ?, ?, ?)",
+                     (g.contributor, now, version, json.dumps(report, sort_keys=True)))
     return None
 
 
@@ -767,6 +815,26 @@ def cmd_keys(db, _args):
             name, "OFF" if disabled else "on", count, when(last), when(seen), state or "", version or ""))
 
 
+def cmd_pace(db, args):
+    """Print the newest numbers installs sent about their own pace, newest first."""
+    rows = db.execute("SELECT p.at, c.name, p.version, p.report FROM contributor_pace p "
+                      "JOIN contributors c ON c.id = p.contributor_id WHERE ? IS NULL OR c.name = ? "
+                      "ORDER BY p.at DESC, p.rowid DESC LIMIT ?", (args.name, args.name, args.last)).fetchall()
+    for at, name, version, text in rows:
+        report = json.loads(text)
+        count = lambda field: report.get(field, 0)
+        times = lambda field: "%d x %d ms (slow %d)" % tuple(report.get(field, [0, 0, 0]))
+        print("%s %-16s %-7s %s  %d s: %d requests (%d failed, %d refused), %d at once (most %d); "
+              "first pages %s, further pages %s, matches %s; calls to ArenaSweats %s; "
+              "paused %d s, at the normal pace after pushback %d s, nothing to read %d s, %d dropped as too old" % (
+                  time.strftime("%Y-%m-%d %H:%M", time.localtime(at)), name, version, "fast  " if count("fast") else "normal",
+                  count("seconds"), count("requests"), count("failed"), count("refused"), count("flight"), count("most"),
+                  times("top"), times("page"), times("match"), times("calls"),
+                  count("paused"), count("rested"), count("idle"), count("expired")))
+    if not rows:
+        print("No pace numbers received%s." % (" from %s" % args.name if args.name else ""))
+
+
 def cmd_purge(db, args):
     """Remove every match one contributor sent. They become wanted again, so other collectors re-fetch them."""
     with db:
@@ -1014,6 +1082,9 @@ def main(argv=None):
         commands.add_parser(name, help=text).add_argument("name")
     commands.add_parser("keys", help="list contributors")
     commands.add_parser("stats", help="show what is held and what is waiting to be read")
+    pace_parser = commands.add_parser("pace", help="show the numbers installs sent about their own pace")
+    pace_parser.add_argument("name", nargs="?", help="only this contributor's")
+    pace_parser.add_argument("--last", type=int, default=20, help="how many of the newest to show (default 20)")
     policy_parser = commands.add_parser("policy", help="show or change what collectors are told")
     policy_parser.add_argument("--on", dest="enabled", action="store_const", const=1, help="collectors may collect")
     policy_parser.add_argument("--off", dest="enabled", action="store_const", const=0, help="all collectors pause")
@@ -1042,7 +1113,7 @@ def main(argv=None):
         app.run(host="127.0.0.1", port=args.port)
         return 0
     db = connect()
-    handlers = {"add-key": cmd_add_key, "keys": cmd_keys, "purge": cmd_purge, "stats": cmd_stats,
+    handlers = {"add-key": cmd_add_key, "keys": cmd_keys, "purge": cmd_purge, "stats": cmd_stats, "pace": cmd_pace,
                 "policy": cmd_policy, "export": cmd_export, "relay": cmd_relay,
                 "disable-key": lambda d, a: cmd_set_key(d, a, 1), "enable-key": lambda d, a: cmd_set_key(d, a, 0)}
     try:

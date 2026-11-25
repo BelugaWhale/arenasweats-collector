@@ -83,6 +83,12 @@ Trust covers what a match says, not its size or shape:
   with `_fast` added when its user turned the beta fast mode on, such as collecting_fast).
   Collectors check in every 10 minutes even while paused. `ingest.py keys` shows it, and
   `relay status` reports installs seen in the last hour and day by state.
+- Every 5 minutes while it collects, a collector newer than 0.3.7 sends a few numbers about its own pace with
+  one of its requests (`X-Collector-Pace`): how many requests it made to the League client, how many
+  failed or were answered 429, how long the client took to answer (first pages of lists, further pages
+  and matches apart), how long requests to ArenaSweats took, the seconds it was paused, at the normal
+  pace after the client pushed back in fast mode, or had nothing to read, and how many requests fast mode
+  has on their way at once. Nothing but numbers. They are kept for 14 days; `ingest.py pace` shows them.
 
 ## Endpoints
 
@@ -109,6 +115,7 @@ python server/ingest.py policy --fast-flight 2 # fast mode has at most 2 request
 python server/ingest.py policy --signups off  # new installs can no longer get a key
 python server/ingest.py policy --on --delay 3 --message "thanks!"
 python server/ingest.py stats                 # per server: matches held, still to fetch, players to read
+python server/ingest.py pace                  # the newest pace numbers installs sent (pace NAME --last 50: one install's)
 python server/ingest.py export out.jsonl.gz --platform HN1   # records still held here
 python server/ingest.py relay status          # what is waiting for the rankings server, uploads per hour
 python server/ingest.py serve                 # development only

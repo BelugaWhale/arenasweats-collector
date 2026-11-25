@@ -139,6 +139,38 @@ class Keys(ServerCase):
         self.assertEqual(self.db.execute("SELECT state FROM contributor_seen").fetchone()[0], "unknown")
         self.assertEqual(ingest.relay_status(self.db, self.now)["installs_seen"]["last_hour"], {"unknown": 1})
 
+    def test_a_collectors_numbers_about_its_own_pace_are_kept_and_nothing_else(self):
+        # These numbers decide how fast collectors may go; junk in them must neither be stored nor break a request.
+        headers = {"Authorization": "Bearer " + self.key, "User-Agent": "arenasweats-collector/0.3.8"}
+        report = {"seconds": 300, "requests": 700, "failed": 1, "refused": 0, "top": [150, 1600, 1900],
+                  "page": [280, 700, 900], "match": [270, 60, 80], "calls": [60, 950, 1400], "paused": 0, "rested": 0,
+                  "idle": 4, "expired": 0, "fast": 1, "flight": 3, "most": 4}
+        sent = dict(report, name="Somebody#123", top=[150, 1600, "x"], extra={"a": 1})      # only numbers we know stay
+        headers["X-Collector-Pace"] = json.dumps(sent)
+        self.assertEqual(self.client.get("/v1/policy", headers=headers).status_code, 200)
+        kept = dict(report)
+        del kept["top"]
+        row = self.db.execute("SELECT version, report FROM contributor_pace").fetchone()
+        self.assertEqual((row[0], json.loads(row[1])), ("0.3.8", kept))
+        for junk in ("x" * 700, "{", "[1, 2]", '"text"', json.dumps({"requests": "many"}), json.dumps({"requests": -1}),
+                     json.dumps({"requests": 1.5}), json.dumps({"requests": True}), "[" * 500):
+            headers["X-Collector-Pace"] = junk
+            self.assertEqual(self.client.get("/v1/policy", headers=headers).status_code, 200, junk[:20])
+        self.assertEqual(self.count("contributor_pace"), 1)
+        headers["Authorization"] = "Bearer wrong"                          # and never without a key
+        headers["X-Collector-Pace"] = json.dumps(report)
+        self.assertEqual(self.client.get("/v1/policy", headers=headers).status_code, 401)
+        self.assertEqual(self.count("contributor_pace"), 1)
+        shown = self.admin("pace")
+        self.assertIn("alice", shown)
+        self.assertIn("300 s: 700 requests (1 failed, 0 refused), 3 at once (most 4)", shown)
+        self.assertIn("matches 270 x 60 ms (slow 80)", shown)
+        self.assertIn("No pace numbers received from bob.", self.admin("pace", "bob"))
+        self.now += (ingest.KEEP_PACE_DAYS + 1) * 86400                    # old ones go when a new one arrives
+        headers["Authorization"] = "Bearer " + self.key
+        self.client.get("/v1/policy", headers=headers)
+        self.assertEqual(self.count("contributor_pace"), 1)
+
     def test_no_key_or_wrong_key_is_refused(self):
         self.assertEqual(self.client.post("/v1/games", data=b"{}").status_code, 401)
         self.assertEqual(self.client.post("/v1/work", data=b"{}").status_code, 401)
@@ -1522,6 +1554,8 @@ class SeveralAtOnce(WithServer):
         self.run_collector(minutes=11, server=self.server(), fast=True)
         reports = [json.loads(text) for text in seen if text]
         self.assertEqual(len(reports), 2)                                # one every 5 minutes, each sent once
+        self.assertEqual([json.loads(row[0]) for row in self.db.execute(
+            "SELECT report FROM contributor_pace ORDER BY at")], reports)    # and ArenaSweats kept them as sent
         for report in reports:
             self.assertEqual(sorted(report), sorted(["seconds", "requests", "failed", "refused", "top", "page", "match",
                                                      "calls", "paused", "rested", "idle", "expired", "fast", "flight",
