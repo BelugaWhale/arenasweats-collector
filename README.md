@@ -26,11 +26,12 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   about two requests a second, sent without waiting for the last one's answer, so up to four
   can be on their way at once. **BETA: Please only use with unimportant accounts for now.**
   It starts with one request at a time and allows more only while the client keeps answering
-  as quickly as before. A failed request or slower answers mean fewer at once again. An
-  answer of "too many requests", or three failures in a row, bring back the normal pace for
-  an hour. It still never runs while you play: when you queue up it sends nothing more, and
-  drops the requests that are still on their way. ArenaSweats can still slow it down, allow
-  fewer requests at once or switch it off, but can never allow more than four.
+  as quickly as before. Two failed requests within a hundred, or slower answers, mean fewer
+  at once again. An answer of "too many requests", or three failures in a row, bring back
+  the normal pace for an hour. It still never runs while you play: when you queue up it
+  sends nothing more, and drops the requests that are still on their way. ArenaSweats can
+  still slow it down, allow fewer requests at once or switch it off, but can never allow
+  more than four.
 - **Your account stays private.** It never reads or sends your password or login. It sends
   only Arena match results, your player ID, which is already in your match records, and a
   few numbers about its own pace: how many requests it made, how many failed, and how long

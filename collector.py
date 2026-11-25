@@ -89,7 +89,8 @@ FAST_MAX_FLIGHT = 4    # so several can be on their way at once, never more than
 FLIGHT_CLEAN = 50      # this many good answers in a row that the next request was waiting for,
 FLIGHT_HOLD = 600      # but not for this long after trouble took one away (twice as long each time trouble comes
                        # back soon after, up to FAST_REST).
-SLOW_FACTOR = 1.5      # Trouble is a failed request, or answers taking this many times as long as they do one at a time
+FLIGHT_FAILURES = 100  # Trouble is two failed requests within this many (one alone happens one at a time too),
+SLOW_FACTOR = 1.5      # or answers taking this many times as long as they do one at a time
 FLIGHT_WINDOW = 20     # (the middle one of this many answers of the same kind, against that of the last ones sent alone).
 FAST_SPEEDUP = "3"     # matches an hour in fast mode against the normal pace (fake client, real client's answer times)
 FAST_REST = 3600       # in fast mode, a 429 or 3 failed requests in a row bring back the normal pace for this long
@@ -1392,6 +1393,7 @@ class Collector:
         self.flight_hold, self.rise_at = FLIGHT_HOLD, float("-inf")    # after trouble: no more at once before rise_at
         self.eased_at = float("-inf")      # when trouble last took one away
         self.failed_at = float("-inf")     # when a match-history request last failed
+        self.landings, self.failed_landing = 0, float("-inf")      # requests answered; which of them failed last
         kinds = ("top", "page", "match")   # answer times (s) of the last requests of each kind (see request_kind):
         self.alone = {kind: deque(maxlen=FLIGHT_WINDOW) for kind in kinds}      # ... sent with no other on its way,
         self.shared = {kind: deque(maxlen=FLIGHT_WINDOW) for kind in kinds}     # ... and with others on their way
@@ -1826,8 +1828,12 @@ class Collector:
         # Was the next request only waiting for this answer? Then more at once would be used.
         awaited = bool(self.todo) and self.now() >= self.next_allowed and len(self.flying) + 1 >= self.flight_limit
         data = self.answered(job.path, job.started, status, data, gone, flown=True)
+        self.landings += 1
         if data is None and new_trouble:
-            self.ease_off("a request failed")
+            self.clean = 0
+            if self.landings - self.failed_landing <= FLIGHT_FAILURES:
+                self.ease_off("two requests failed within %d" % FLIGHT_FAILURES)
+            self.failed_landing = self.landings
         elif data is not None:
             self.clean += awaited
             (self.alone if job.alone else self.shared)[kind].append(seconds)

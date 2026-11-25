@@ -1498,14 +1498,15 @@ class SeveralAtOnce(WithServer):
         start = self.clock.now()
         failing = {}
         self.fake.fail = lambda path: failing.pop("status", None) if "/matches?" in path else None
-        self.clock.at(start + 400, lambda: failing.update(status=500))
-        self.clock.at(start + 800, lambda: failing.update(status=429))
+        for when, status in ((250, 500), (400, 500), (410, 500), (800, 429)):
+            self.clock.at(start + when, lambda status=status: failing.update(status=status))
         self.clock.at(start + 830, lambda: setattr(self.flights, "most", 0))
         with self.assertLogs(collector.log, "INFO") as logs:
             made = self.run_collector(minutes=30, server=self.server(), fast=True)
-        down = [line for line in logs.output if "a request failed: down to" in line]
-        self.assertEqual(len(down), 1)
+        down = [line for line in logs.output if "requests failed within 100: down to" in line]
+        self.assertEqual(len(down), 1)          # not for the one failure on its own, but for two close together
         self.assertIn("no more for 10m", down[0])
+        self.assertEqual(made.stats["failed"], 4)
         self.assertEqual(self.output.getvalue().count("fast mode rests for an hour"), 1)
         self.assertEqual((self.flights.most, made.flight, made.flight_limit), (1, 1, 1))   # one at a time since the 429
         resting = self.starts(start + 830)
@@ -1520,9 +1521,10 @@ class SeveralAtOnce(WithServer):
         self.admin("policy", "--fast-flight", "50")
         made = self.run_collector(minutes=15, server=self.server(), fast=True, hours_later=1)
         self.assertEqual((self.flights.most, made.flight_limit), (collector.FAST_MAX_FLIGHT, collector.FAST_MAX_FLIGHT))
-        made.apply_policy({"fast": False})
-        self.assertEqual(made.flight_limit, 1)
-        made.apply_policy({"fast": True})                                # switched back on: one at a time again at first
+        with contextlib.redirect_stdout(io.StringIO()):
+            made.apply_policy({"fast": False})
+            self.assertEqual(made.flight_limit, 1)
+            made.apply_policy({"fast": True})                            # switched back on: one at a time again at first
         self.assertEqual((made.fast_on, made.flight_limit), (True, 1))
 
     def test_a_game_starting_stops_requests_and_drops_the_ones_on_their_way(self):
