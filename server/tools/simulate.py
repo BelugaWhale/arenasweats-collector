@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Play the rules for handing out work on a made-up world of Arena players.
 
-    python server/tools/simulate.py            # the tables (several minutes)
-    python server/tools/simulate.py --quick    # fewer cases and 14 days instead of 30
+    python server/tools/simulate.py            # the tables (about half an hour)
+    python server/tools/simulate.py --quick    # fewer cases and 14 days instead of 30 (a few minutes)
 
 The world is shaped like what was measured on HN1 (Ionia) for 12-19 Nov 2026, when nearly every match of
 those days was held: how many Arena matches players play, how many of the 18 in a match play a lot, how
@@ -559,7 +559,10 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--real", type=int, default=REAL_MATCHES_A_DAY, help="HN1's Arena matches a day to assume")
     parser.add_argument("--quick", action="store_true", help="fewer cases, 14 days")
+    parser.add_argument("--place-seconds", type=float, default=T_PLACE,
+                        help="seconds a client takes for each match of a list it fetches afresh (measured on OC1: 0.25)")
     args = parser.parse_args()
+    globals()["T_PLACE"] = args.place_seconds
     days = 14 if args.quick else args.days
     world = World(int(NOW) + 2 + days, args.matches_a_day, args.seed)
     show_world(world)

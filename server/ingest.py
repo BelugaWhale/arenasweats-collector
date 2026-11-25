@@ -837,8 +837,16 @@ def take_report(db, platform, now, season, report, block):
                     "listed": report["listed"] if report["block"] else 0} if fresh else {}))
     if fresh:
         settled = defaultdict(lambda: [0, 0])           # day played -> [matches seen, of which held]
+        # When a match not held was played is judged by its neighbours (see played_at). In a long list that is looked
+        # up for 20 of them, evenly spread, and the ones in between take the time of the match before them.
+        played, since_looked, look_every = None, 0, max(1, len(missing) // 20)
         for game_id in ids:
-            played = held.get(game_id) or played_at(db, platform, game_id)
+            if held.get(game_id):
+                played = held[game_id]
+            elif played is None or since_looked >= look_every:
+                played, since_looked = played_at(db, platform, game_id), 1
+            else:
+                since_looked += 1
             if played and played <= (now - SETTLED_SECONDS) * 1000:
                 counts = settled[utc_day(played // 1000)]
                 counts[0] += 1

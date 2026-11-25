@@ -108,7 +108,7 @@ Live at `https://arenasweats.lol/collector/` on the website server.
 
 ### What the order and the sizes were tried on
 
-`python server/tools/simulate.py` (several minutes; `--quick` for fewer cases) plays
+`python server/tools/simulate.py` (about half an hour; `--quick` for fewer cases) plays
 `ingest.py` itself with made-up collectors on a made-up world of players shaped like HN1's:
 how much they play, who queues together, lists that fill with all modes. Each made-up
 collector has a League client that behaves as the real one measured on 25 Nov: it gives as
@@ -116,6 +116,60 @@ many matches as the first request for a player asks for, answers from its copy a
 and takes as long as the list is long. Before that it replays the rules until 25 Nov on the
 requests HN1's collectors really made on 13-24 Nov and prints the result beside what was
 measured, which is how the world was fitted. A small run of it is one of the tests.
+
+At HN1's size, from 25 Nov, when 42% of the season was held. Four collectors at the normal
+pace unless said; a client keeps its copies for an hour unless said:
+
+| | days until 50%, 80%, 95% of the season is held | held after 30 days | a new match is held after: half of them, 9 in 10 |
+| --- | --- | --- | --- |
+| rules until 25 Nov | 1.8, 9.5, never | 88% | 11 h, 41 h |
+| one page of 20 (collectors up to 0.3.7) | 1.2, 7.5, never | 89% | 3 h, 13 h |
+| up to 200 in one request (0.3.8) | 1.5, 6.8, 9.8 | 99% | 7 h, 29 h |
+| the same, clients keep copies until restarted, every 3 days | 1.5, 6.8, 9.8 | 99% | 7 h, 29 h |
+| the same, and they are never restarted | 1.2, 5.8, 8.2 | 98% | 11 h, 43 h |
+| up to 100 | 1.0, 5.0, 9.0 | 99% | 5 h, 20 h |
+| up to 60 | 1.2, 5.2, 9.0 | 99% | 4 h, 18 h |
+| up to 200, 12 collectors | 0.5, 1.5, 2.0 | 100% | 3 h, 17 h |
+| a new server like HN10, one collector in fast mode, one page of 20 | 5.0, 10.0, never | 87% | 3 h, 13 h |
+| the same, up to 200 | 4.5, 8.0, 10.2 | 100% | 6 h, 20 h |
+| the same, its client never restarted | 4.5, 7.8, 10.0 | 95% | 23 h, 85 h |
+| the same, three collectors in fast mode | 1.5, 2.5, 3.0 | 100% | 3 h, 16 h |
+
+What it says, and how far to trust it:
+
+- With one page of 20, a match can only be had while it is among the latest 20 of one of
+  its 18 players: 84% of the season on 25 Nov, which is why those lines stop under 90%.
+  With 100 or more, every match of the season was still among the latest matches of one of
+  its players. That is the made-up world. How much players play other modes was fitted to
+  reads of 20 only, so how far back a real list of 200 goes is not known until `size_days`
+  shows it (the days back and how many reached the season's start).
+- Fetching the matches is most of the work, so the number asked for decides how far back a
+  read sees, not how fast the season fills: 60, 100 and 200 fill it about as fast here, and
+  1,000 (if a client gave that many) more slowly, with nothing gained. 200 is asked for
+  because it is what collectors can ask for and nobody knows yet how far 100 goes back.
+- Long lists delay new matches a little while a server is being caught up on, and keep
+  collectors busy after that, reading players whose matches are held by then (28 client
+  seconds for each new match at the end, against 14 with pages). Then `policy --block 60`
+  spares the clients.
+- A client that keeps its copies until restarted costs nothing if it restarts every few
+  days. One that never restarts cannot read a list twice: with a single collector on a
+  server, 93% of the new matches were held, most of them a day late.
+- The times are the weakest part. A page of 20 was taken to cost a client 1.7 s (inferred
+  from how fast collectors went on the Chinese servers), a match 1.5 s. If a client there
+  takes as long for a list as the one measured on OC1 (0.25 s for each match listed, so
+  50 s for 200), reading lists becomes most of the work: with lists of 200 the four
+  collectors on HN1 need 19 days to 80% and 28 to 95%, and new matches come a day and a
+  half late; with lists of 100, 9.5 and 22 days, and 10 hours. One collector in fast mode
+  (three lists at once) on a new server is hardly slowed: 14 days to 95%. The middle
+  answer time in `size_days` says which it is on the first day; if lists of 200 take over
+  20 seconds, `policy --block 100`. (`simulate.py --place-seconds 0.25` plays that.)
+- HN1 has about 10,000-11,000 Arena matches a day (0.3% of its match-id counter), not the
+  30,000-39,000 that 1% of the counter gives. Only near 11,000 does the replay give the fall
+  in new matches per list (4.0 to 1.1) and the age of the matches received (22 days on
+  24 Nov) that were measured; at 20,000 it gives 2.5 per list and 2 days. The days of
+  12-18 Nov, of which lists read a week later showed 96-100% as held, have 8,500-12,800
+  held each. Those lists were pages of 20, so this leans on players who play little; the
+  share held in `seen_days`, once lists of 200 are read, is the better measure.
 
 ## What is still checked
 
