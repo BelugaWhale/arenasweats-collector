@@ -28,9 +28,11 @@ WHAT IT NEVER DOES
     What leaves this computer, and only to the upload address, is: match
     records, which Arena matches a player's list contains, your own player
     id (the same id that is in your match records; a server with no players
-    yet starts from it), and a few numbers about the collector's own pace
-    (how many requests it made, how many failed, how long the client took to
-    answer: see pace_report).
+    yet starts from it), short fixed codes for what the collector is doing
+    and, when it is not collecting, why (such as paused in champion select, or
+    the client's folder hidden): never a path, a name or an error message;
+    and a few numbers about the collector's own pace (how many requests it
+    made, how many failed, how long the client took to answer: see pace_report).
   - It keeps the computer awake while it runs (the screen can still turn off),
     and stops a click in its window from freezing it.
   - It needs no administrator rights and installs nothing. (When the League
@@ -43,6 +45,7 @@ Only the Python standard library is used, so this one file is the whole program.
 import argparse
 import base64
 import calendar
+import contextlib
 import errno
 import gzip
 import hashlib
@@ -64,6 +67,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -125,6 +129,8 @@ OUTBOX_LIMIT = 2000    # stop collecting when this many matches are waiting to u
 UPLOAD_BATCH = 20      # matches per upload
 POLICY_SECONDS = 600   # how often to ask the server whether collection should continue
 PACE_SECONDS = 300     # how often ArenaSweats is told a few numbers about this collector's own pace (see pace_report)
+CHANGE_SECONDS = 10    # before collection starts, a change in why it has not is told at once, but not more often
+FOLDER_SECONDS = 120   # an unanswered question for the League folder gives up after this long, and looking goes on
 TEST_MINUTES = 15      # length of a test run (no upload address set)
 MAX_LCU_BYTES = 8 * 1024 * 1024
 
@@ -166,6 +172,12 @@ def as_list(value):
 
 def as_dict(value):
     return value if isinstance(value, dict) else {}
+
+
+def both(english, chinese, indent=9):
+    """A message in English and, on the next line, in Simplified Chinese. `indent` lines the Chinese up under the
+    English after the time that Collector.say puts in front; 0 for a plain print."""
+    return english + "\n" + " " * indent + chinese
 
 log = logging.getLogger("collector")
 
@@ -247,6 +259,8 @@ def read_lockfile(path):
 CLIENT_NAMES = ("leagueclient.exe", "leagueclientux.exe")
 WINDOW_PROGRAM = "leagueclientux.exe"     # the client's window program, started with its port and password
 RELATED_WORDS = ("league", "lol", "riot", "wegame", "tcls", "tencent")   # program names worth noting in the log
+LAUNCHER_WORDS = ("wegame", "tcls", "riotclient")    # programs that start the client: running, the client may follow
+related_running = []    # names of the programs with RELATED_WORDS running at the last look (running_client_dirs)
 LEAGUE_FOLDER_WORDS = ("英雄联盟", "league of legends")
 GAME_FOLDER_WORDS = ("game", "游戏", "tencent", "腾讯", "riot", "lol")   # folders worth looking one level deeper in
 SKIP_FOLDERS = {"windows", "users", "programdata", "recovery", "system volume information", "perflogs"}
@@ -455,6 +469,7 @@ def running_client_dirs(names=CLIENT_NAMES):
                 errors.add(str(error))
             if folder not in dirs:
                 dirs.append(folder)
+    related_running[:] = sorted(related)
     note("related programs running", ", ".join(sorted(related)) or "none")
     note("League client folders", ", ".join(
         folder or "(Windows would not say: error %s)" % "/".join(sorted(errors)) for folder in dirs)
@@ -1322,18 +1337,21 @@ class Server:
         if not (self.url.startswith("https://") or local_test):
             raise Fatal("The upload address must start with https://")
         self.key = key or None      # None until this install has signed up (Collector.sign_up)
-        self.state = "collecting"   # what this collector is doing, sent with every request
+        self.state = "starting"     # what this collector is doing, sent with every request (see Collector.heartbeat)
+        self.detail = ""            # ... and, when it is not collecting, why: a short fixed code, never a path or a name
+        self.told = None            # the (state, detail) that ArenaSweats last received
         self.problem = []           # after a call that got no answer: what went wrong (NoAnswer.tries)
         log.info("network: %s", network_setup(self.url))
         self.fast = False           # the user turned fast mode on: "_fast" is added to the state sent
         self.pace = None            # numbers about this collector's own pace (Collector.pace_report): the next
                                     # request takes them along, once
 
-    def call(self, method, path, payload=None):
+    def call(self, method, path, payload=None, timeout=30):
         """Returns (status, parsed JSON or None, seconds the server asked us to wait).
         Status 0 = unreachable; `problem` then says why."""
         headers = {"Accept": "application/json", "User-Agent": "arenasweats-collector/" + VERSION,
-                   "X-Collector-State": self.state + ("_fast" if self.fast else "")}
+                   "X-Collector-State": self.state + ("_fast" if self.fast else ""), "X-Collector-Detail": self.detail}
+        told = (self.state, self.detail)
         pace, self.pace = self.pace, None
         if self.key:
             headers["Authorization"] = "Bearer " + self.key
@@ -1344,15 +1362,52 @@ class Server:
             body = gzip.compress(json.dumps(payload, separators=(",", ":")).encode())
             headers.update({"Content-Type": "application/json", "Content-Encoding": "gzip"})
         try:
-            status, raw, answer_headers = request_url(self.url + path, body, headers, method, timeout=30)
+            status, raw, answer_headers = request_url(self.url + path, body, headers, method, timeout=timeout)
         except NoAnswer as error:
             self.problem = error.tries
             log.warning("%s %s got no answer: %s", method, path, error)
             return 0, None, 0
         self.problem = []
+        self.told = told
         retry = answer_headers.get("Retry-After")
         wait = int(retry) if retry and re.fullmatch(r"[0-9]{1,5}", retry) else 0
         return status, parse_json(raw), min(3600, wait)
+
+
+# ---------------------------------------------------------------------------
+# Why it is not collecting, as short fixed codes for ArenaSweats (X-Collector-Detail). Only these words and numbers
+# are sent: never a path, a name or an error message.
+# ---------------------------------------------------------------------------
+def failure_code(error):
+    """A try at reaching the client that failed: refused (nothing listens on its port, as with a lockfile left
+    over from an earlier start), reset, tls, denied (Windows would not let the file be read), gone, badfile (a
+    lockfile that does not hold a port and password, as the Tencent client's), or oserror / failed."""
+    cause = error.__context__ if isinstance(error, ClientGone) else error      # ClientGone keeps only the text
+    cause = error_reason(cause) if isinstance(cause, urllib.error.URLError) else cause
+    for kind, code in ((ConnectionRefusedError, "refused"), (ConnectionResetError, "reset"), (ssl.SSLError, "tls"),
+                       (PermissionError, "denied"), (FileNotFoundError, "gone"), (ValueError, "badfile"),
+                       (OSError, "oserror")):
+        if isinstance(cause, kind):
+            return code
+    return "failed"
+
+
+def phase_code(status, phase):
+    """Why collection is paused: the client's state, such as phase_inprogress or phase_endofgame, or, when asking
+    for it failed, its status, such as phase_status_404 (0: no answer)."""
+    if status != 200:
+        return "phase_status_%d" % status
+    if not isinstance(phase, str):
+        return "phase_odd"
+    return "phase_" + (re.sub(r"[^a-z]", "", phase.lower())[:24] or "blank")
+
+
+def error_code(error):
+    """An unexpected error: its kind and the collector's function it happened in, such as error.keyerror.work_round."""
+    here = [frame.name for frame in traceback.extract_tb(error.__traceback__)
+            if os.path.basename(frame.filename) == os.path.basename(__file__)]
+    code = "error." + type(error).__name__.lower() + ("." + here[-1].lower() if here else "")
+    return re.sub(r"[^a-z0-9_.]", "", code)[:64]
 
 
 # ---------------------------------------------------------------------------
@@ -1407,6 +1462,7 @@ class Collector:
         self.last_said, self.last_status, self.folder_asks, self.described = None, now(), 0, False
         self.watch, self.last_lcu = ClientWatch(now, wall), None     # for the log: the client's programs
         self.idle_at = float("-inf")       # last time the client was seen idle
+        self.ended = False                 # why it stops has been told to ArenaSweats (tell_end)
 
     # -- small helpers -------------------------------------------------------
     @property
@@ -1490,7 +1546,8 @@ class Collector:
                     log.warning("client gone: %s. Collector: %s", error, self.doing())
                     self.last_lcu, self.lcu = self.lcu, None
                     self.watch.look(self.doing)     # which of the client's programs are still running
-                    self.say("The League client closed. Waiting for it to open again.")
+                    self.say(both("The League client closed. Waiting for it to open again.",
+                                  "英雄联盟客户端已关闭，等待它重新打开。"))
                     self.sleep(10)
         except Done:
             self.say("Time limit reached.")
@@ -1498,7 +1555,9 @@ class Collector:
             raise
         except Exception as error:
             log.exception("unexpected error")       # logged here so a test run's report includes it
-            raise Fatal("Unexpected error. Details are in collector.log in the data folder.") from error
+            self.tell_end("error", error_code(error))
+            raise Fatal(both("Unexpected error. Details are in collector.log in the data folder.",
+                             "发生意外错误。详细信息在 data 文件夹里的 collector.log 中。", 0)) from error
         finally:
             self.finish()
 
@@ -1507,72 +1566,103 @@ class Collector:
         rounds = 0
         while True:
             paths, running, hidden = lockfile_paths(self.opts.league_dir)
-            results = []
+            by_lockfile, by_command_line = [], None
             for path in paths:
-                results.append(self.try_client(path, lambda path=path: read_lockfile(path)))
-                if results[-1] == "connected":
+                by_lockfile.append(self.try_client(path, lambda path=path: read_lockfile(path)))
+                if by_lockfile[-1] == "connected":
                     return
-            if running and "answered" not in results:
+            answered = any(result.startswith("login") for result in by_lockfile)
+            if running and not answered:
+                by_command_line = []
                 for port, token, scheme in command_line_logins():
-                    results.append(self.try_client("the client's command line",
-                                                   lambda port=port, token=token, scheme=scheme: Lcu(port, token, scheme)))
-                    if results[-1] == "connected":
+                    by_command_line.append(self.try_client(
+                        "the client's command line", lambda port=port, token=token, scheme=scheme: Lcu(port, token, scheme)))
+                    if by_command_line[-1] == "connected":
                         return
+                answered = any(result.startswith("login") for result in by_command_line)
             rounds += 1
-            if "answered" in results:
-                self.say("Found the League client. Waiting for you to log in.", once=True)
+            if answered:
+                self.say(both("Found the League client. Waiting for you to log in.",
+                              "已找到英雄联盟客户端，等待你登录。"), once=True)
             elif running:
-                self.say("The League client is open, but the collector cannot reach it yet.", once=True)
-                if rounds >= 2 and self.folder_asks < 3 and sys.stdin and sys.stdin.isatty():
-                    self.ask_for_folder(hidden)
+                self.say(both("The League client is open, but the collector cannot reach it yet. If this does not "
+                              "change within a minute,\n         close this window and start the collector again with "
+                              "right-click > 'Run as administrator'.",
+                              "英雄联盟客户端已打开，但采集器暂时连接不上它。如果一分钟后仍是这样，"
+                              "请关闭此窗口，右键点击采集器，选择“以管理员身份运行”。"), once=True)
+                if hidden and rounds >= 2 and self.folder_asks < 3 and sys.stdin and sys.stdin.isatty():
+                    self.ask_for_folder()
                     continue
             else:
-                self.say("Waiting for the League client. Open it and log in.", once=True)
-            self.heartbeat("waiting_for_client" if not running else "client_unreachable")
+                self.say(both("Waiting for the League client. Open League and log in.",
+                              "正在等待英雄联盟客户端。请打开英雄联盟并登录。"), once=True)
+            # Why, for ArenaSweats: whether Windows lists the client's programs and says where they are, a program
+            # that starts the client (WeGame, TCLS, Riot Client), and what the first lockfile and command line gave.
+            if running:
+                steps = ["path_hidden" if hidden else "path_seen"]
+            else:
+                steps = ["no_client"]
+                if any(word in name.lower() for name in related_running for word in LAUNCHER_WORDS):
+                    steps.append("launcher")
+            if running or by_lockfile:
+                steps.append("lock_" + (by_lockfile[0] if by_lockfile else "none"))
+            if by_command_line is not None:
+                steps.append("cmd_" + (by_command_line[0] if by_command_line else "none"))
+            self.heartbeat("client_unreachable" if running else "waiting_for_client", ".".join(steps))
             self.sleep(10)
 
     def try_client(self, where, make):
-        """Try one way of reaching the client: "connected" (and in use), "answered" (reachable
-        but nobody logged in yet) or "unreachable"."""
+        """Try one way of reaching the client. Returns "connected" (and in use), "login" and the status the
+        client answered with when nobody is logged in yet (such as login404), or why it could not be reached
+        (see failure_code)."""
         try:
             lcu = make()
             status, me = lcu.get("/lol-summoner/v1/current-summoner")
         except (OSError, ValueError, ClientGone) as error:
             log.info("client via %s not usable: %s", where, error)
-            return "unreachable"
+            return failure_code(error)
         puuid = me.get("puuid") if isinstance(me, dict) else None
         if status == 200 and isinstance(puuid, str) and PUUID_RE.fullmatch(puuid):
             self.use_client(lcu, puuid, where)
             return "connected"
         log.info("client via %s not ready: status %s, player id %s", where, status,
                  "missing" if not puuid else "in an unexpected format")
-        return "answered"
+        return "login%d" % status
 
-    def ask_for_folder(self, hidden):
-        """Ask where League is installed, when the client is open but cannot be found."""
+    def ask_for_folder(self):
+        """Ask where League is installed, when the client is open but Windows will not say where. Nobody may be at
+        the PC, so after FOLDER_SECONDS without an answer it carries on looking (and checking in) by itself."""
         self.folder_asks += 1
-        if hidden:
-            print("Windows does not let the collector see where League is installed. This happens when\n"
-                  "the League client runs as administrator. Either tell the collector the folder below, or\n"
-                  "close this window and start the collector with right-click > 'Run as administrator'.")
-        print("To find the folder, right-click your League shortcut and choose 'Open file location'.")
+        print(both("Windows does not let the collector see the League client. This happens when the client runs as\n"
+                   "administrator. Close this window and start the collector with right-click > 'Run as administrator',\n"
+                   "or tell the collector the folder League is installed in. To find it, right-click your League\n"
+                   "shortcut and choose 'Open file location'.",
+                   "Windows 不让采集器看到英雄联盟客户端，这通常是因为客户端以管理员身份运行。请关闭此窗口，右键点击采集器，"
+                   "选择“以管理员身份运行”；\n或者告诉采集器英雄联盟的安装文件夹：右键点击英雄联盟的快捷方式，"
+                   "选择“打开文件所在的位置”即可找到。", 0))
         set_quick_edit(True)            # so the folder can be pasted with a right-click
         try:
-            folder = given_folder(input("Paste the folder where League is installed and press Enter: "))
+            answer = timed_input("Paste the folder and press Enter / 粘贴文件夹路径后按回车: ", FOLDER_SECONDS)
         except EOFError:
             self.folder_asks = 3
             return
         finally:
             set_quick_edit(False)
+        if answer is None:
+            print("No answer: the collector keeps looking. 无人回答：采集器继续查找。")
+            return
+        folder = given_folder(answer)
         if folder and existing_lockfiles(([folder], 2)):
             log.info("folder given: %s", folder)
             self.opts.league_dir = folder
             save_config(league_dir=folder)
         elif folder:
-            print("No League client was found in or near that folder. Check the client is open and logged in.")
+            print(both("No League client was found in or near that folder. Check the client is open and logged in.",
+                       "在该文件夹及附近没有找到英雄联盟客户端。请确认客户端已打开并已登录。", 0))
 
     def use_client(self, lcu, puuid, path):
         self.lcu = lcu
+        self.set_state("collecting")
         if puuid != self.me:
             self.me, self.checked_me = puuid, False
             self.close()        # another account: it keeps its own file, and the last one's is left as it is
@@ -1582,9 +1672,11 @@ class Collector:
         status, region = lcu.get("/riotclient/region-locale")
         log.info("connected via %s, account %s..., region-locale: %s %s", path, puuid[:8], status, region)
         self.watch.describe_soon()
-        self.say("Connected to the League client%s." % (" in " + os.path.dirname(path) if os.path.isabs(path) else ""))
-        self.say("Collecting only while you are not playing, one request every %.1f seconds, matches since %s."
-                 % (self.delay, time.strftime("%Y-%m-%d", time.gmtime(self.season_start / 1000))))
+        self.say(both("Connected to the League client%s." % (" in " + os.path.dirname(path) if os.path.isabs(path) else ""),
+                      "已连接到英雄联盟客户端。"))
+        self.say(both("Collecting only while you are not playing, one request every %.1f seconds, matches since %s."
+                      % (self.delay, time.strftime("%Y-%m-%d", time.gmtime(self.season_start / 1000))),
+                      "只在你不玩游戏时采集。"))
 
     def step(self):
         try:
@@ -2009,18 +2101,22 @@ class Collector:
                     self.idle_at = self.now()
                     if self.paused:
                         self.paused = False
-                        self.say("You are not playing any more. Collection resumed.")
+                        self.say(both("You are not playing any more. Collection resumed.", "你已不在游戏中，继续采集。"))
                     return
             else:
                 self.busy_at = self.now()
+                why = phase_code(status, phase)
                 if not self.paused:
                     self.paused = True
+                    self.set_state("paused", why)
                     if status == 200:
-                        self.say("Paused while you play (client state: %.40s)." % (phase,))
+                        self.say(both("Paused while you play (client state: %.40s)." % (phase,),
+                                      "你正在游戏中，采集已暂停（客户端状态：%.40s）。" % (phase,)))
                     else:
-                        self.say("Paused: the League client is not ready yet (status %s)." % status)
+                        self.say(both("Paused: the League client is not ready yet (status %s)." % status,
+                                      "已暂停：英雄联盟客户端尚未就绪（状态码 %s）。" % status))
                     self.hand_in()      # so nothing that is ready waits through the game
-                self.heartbeat("paused")
+                self.heartbeat("paused", why)
             self.sleep(5)
 
     def hand_in(self):
@@ -2036,12 +2132,14 @@ class Collector:
         """Return only when collecting is allowed: you are not playing and ArenaSweats has not switched it off."""
         while True:
             self.wait_until_idle()
+            self.set_state("collecting" if self.enabled else "switched_off")
             if self.server and self.now() - self.policy_at >= POLICY_SECONDS:
                 self.refresh_policy()
                 continue                # that took a moment, so look at the client again
             if self.enabled:
                 return
-            self.say("ArenaSweats has switched collection off for now. Checking again every 10 minutes.", once=True)
+            self.say(both("ArenaSweats has switched collection off for now. Checking again every 10 minutes.",
+                          "ArenaSweats 暂时关闭了采集，每 10 分钟检查一次。"), once=True)
             self.hand_in()
             self.sleep(60)
 
@@ -2201,7 +2299,8 @@ class Collector:
 
     def bad_key(self):
         self.server = None
-        return Fatal("ArenaSweats did not accept the upload key. Check the key in config.json.")
+        return Fatal(both("ArenaSweats did not accept the upload key. Check the key in config.json.",
+                          "ArenaSweats 不接受这个上传密钥。请检查 config.json 中的密钥。", 0))
 
     def sign_up(self):
         """A new install asks ArenaSweats for its own upload key, once, and keeps it in config.json."""
@@ -2212,7 +2311,7 @@ class Collector:
                 self.server.key = key
                 save_config(key=key)
                 log.info("signed up with ArenaSweats as %.40s", as_dict(data).get("name"))
-                self.say("Signed up with ArenaSweats.")
+                self.say(both("Signed up with ArenaSweats.", "已在 ArenaSweats 注册。"))
                 return
             if status == 403:
                 raise Fatal("ArenaSweats is not taking new collectors right now. Please try again another day.\n"
@@ -2232,15 +2331,45 @@ class Collector:
                  % (english, when[0], " " * 9, chinese, when[1], " " * 9, os.path.join(self.data_dir, "collector.log")),
                  once=True)
 
-    def heartbeat(self, state):
-        """While it waits, still tell ArenaSweats every 10 minutes what it is doing, so a paused
-        collector looks different from one that was closed."""
-        if self.server and self.server.key and self.now() - self.policy_at >= POLICY_SECONDS:
-            self.server.state = state
-            try:
-                self.refresh_policy()
-            finally:
-                self.server.state = "collecting"
+    def set_state(self, state, detail=""):
+        """What the collector is doing now, and when it is not collecting why (a short fixed code), for the next
+        request to ArenaSweats."""
+        if self.server:
+            self.server.state, self.server.detail = state, detail
+
+    def heartbeat(self, state, detail=""):
+        """While it waits, still tell ArenaSweats every 10 minutes what it is doing and why, so a paused collector
+        looks different from one that was closed. Until it has started collecting, a change is told at once (at
+        most every CHANGE_SECONDS), so an install that never gets going shows why, even when it is soon closed."""
+        self.set_state(state, detail)
+        if not (self.server and self.server.key):
+            return
+        since = self.now() - self.policy_at
+        if since >= POLICY_SECONDS or (not self.introduced and since >= CHANGE_SECONDS
+                                       and self.server.told != (state, detail)):
+            self.refresh_policy()
+
+    def tell_end(self, state, detail):
+        """One last check-in as the collector stops, so ArenaSweats sees why it stopped; only the first reason
+        counts (closing the window after an error must not hide the error). If that fails too, it only goes to
+        the log: the collector is stopping anyway."""
+        if self.ended or not (self.server and self.server.key):
+            return
+        self.ended = True
+        self.set_state(state, detail)
+        try:
+            status, _, _ = self.server.call("GET", "/v1/policy", timeout=5)     # not keeping the person waiting
+            log.info("told ArenaSweats the collector stops (%s %s): status %s", state, detail, status)
+        except Exception:
+            log.exception("could not tell ArenaSweats the collector stops")
+
+    def closing(self, event):
+        """Windows is closing the window (event 2), or the user signs out or Windows shuts down (5, 6): tell
+        ArenaSweats, so a collector someone closed looks different from one that crashed or that other software
+        stopped. Returns False, so Windows then ends the program as it always did."""
+        if event in (2, 5, 6):
+            self.tell_end("closed", {2: "window", 5: "logoff", 6: "shutdown"}[event])
+        return False
 
     def refresh_policy(self, first=False):
         self.policy_at = self.now()
@@ -2248,7 +2377,7 @@ class Collector:
         if status == 200:
             self.apply_policy(data)
             if first:
-                self.say("Connected to ArenaSweats.")
+                self.say(both("Connected to ArenaSweats.", "已连接到 ArenaSweats。"))
         elif status in (401, 403):
             raise self.bad_key()
         elif first:
@@ -2366,7 +2495,8 @@ class Collector:
 
     def finish(self):
         if self.store is None:
-            self.say("Stopped before a logged-in League client was found. Nothing was collected.")
+            self.say(both("Stopped before a logged-in League client was found. Nothing was collected.",
+                          "在找到已登录的英雄联盟客户端之前就停止了，没有采集到任何数据。"))
         else:
             try:
                 self.hand_in()      # the last matches and reports, without taking on more
@@ -2616,7 +2746,12 @@ def save_config(**values):
         with open(os.path.join(folder, "config.json"), "w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2, ensure_ascii=False)
     except OSError as error:
-        log.info("could not save config.json: %s", error)
+        log.warning("could not save config.json: %s", error)
+        print(both("Could not save config.json beside the program (%s). The collector carries on, but next time it\n"
+                   "will not remember this. Move ArenaSweatsCollector.exe into a folder of its own that you can write to."
+                   % (error.strerror or error),
+                   "无法在程序旁边保存 config.json（%s）。采集器会继续运行，但下次启动时不会记得这次的设置。"
+                   "请把 ArenaSweatsCollector.exe 移到一个你可以写入的单独文件夹。" % (error.strerror or error), 0))
 
 
 def set_quick_edit(on):
@@ -2661,7 +2796,7 @@ def lock_single_instance():
             import fcntl
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        raise Fatal("The collector is already running on this computer.")
+        raise Fatal(both("The collector is already running on this computer.", "采集器已经在这台电脑上运行。", 0))
     return handle      # stays locked for as long as this object is kept
 
 
@@ -2710,6 +2845,7 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):     # never crash on a character the console cannot show
         if stream and hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
+    set_quick_edit(False)       # before the questions at start too: a click must not freeze their count
 
     config = load_config(program_dir())
     if getattr(sys, "frozen", False) and os.name == "nt":       # the packaged Windows program
@@ -2718,13 +2854,19 @@ def main(argv=None):
             if offer_update(opts.server or config.get("server") or DEFAULT_SERVER):
                 return 0
     data_dir = os.path.abspath(opts.data_dir or os.path.join(program_dir(), "data"))
-    os.makedirs(data_dir, exist_ok=True)
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except OSError as error:
+        return cannot_write(data_dir, error)
     if opts.export:
         export(data_dir, opts.export)
         return 0
 
-    handler = logging.handlers.RotatingFileHandler(
-        os.path.join(data_dir, "collector.log"), maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            os.path.join(data_dir, "collector.log"), maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+    except OSError as error:
+        return cannot_write(data_dir, error)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     log.addHandler(handler)
     log.setLevel(logging.INFO)
@@ -2745,32 +2887,39 @@ def main(argv=None):
             opts.minutes = 0 if server else TEST_MINUTES
         lock = lock_single_instance()
         print("ArenaSweats collector %s - reads Arena match history from your League client. Read-only." % VERSION)
+        print("ArenaSweats 采集器 %s：从你的英雄联盟客户端读取斗魂竞技场的对局记录，只读不改。" % VERSION)
         if server is None:
             print("This is a test run: it collects for up to %g min, then writes one file\n"
                   "for you to send back. Nothing is uploaded." % opts.minutes
                   if opts.minutes else "Nothing is uploaded: matches are only saved on this computer.")
         else:
-            print("It sends the Arena matches it reads to ArenaSweats%s. Close this window to stop."
-                  % (", for up to %g min" % opts.minutes if opts.minutes else ""))
+            print(both("It sends the Arena matches it reads to ArenaSweats%s. Close this window to stop."
+                       % (", for up to %g min" % opts.minutes if opts.minutes else ""),
+                       "它会把读取到的斗魂竞技场对局发送给 ArenaSweats。关闭此窗口即可停止。", 0))
         if server and opts.fast is None and sys.stdin and sys.stdin.isatty():
             opts.fast = ask_fast_mode()         # after the update offer, so an update never asks twice
         opts.fast = bool(opts.fast)
         log.info("fast mode: %s", "on (experimental)" if opts.fast else "off")
         if opts.fast:
             print(FAST_ON)
-        set_quick_edit(False)
         keep_awake()
         made = Collector(opts, data_dir, server)
-        made.run()
+        with told_on_close(made.closing):
+            made.run()
     except KeyboardInterrupt:
         print("Stopped.")
+        if made:
+            made.tell_end("stopped", "ctrl_c")
     except Fatal as error:
         log.error("%s", error)
         print(error)
         code = 1
-    except Exception:
+    except Exception as error:
         log.exception("unexpected error")
-        print("Unexpected error. Details are in %s" % os.path.join(data_dir, "collector.log"))
+        if made:
+            made.tell_end("error", error_code(error))
+        print(both("Unexpected error. Details are in %s" % os.path.join(data_dir, "collector.log"),
+                   "发生意外错误。详细信息在 %s 中。" % os.path.join(data_dir, "collector.log"), 0))
         code = 1
     finally:
         if made:
@@ -2779,12 +2928,49 @@ def main(argv=None):
             lock.close()
         log.removeHandler(handler)
         handler.close()
+    keep_window_open()
+    return code
+
+
+@contextlib.contextmanager
+def told_on_close(action):
+    """Inside this, `action(event)` is called when the window is closed (Windows only). Windows waits about 5
+    seconds for it before it ends the program."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32")
+    handler = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)(action)
+    if not k32.SetConsoleCtrlHandler(handler, True):
+        log.warning("could not watch for the window being closed")
+    try:
+        yield
+    finally:
+        k32.SetConsoleCtrlHandler(handler, False)
+
+
+def keep_window_open():
+    """The packaged program's window closes as soon as it ends, so it first waits for Enter: the last message can
+    be read."""
     if getattr(sys, "frozen", False) and sys.stdin and sys.stdin.isatty():
         try:
-            input("Press Enter to close.")
+            input("Press Enter to close. 按回车键关闭。")
         except (EOFError, KeyboardInterrupt):
             pass
-    return code
+
+
+def cannot_write(folder, error):
+    """The collector cannot make its data folder or its log file: say so plainly instead of a window that
+    vanishes with Python's error report. Returns the exit code."""
+    print(both("The collector cannot write in the folder %s (%s).\nMove ArenaSweatsCollector.exe into a folder of its "
+               "own that you can write to, such as a new folder\non the Desktop or on drive D:, and start it again."
+               % (folder, error.strerror or error),
+               "采集器无法在文件夹 %s 中写入（%s）。\n请把 ArenaSweatsCollector.exe 移到一个你可以写入的单独文件夹"
+               "（例如在桌面或 D 盘新建一个文件夹），然后重新运行。" % (folder, error.strerror or error), 0))
+    keep_window_open()
+    return 1
 
 
 if __name__ == "__main__":

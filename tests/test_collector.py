@@ -1,7 +1,6 @@
 """Tests for collector.py against the fake League client.  Run:  python -m unittest discover tests"""
 
 import argparse
-import builtins
 import contextlib
 import io
 import json
@@ -654,13 +653,14 @@ class HiddenClient(CollectorCase):
         saved = {}
         self.addCleanup(setattr, collector, "save_config", collector.save_config)
         collector.save_config = lambda **values: saved.update(values)
-        self.addCleanup(setattr, builtins, "input", builtins.input)
-        builtins.input = lambda prompt: '"%s"' % os.path.join(install, "TCLS")      # the shortcut's folder
+        self.addCleanup(setattr, collector, "timed_input", collector.timed_input)
+        collector.timed_input = lambda prompt, seconds: '"%s"' % os.path.join(install, "TCLS")   # the shortcut's folder
         made = self.collector(league_dir=None)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            made.ask_for_folder(hidden=True)
+            made.ask_for_folder()
         self.assertIn("Run as administrator", output.getvalue())
+        self.assertIn("以管理员身份运行", output.getvalue())
         self.assertEqual(saved, {"league_dir": os.path.join(install, "TCLS")})
         self.assertEqual(made.opts.league_dir, os.path.join(install, "TCLS"))
         self.assertEqual(collector.lockfile_paths(made.opts.league_dir)[0],

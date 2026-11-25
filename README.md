@@ -36,9 +36,11 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   still slow it down, allow fewer requests at once or switch it off, but can never allow
   more than four.
 - **Your account stays private.** It never reads or sends your password or login. It sends
-  only Arena match results, your player ID, which is already in your match records, and a
-  few numbers about its own pace: how many requests it made, how many failed, and how long
-  the client took to answer.
+  only Arena match results, your player ID, which is already in your match records,
+  short fixed codes for what it is doing, such as "paused while you play" or "League
+  client not found", and a few numbers about its own pace: how many requests it made,
+  how many failed, and how long the client took to answer. Never a file or folder name,
+  nor anything that identifies you or your PC.
 - **Nothing to install.** No administrator rights and no background service. Close the
   window and it stops. Delete its folder and it's gone.
 - **Open source.** The download is built by GitHub straight from the code in this
@@ -59,6 +61,9 @@ counting down 10 seconds; pressing Enter, or no answer, keeps it off. So it stil
 the PC. To skip the fast mode question, add `--fast` or `--no-fast` to the end of a
 shortcut's target. While fast mode is on, it says so every time it starts.
 
-If it can't find League by itself, it asks you which folder League is installed in.
+If Windows hides the League client from it (this happens when the client runs as
+administrator), it suggests starting it with right-click > "Run as administrator", or asks
+which folder League is installed in. With no answer within 2 minutes it keeps looking by
+itself.
 
 MIT licence; see [`LICENSE`](LICENSE).

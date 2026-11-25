@@ -951,6 +951,68 @@ class EndToEnd(WithServer):
         self.run_collector(minutes=25, server=self.server())
         self.assertGreaterEqual(states.count("paused"), 2)  # every 10 minutes while paused
 
+    def told(self):
+        """Every (state, detail, pretend time) the collector sent with its requests, from the server's side."""
+        told = []
+        original = ingest.note_seen
+
+        def record(db, contributor, now):
+            told.append((ingest.request.headers.get("X-Collector-State"),
+                         ingest.request.headers.get("X-Collector-Detail"), self.clock.now()))
+            return original(db, contributor, now)
+        ingest.note_seen = record
+        self.addCleanup(setattr, ingest, "note_seen", original)
+        self.addCleanup(setattr, collector, "save_config", collector.save_config)
+        collector.save_config = lambda **values: None
+        return told
+
+    def test_an_install_that_finds_no_client_says_why_at_once(self):
+        # Why: installs that never found a client looked like "collecting" and went quiet, so nobody could tell
+        # why they sent nothing; this is what shows it now, even for one that is closed within a minute.
+        told = self.told()
+        os.remove(os.path.join(self.league_dir, "lockfile"))
+        start = self.clock.now()
+        self.run_collector(minutes=1, server=collector.Server(self.url, None))
+        self.assertEqual(told[0][:2], ("starting", ""))                                # signed up, nothing found yet
+        self.assertNotIn("collecting", [state for state, _, _ in told])
+        self.assertIn(("waiting_for_client", "no_client"), [(state, detail) for state, detail, _ in told])
+        self.assertLess(told[1][2] - start, 30)
+        self.assertIn("请打开英雄联盟并登录", self.output.getvalue())
+
+    def test_a_client_that_is_open_but_out_of_reach_says_which_step_failed(self):
+        # Why: the Tencent client's lockfile holds no password, so a refused command line leaves it unreachable;
+        # the code must say so, or the fix (run as administrator) cannot be told apart from other causes.
+        told = self.told()
+        with open(os.path.join(self.league_dir, "lockfile"), "w") as handle:
+            handle.write("12345")                                                       # the Tencent client's
+        for name, value in (("running_client_dirs", lambda: [self.league_dir]), ("command_line_logins", lambda: [])):
+            self.addCleanup(setattr, collector, name, getattr(collector, name))
+            setattr(collector, name, value)
+        self.run_collector(minutes=1, server=self.server())
+        self.assertIn(("client_unreachable", "path_seen.lock_badfile.cmd_none"),
+                      [(state, detail) for state, detail, _ in told])
+        self.assertIn("以管理员身份运行", self.output.getvalue())
+
+    def test_an_unexpected_error_is_told_before_the_collector_stops(self):
+        # Why: a crash used to end with nothing sent, looking exactly like a window someone closed.
+        told = self.told()
+
+        def explode(self):
+            raise RuntimeError("boom for the test")
+        self.addCleanup(setattr, collector.Collector, "work_round", collector.Collector.work_round)
+        collector.Collector.work_round = explode
+        made = self.collector(minutes=5, server=self.server())
+        with self.assertRaises(collector.Fatal) as raised, self.assertLogs(collector.log, "ERROR"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            made.run()
+        self.assertEqual(told[-1][:2], ("error", "error.runtimeerror.step"))
+        self.assertIn("发生意外错误", str(raised.exception))
+        sent = len(told)
+        self.assertFalse(made.closing(2))               # the window closed afterwards: the error stays what we see
+        self.assertEqual(len(told), sent)
+        self.collector(server=self.server()).closing(2)            # a window closed while it ran, as such
+        self.assertEqual(told[-1][:2], ("closed", "window"))
+
     def test_a_new_install_signs_up_and_uploads(self):
         saved = {}
         self.addCleanup(setattr, collector, "save_config", collector.save_config)
