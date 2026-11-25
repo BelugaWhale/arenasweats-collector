@@ -39,8 +39,11 @@ class CollectorCase(unittest.TestCase):
         os.makedirs(self.data_dir)
         # This computer's own programs and League install are not part of the tests: a League client
         # running here must never be found and read from.
+        # Nor is how the tests were started: GitHub's Windows machine runs them as administrator, which the
+        # collector would report and act on. As off Windows (None), unless a test says otherwise.
         for name, value in (("process_table", lambda: {}), ("running_programs", lambda: []),
-                            ("installer_dirs", lambda: []), ("installed_dirs", lambda: [])):
+                            ("installer_dirs", lambda: []), ("installed_dirs", lambda: []),
+                            ("is_elevated", lambda: None)):
             original = getattr(collector, name)
             setattr(collector, name, value)
             self.addCleanup(setattr, collector, name, original)
