@@ -43,7 +43,7 @@ MAX_GAMES = 50                   # matches per upload
 MAX_GAME_BYTES = 300 * 1024      # one match record
 MAX_REPORTS = 20                 # match lists reported per work request
 MAX_REPORT_IDS = 3000            # matches named in one match-list report
-REQUESTS_PER_MINUTE = 60         # per key; a collector makes at most ~32 a minute, fast mode too (measured: up to 23)
+REQUESTS_PER_MINUTE = 60         # per key; a collector makes at most ~48 a minute in fast mode (measured on the fake client: up to 21)
 GAMES_PER_DAY = 220000           # per key; fast mode's floor (0.4 s between requests, at most a match a request) allows
                                  # 216,000 a day, plus a held-back outbox (measured: ~100k in fast mode, ~30k normally)
 SIGNUPS_PER_ADDRESS = 10         # new installs one internet address can sign up a day (many homes in China share one)
@@ -51,6 +51,7 @@ SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close wi
 ARENA_MODES = {"CHERRY"}
 DEFAULT_SEASON_START = "2026-10-06"   # UTC. Change with: ingest.py policy --season-start YYYY-MM-DD
 DEFAULT_FAST_DELAY = 0.4         # fast mode's shortest gap between requests, s. Change with: policy --fast-delay S
+DEFAULT_FAST_FLIGHT = 4          # fast mode's most requests on their way at once. Change with: policy --fast-flight N
 
 # ---- passing matches on to the rankings server (it pulls them over SSH: see `relay` below)
 RELAY_BATCH = 5000               # most matches handed over in one pull
@@ -199,14 +200,16 @@ def date_ms(text):
 
 
 def get_policy(db):
-    """What collectors are told: whether to collect, the slowest pace we ask for, whether fast mode is allowed
-    and its shortest gap (collectors whose user turned it on wait a fifth as long, never under fast_delay,
-    nor under their own 0.4 s floor), a short message, the season."""
+    """What collectors are told: whether to collect, the slowest pace we ask for, whether fast mode is allowed,
+    its shortest gap (collectors whose user turned it on wait a fifth as long, never under fast_delay,
+    nor under their own 0.4 s floor) and how many requests it may have on their way at once (never more
+    than their own 4), a short message, the season."""
     values = dict(db.execute("SELECT name, value FROM settings"))
     return {"enabled": values.get("enabled", "1") == "1",
             "delay": float(values.get("delay", "2")),
             "fast": values.get("fast", "1") == "1",
             "fast_delay": float(values.get("fast_delay", DEFAULT_FAST_DELAY)),
+            "fast_flight": int(values.get("fast_flight", DEFAULT_FAST_FLIGHT)),
             "message": values.get("message", ""),
             "season_start": int(values.get("season_start", date_ms(DEFAULT_SEASON_START)))}
 
@@ -809,7 +812,7 @@ def cmd_stats(db, _args):
         if relay["last_urgent_at"] else "never"))
     rules = get_policy(db)
     print("Policy: %s, season starts %s UTC" % (
-        {name: rules[name] for name in ("enabled", "delay", "fast", "fast_delay", "message")},
+        {name: rules[name] for name in ("enabled", "delay", "fast", "fast_delay", "fast_flight", "message")},
         time.strftime("%Y-%m-%d", time.gmtime(rules["season_start"] / 1000))))
 
 
@@ -817,12 +820,14 @@ def cmd_policy(db, args):
     season = date_ms(args.season_start) if args.season_start else None
     if args.fast_delay is not None and not 0 <= args.fast_delay <= 60:
         raise ValueError("--fast-delay must be between 0 and 60 seconds")
+    if args.fast_flight is not None and not 1 <= args.fast_flight <= 100:
+        raise ValueError("--fast-flight must be between 1 and 100")
     with db:
         before = get_policy(db)["season_start"]
         signups, fast = {"on": 1, "off": 0}.get(args.signups), {"on": 1, "off": 0}.get(args.fast)
         for name, value in (("enabled", args.enabled), ("delay", args.delay), ("message", args.message),
                             ("season_start", season), ("signups", signups), ("fast", fast),
-                            ("fast_delay", args.fast_delay)):
+                            ("fast_delay", args.fast_delay), ("fast_flight", args.fast_flight)):
             if value is not None:
                 db.execute("INSERT OR REPLACE INTO settings VALUES(?, ?)", (name, str(value)))
         if season is not None and season < before:
@@ -1018,6 +1023,9 @@ def main(argv=None):
     policy_parser.add_argument("--fast-delay", type=float, metavar="SECONDS",
                                help="fast mode's shortest gap between requests (default %g; collectors never go "
                                     "under 0.4 s whatever this says)" % DEFAULT_FAST_DELAY)
+    policy_parser.add_argument("--fast-flight", type=int, metavar="N",
+                               help="how many requests fast mode may have on their way at once (default %d; "
+                                    "collectors never go above 4 whatever this says)" % DEFAULT_FAST_FLIGHT)
     policy_parser.add_argument("--message", help="short message shown to every collector ('' to clear)")
     policy_parser.add_argument("--signups", choices=("on", "off"),
                                help="whether new installs can get their own key automatically")

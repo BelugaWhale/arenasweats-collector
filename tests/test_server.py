@@ -729,6 +729,7 @@ class Limits(ServerCase):
         # could not upload for a while holds at most OUTBOX_LIMIT more.
         self.assertGreater(ingest.GAMES_PER_DAY, 86400 / collector.FAST_MIN_DELAY + collector.OUTBOX_LIMIT)
         self.assertEqual(ingest.DEFAULT_FAST_DELAY, collector.FAST_MIN_DELAY)
+        self.assertEqual(ingest.DEFAULT_FAST_FLIGHT, collector.FAST_MAX_FLIGHT)
         # At most one work request every FAST_WORK_SECONDS, a full upload every UPLOAD_BATCH matches, and one more
         # upload with each work request.
         most = 60 / collector.FAST_WORK_SECONDS * 2 + 60 / collector.FAST_MIN_DELAY / collector.UPLOAD_BATCH
@@ -748,17 +749,20 @@ class Policy(ServerCase):
     def test_policy_is_served_and_changeable(self):
         headers = {"Authorization": "Bearer " + self.key}
         self.assertEqual(self.client.get("/v1/policy", headers=headers).get_json(),
-                         {"enabled": True, "delay": 2.0, "fast": True, "fast_delay": 0.4, "message": "",
-                          "season_start": ingest.date_ms("2026-10-06")})
+                         {"enabled": True, "delay": 2.0, "fast": True, "fast_delay": 0.4, "fast_flight": 4,
+                          "message": "", "season_start": ingest.date_ms("2026-10-06")})
         self.admin("policy", "--off", "--delay", "5", "--message", "back soon", "--season-start", "2027-01-15",
-                   "--fast", "off", "--fast-delay", "1.5")
+                   "--fast", "off", "--fast-delay", "1.5", "--fast-flight", "2")
         self.assertEqual(self.client.get("/v1/policy", headers=headers).get_json(),
-                         {"enabled": False, "delay": 5.0, "fast": False, "fast_delay": 1.5, "message": "back soon",
-                          "season_start": ingest.date_ms("2027-01-15")})
+                         {"enabled": False, "delay": 5.0, "fast": False, "fast_delay": 1.5, "fast_flight": 2,
+                          "message": "back soon", "season_start": ingest.date_ms("2027-01-15")})
         for wrong in ("-1", "nan", "inf", "61"):
             self.assertIn("Not understood", self.admin("policy", "--fast-delay", wrong))
+        for wrong in ("0", "-1", "101"):
+            self.assertIn("Not understood", self.admin("policy", "--fast-flight", wrong))
         self.assertEqual(ingest.get_policy(self.db)["fast_delay"], 1.5)
-        self.assertIn("'fast_delay': 1.5", self.admin("stats"))
+        self.assertEqual(ingest.get_policy(self.db)["fast_flight"], 2)
+        self.assertIn("'fast_delay': 1.5, 'fast_flight': 2", self.admin("stats"))
         self.assertEqual(self.post(self.games).get_json()["policy"]["enabled"], False)
         self.assertEqual(self.work()["policy"]["fast"], False)
         self.assertFalse(ingest.relay_status(self.db, self.now)["fast"])
@@ -1478,12 +1482,10 @@ class SeveralAtOnce(WithServer):
 
     def test_arenasweats_can_allow_fewer_at_once_but_never_more(self):
         # ArenaSweats' setting is the brake for every collector at once; it must work, and must not work as a throttle up.
-        original = ingest.get_policy
-        self.addCleanup(setattr, ingest, "get_policy", original)
-        ingest.get_policy = lambda db: dict(original(db), fast_flight=2)
+        self.admin("policy", "--fast-flight", "2")
         made = self.run_collector(minutes=10, server=self.server(), fast=True)
         self.assertEqual((self.flights.most, made.flight_limit), (2, 2))
-        ingest.get_policy = lambda db: dict(original(db), fast_flight=50)
+        self.admin("policy", "--fast-flight", "50")
         made = self.run_collector(minutes=15, server=self.server(), fast=True, hours_later=1)
         self.assertEqual((self.flights.most, made.flight_limit), (collector.FAST_MAX_FLIGHT, collector.FAST_MAX_FLIGHT))
 

@@ -89,7 +89,7 @@ Trust covers what a match says, not its size or shape:
 | | |
 | --- | --- |
 | `POST /v1/register` | No key needed. A new install gets its own key (201 `{"key", "name"}`). |
-| `GET /v1/policy` | Whether to collect, the pace, whether fast mode is allowed and its shortest gap, a short message, the season's start. |
+| `GET /v1/policy` | Whether to collect, the pace, whether fast mode is allowed, its shortest gap and how many requests it may have on their way at once, a short message, the season's start. |
 | `POST /v1/work` | Takes match-list reports; answers with matches to fetch and lists to read. |
 | `POST /v1/games` | `{"games": [...]}`, gzip allowed. Answers with accepted / duplicates / skipped / rejected. |
 | `GET /healthz` | No key needed. |
@@ -105,6 +105,7 @@ python server/ingest.py policy --season-start 2026-10-06
 python server/ingest.py policy --off          # every collector pauses within 10 minutes
 python server/ingest.py policy --fast off     # fast-mode collectors go back to the normal pace (--delay)
 python server/ingest.py policy --fast-delay 1 # fast mode keeps at least 1 s between requests (default 0.4)
+python server/ingest.py policy --fast-flight 2 # fast mode has at most 2 requests on their way at once (default 4, 1 = one at a time)
 python server/ingest.py policy --signups off  # new installs can no longer get a key
 python server/ingest.py policy --on --delay 3 --message "thanks!"
 python server/ingest.py stats                 # per server: matches held, still to fetch, players to read
