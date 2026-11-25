@@ -65,8 +65,6 @@ counting down 30 seconds; no answer means no, and it asks again at the next star
 yes is remembered in `config.json`, and from then on it starts as administrator by itself
 (Windows asks your permission each time); to undo that, start it once with `--no-admin`, or
 delete the `"admin"` line from `config.json`. As administrator it makes exactly the same
-read-only requests, and nothing else. Where knowing the folder League is installed
-in can help (Riot's own client; the Chinese client's folder cannot help), a line in its
-window offers to take it, and it keeps looking meanwhile.
+read-only requests, and nothing else.
 
 MIT licence; see [`LICENSE`](LICENSE).

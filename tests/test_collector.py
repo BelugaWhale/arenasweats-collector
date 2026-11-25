@@ -249,7 +249,7 @@ class Gentle(CollectorCase):
         os.remove(os.path.join(self.league_dir, "lockfile"))
         self.clock.at(self.clock.now() + 120, lambda: self.fake.write_lockfile(self.league_dir))
         made = self.run_collector()
-        self.assertIn("Waiting for the League client", self.output.getvalue())
+        self.assertIn("League is not open. Open League and log in", self.output.getvalue())
         self.assertEqual(self.stored_ids(made), self.fake.arena_ids())
 
 
@@ -660,30 +660,8 @@ class HiddenClient(CollectorCase):
         self.assertIn("Windows hides the League client from the collector, because League runs as administrator.",
                       self.output.getvalue())
         self.assertIn("answer y to the administrator question", self.output.getvalue())
-        self.assertNotIn("Waiting for the League client", self.output.getvalue())
+        self.assertNotIn("League is not open", self.output.getvalue())
         self.assertEqual(self.stored_ids(made) if made.store else set(), set())
-
-    def test_the_folder_typed_in_is_used_and_remembered(self):
-        install = os.path.join(self.tmp.name, "WeGameApps", "英雄联盟")
-        self.fake.write_lockfile(os.path.join(install, "LeagueClient"))
-        os.makedirs(os.path.join(install, "TCLS"))
-        open(os.path.join(install, "TCLS", "Client.exe"), "w").close()
-        saved = {}
-        for name, value in (("save_config", lambda **values: saved.update(values)), ("answerable", lambda: True)):
-            self.addCleanup(setattr, collector, name, getattr(collector, name))
-            setattr(collector, name, value)
-        made = self.collector(league_dir=None)
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            made.offer_folder()
-            self.assertTrue(made.take_folder('"%s"' % os.path.join(install, "TCLS")))      # the shortcut's folder
-        self.assertIn("Open file location", output.getvalue())
-        self.assertIn("打开文件所在的位置", output.getvalue())
-        self.assertEqual(saved, {"league_dir": install})
-        self.assertEqual(made.opts.league_dir, install)
-        self.assertEqual(collector.lockfile_paths(made.opts.league_dir)[0],
-                         [os.path.join(install, "LeagueClient", "lockfile")])
-
 
 class PlainLcu(collector.Lcu):
     """The fake client speaks plain HTTP, where the real one speaks HTTPS."""
@@ -795,7 +773,7 @@ class ClientPrograms(CollectorCase):
     def test_the_moment_the_client_closes_is_logged_with_what_the_collector_was_doing(self):
         self.clock.at(self.clock.now() + 120, self.close_client)
         _, output = self.run_logged(minutes=30)
-        self.assertIn("Waiting for the League client", self.output.getvalue())
+        self.assertIn("League is not open. Open League and log in", self.output.getvalue())
         closed = [line for line in output if "League client program closed" in line]
         self.assertEqual(len(closed), 1)
         for text in ("LeagueClient (pid 4141) after running 1h02m, memory 300 MB", "LeagueClientUx (pid 4242)",
@@ -1134,9 +1112,8 @@ class DefaultSearch(unittest.TestCase):
         self.assertEqual(collector.riot_records(riot), ["D:/Riot Games/League of Legends", "E:/LoL/"])
 
 
-class FolderLine(CollectorCase):
-    """Windows hides Riot's own client and no lockfile was found: the window takes League's folder, while the
-    collector keeps looking. Never for the Tencent client, whose lockfile cannot help."""
+class FoundBy(CollectorCase):
+    """Which step of its own search found the client is told to ArenaSweats while it collects."""
 
     def setUp(self):
         super().setUp()
@@ -1144,58 +1121,14 @@ class FolderLine(CollectorCase):
         self.install = os.path.join(self.tmp.name, "Riot Games", "League of Legends")
         os.makedirs(self.install)
         open(os.path.join(self.install, "LeagueClient.exe"), "w").close()
-        self.answers, self.saved, self.hidden, self.programs = [], {}, True, []
-
-        def read_typed():
-            if self.answers and self.clock.now() >= self.answers[0][0]:
-                return self.answers.pop(0)[1]
-            return None
-
-        def running_client_dirs():
-            collector.related_running[:] = self.programs
-            return [None] if self.hidden else []
-        for name, value in (("answerable", lambda: True), ("read_typed", read_typed),
-                            ("save_config", lambda **values: self.saved.update(values)),
-                            ("running_client_dirs", running_client_dirs), ("command_line_logins", lambda: []),
+        for name, value in (("running_client_dirs", lambda: []), ("command_line_logins", lambda: []),
                             ("scan_drives", lambda roots=None, seconds=0: []), ("is_elevated", lambda: True),
                             ("game_running", lambda: False)):
             self.addCleanup(setattr, collector, name, getattr(collector, name))
             setattr(collector, name, value)
 
-    def test_the_line_is_offered_where_a_folder_can_help(self):
-        # Why: it must reach the helpers it can help, and only them.
-        self.run_collector(minutes=2, league_dir=None)
-        self.assertIn("Or paste the folder League is installed in and press Enter, for example "
-                      "C:\\Riot Games\\League of Legends.", self.output.getvalue())
-        self.assertIn("也可以粘贴英雄联盟的安装文件夹并按回车", self.output.getvalue())
-
-    def test_never_where_a_folder_cannot_help(self):
-        # Why: a folder cannot give the Tencent client's login, and asking for one sends helpers the wrong way.
-        self.hidden = False
-        self.run_collector(minutes=5, league_dir=None)                                     # no League program
-        self.assertNotIn("paste the folder", self.output.getvalue())
-        self.hidden, self.programs = True, ["wegame.exe"]
-        self.run_collector(minutes=2, league_dir=None)                                     # the Tencent client
-        self.assertNotIn("paste the folder", self.output.getvalue())
-
-    def test_a_wrong_folder_keeps_the_line_and_a_right_one_collects_and_says_how(self):
-        # Why: check-ins must go on while the line stands, and the found step must reach ArenaSweats.
-        start = self.clock.now()
-        self.answers = [(start + 30, os.path.join(self.tmp.name, "nothing")), (start + 90, self.install)]
-        self.clock.at(start + 60, lambda: self.fake.write_lockfile(self.install))      # League opens meanwhile
-        server = StubServer()
-        made = self.run_collector(minutes=10, league_dir=None, server=server)
-        text = self.output.getvalue()
-        self.assertIn("No League was found in or near that folder.", text)
-        self.assertIn("League found in %s." % self.install, text)
-        self.assertEqual(self.saved, {"league_dir": self.install})
-        self.assertTrue(made.store is not None)
-        self.assertTrue([call for call in server.calls if call[1] == "client_unreachable"])    # checked in meanwhile
-        self.assertIn("found_typed", [call[2] for call in server.calls])
-
     def test_how_the_client_was_found_is_said_while_collecting(self):
         # Why: this shows which of the search's steps installs need, so the search can be fixed where it fails.
-        self.hidden = False
         self.fake.write_lockfile(self.install)
         self.addCleanup(setattr, collector, "installed_dirs", collector.installed_dirs)
         collector.installed_dirs = lambda: [self.install]

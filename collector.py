@@ -134,8 +134,6 @@ UPLOAD_BATCH = 20      # matches per upload
 POLICY_SECONDS = 600   # how often to ask the server whether collection should continue
 PACE_SECONDS = 300     # how often ArenaSweats is told a few numbers about this collector's own pace (see pace_report)
 CHANGE_SECONDS = 10    # before collection starts, a change in why it has not is told at once, but not more often
-FOLDER_EXAMPLE = "C:\\Riot Games\\League of Legends"    # the example of a League folder the window shows (a folder
-                                                          # helps only Riot's own client: see Collector.connect)
 TEST_MINUTES = 15      # length of a test run (no upload address set)
 MAX_LCU_BYTES = 8 * 1024 * 1024
 
@@ -1709,8 +1707,6 @@ class Collector:
         self.idle_at = float("-inf")       # last time the client was seen idle
         self.ended = False                 # why it stops has been told to ArenaSweats (tell_end)
         self.elevated = is_elevated()      # this copy runs as administrator (None: not Windows)
-        self.standing = None               # a line that stays up for an answer: folder (where League is installed)
-        self.folder_given = False          # a folder typed in this run led to League
         self.found_code = ""               # which step of the search found the client in use (report_found)
         # Administrator rights (asked at start, see main), for the reason codes: this copy runs as administrator;
         # or asked and answered no (or nothing), or --no-admin; or answered yes and Windows did not start it so.
@@ -1817,7 +1813,6 @@ class Collector:
 
     def connect(self):
         """Wait for a running, logged-in League client."""
-        rounds = 0
         while True:
             paths, running, hidden = lockfile_paths(self.opts.league_dir)
             by_lockfile, by_command_line = [], None
@@ -1825,7 +1820,7 @@ class Collector:
                 by_lockfile.append(self.try_client(path, lambda path=path: read_lockfile(path)))
                 if by_lockfile[-1] == "connected":
                     self.report_found(found_by.get(path, "typed"))
-                    return self.drop_question()
+                    return
             answered = any(result.startswith("login") for result in by_lockfile)
             if running and not answered:
                 by_command_line = []
@@ -1833,9 +1828,8 @@ class Collector:
                     by_command_line.append(self.try_client("the client's command line", lambda login=login: Lcu(*login)))
                     if by_command_line[-1] == "connected":
                         self.report_found("cmdline")
-                        return self.drop_question()
+                        return
                 answered = any(result.startswith("login") for result in by_command_line)
-            rounds += 1
             # Why, for ArenaSweats: whether Windows lists the client's programs and says where they are, a program
             # that starts the client (WeGame, TCLS, Riot Client), and what the first lockfile and command line gave.
             state = "client_unreachable" if running else "waiting_for_client"
@@ -1866,74 +1860,12 @@ class Collector:
                                   "and answer y to the administrator question.",
                                   "英雄联盟以管理员身份运行，所以 Windows 不让采集器看到它。\n         "
                                   "要开始采集：请关闭此窗口，重新启动采集器，在询问是否以管理员身份运行时回答 y。"), once=True)
-                # A folder can lead to the client only where Windows hides where the client is and no lockfile
-                # was found, and only for Riot's own client: the Tencent client's lockfile is empty, so its
-                # folder cannot help (it is known by its lockfile, or by WeGame or TCLS running).
-                tencent = tencent_lockfile or any(word in name.lower() for name in related_running
-                                                  for word in ("wegame", "tcls"))
-                if hidden and not by_lockfile and not tencent and rounds >= 2:
-                    self.offer_folder()
             else:
-                self.say(both("Waiting for the League client. Open League and log in.",
-                              "正在等待英雄联盟客户端。请打开英雄联盟并登录。"), once=True)
+                self.say(both("League is not open. Open League and log in: the collector starts by itself when "
+                              "it sees League.",
+                              "没有检测到英雄联盟客户端。请打开英雄联盟并登录，采集器检测到后会自动开始。"), once=True)
             self.heartbeat(state, ".".join(steps + ([self.admin_code] if self.admin_code else [])))
-            self.wait_round(10)
-
-    def wait_round(self, seconds):
-        """Wait before looking for the client again. While the folder line is up, an answer is taken within a
-        second, and a folder that leads to League is looked at straight away."""
-        for _ in range(int(seconds)):
-            if self.standing:
-                answer = read_typed()
-                if answer is not None and self.take_folder(answer):
-                    return
-            self.sleep(1)
-
-    def drop_question(self):
-        """The client can be reached: the folder line, if it is up, is no longer needed."""
-        self.standing = None
-        typed.clear()
-
-    def offer_folder(self):
-        """Put up a line that takes League's folder, where that can lead to the client (see connect). It stays up
-        while the collector keeps looking and checking in; an answer is optional (wait_round reads it). Only one
-        line is up at a time, only when somebody can type, and not again once a folder led to League."""
-        if self.standing or self.folder_given or not answerable():
-            return
-        print(both("Or paste the folder League is installed in and press Enter, for example " + FOLDER_EXAMPLE
-                   + ".\nTo find it: right-click your League shortcut and choose 'Open file location'.",
-                   "也可以粘贴英雄联盟的安装文件夹并按回车，例如 " + FOLDER_EXAMPLE + "。\n"
-                   "查找方法：右键点击英雄联盟的快捷方式，选择“打开文件所在的位置”。", 0))
-        typed.clear()
-        self.standing = "folder"
-
-    def take_folder(self, answer):
-        """An answer to the folder line. True when it leads to a League install (the line goes); otherwise one
-        line says why and the line stays."""
-        if not answer.strip():
-            return False
-        folder, problem = find_install(answer)
-        if problem == "shortcut":
-            print(both("That is a shortcut that cannot be read. Paste the folder instead: right-click the shortcut "
-                       "and choose 'Open file location'.",
-                       "这是一个无法读取的快捷方式。请改为粘贴文件夹：右键点击快捷方式，选择“打开文件所在的位置”。", 0))
-            return False
-        if folder is None:
-            print(both("No League was found in or near that folder. Paste another one, or leave it: the collector "
-                       "keeps looking.",
-                       "在该文件夹及附近没有找到英雄联盟。可以再粘贴一个文件夹，或者不用管：采集器会继续查找。", 0))
-            return False
-        log.info("folder given: %s", folder)
-        self.standing, self.folder_given = None, True
-        self.opts.league_dir = folder
-        save_config(league_dir=folder)
-        if existing_lockfiles(([folder], 2)):
-            print(both("League found in %s." % folder, "已在 %s 找到英雄联盟。" % folder, 0))
-        else:
-            print(both("That is League's folder, but League is not running from it. Open League and log in; the "
-                       "collector keeps looking there.",
-                       "这是英雄联盟的文件夹，但英雄联盟没有从这里运行。请打开英雄联盟并登录，采集器会继续在这里查找。", 0))
-        return True
+            self.sleep(10)
 
     def report_found(self, step):
         """Note which step of the search found the client in use, sent with the state while it collects (found_ and
@@ -3173,45 +3105,6 @@ def game_running():
     """Whether a match is being played: the game program is running. Windows lists every program's name, even
     when it hides where the client is."""
     return any(name.lower() == GAME_PROGRAM for _, name in running_programs())
-
-
-typed = []          # what has been typed so far in answer to a question that stays up (read_typed)
-
-
-def read_typed():
-    """The answer to a question that stays up while the collector carries on: the line typed, once Enter is
-    pressed; until then None, at once (it never waits)."""
-    if os.name == "nt":
-        import msvcrt
-        while msvcrt.kbhit():
-            char = msvcrt.getwch()
-            if char in ("\x00", "\xe0"):          # an arrow or function key; its second half follows
-                msvcrt.getwch()
-            elif char == "\x03":
-                raise KeyboardInterrupt
-            elif char in ("\r", "\n"):
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                line = "".join(typed)
-                typed.clear()
-                return line
-            elif char == "\x08":
-                if typed:
-                    typed.pop()
-                    sys.stdout.write("\b \b")
-            else:
-                typed.append(char)
-                sys.stdout.write(char)
-            sys.stdout.flush()
-        return None
-    import select
-    try:
-        if not select.select([sys.stdin], [], [], 0)[0]:
-            return None
-    except (OSError, ValueError):
-        return None
-    line = sys.stdin.readline()
-    return line.rstrip("\r\n") if line else None
 
 
 def export(data_dir, target):
