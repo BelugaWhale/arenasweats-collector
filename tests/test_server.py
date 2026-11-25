@@ -175,6 +175,47 @@ class Keys(ServerCase):
         self.client.get("/v1/policy", headers=headers)
         self.assertEqual(self.count("contributor_pace"), 1)
 
+    def test_why_an_install_is_not_collecting_is_kept(self):
+        # Why: this code is the only way to learn why an install sends nothing; lost or mangled, we are blind again.
+        headers = {"Authorization": "Bearer " + self.key, "X-Collector-State": "client_unreachable",
+                   "X-Collector-Detail": "path_hidden.lock_badfile.cmd_none", "User-Agent": "arenasweats-collector/0.3.8"}
+        self.client.get("/v1/policy", headers=headers)
+        self.assertEqual(self.db.execute("SELECT state, detail FROM contributor_seen").fetchone(),
+                         ("client_unreachable", "path_hidden.lock_badfile.cmd_none"))
+        self.assertIn("client_unreachable 0.3.8   why: path_hidden.lock_badfile.cmd_none", self.admin("keys"))
+        headers.update({"X-Collector-State": "paused", "X-Collector-Detail": "phase_endofgame"})     # a new reason
+        self.client.get("/v1/policy", headers=headers)                                         # is kept at once
+        self.assertEqual(self.db.execute("SELECT state, detail FROM contributor_seen").fetchone(),
+                         ("paused", "phase_endofgame"))
+        for odd in ("C:\\Users\\张三\\英雄联盟", "x" * 65):                                       # never a path
+            headers["X-Collector-Detail"] = odd
+            self.now += 120
+            self.client.get("/v1/policy", headers=headers)
+            self.assertEqual(self.db.execute("SELECT detail FROM contributor_seen").fetchone()[0], "unknown")
+        del headers["X-Collector-Detail"]                                                      # older collectors
+        self.now += 120
+        self.client.get("/v1/policy", headers=headers)
+        self.assertEqual(self.db.execute("SELECT detail FROM contributor_seen").fetchone()[0], "")
+
+    def test_a_database_from_before_the_detail_column_still_takes_check_ins(self):
+        # Why: every collector request records a check-in first; if that write failed, every collector would stop.
+        path = os.path.join(self.tmp.name, "old.db")
+        old = ingest.sqlite3.connect(path)
+        old.executescript(ingest.SCHEMA.replace(",\n    detail TEXT NOT NULL DEFAULT ''", ""))
+        old.execute("INSERT INTO contributor_seen VALUES(99, 100, 'collecting', '0.3.7')")
+        old.commit()
+        old.close()
+        os.environ["INGEST_DB"] = path
+        self.key = self.add_key("bob")
+        headers = {"Authorization": "Bearer " + self.key, "X-Collector-State": "paused",
+                   "X-Collector-Detail": "phase_inprogress"}
+        self.assertEqual(self.client.get("/v1/policy", headers=headers).status_code, 200)
+        db = ingest.connect()
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute("SELECT contributor_id, state, detail FROM contributor_seen ORDER BY 1").fetchall(),
+                         [(1, "paused", "phase_inprogress"), (99, "collecting", "")])
+        self.assertIn("why: phase_inprogress", self.admin("keys"))
+
     def test_no_key_or_wrong_key_is_refused(self):
         self.assertEqual(self.client.post("/v1/games", data=b"{}").status_code, 401)
         self.assertEqual(self.client.post("/v1/work", data=b"{}").status_code, 401)

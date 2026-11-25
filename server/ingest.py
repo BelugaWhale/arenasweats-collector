@@ -90,9 +90,11 @@ PUUID_RE = re.compile(r"[0-9A-Za-z_-]{20,100}")
 SCHEMA = """
 -- Sign-ups of the last day, for the daily limits. The address is stored only as a hash.
 CREATE TABLE IF NOT EXISTS signups(at INTEGER NOT NULL, address TEXT NOT NULL);
--- When each install last got in touch, and what it said it was doing (collecting, paused, ...).
+-- When each install last got in touch, what it said it was doing (collecting, paused, ...) and, when it is not
+-- collecting, why, as a short fixed code (paused in the post-game screen, the client's folder hidden, ...).
 CREATE TABLE IF NOT EXISTS contributor_seen(
-    contributor_id INTEGER PRIMARY KEY, seen_at INTEGER NOT NULL, state TEXT NOT NULL, version TEXT NOT NULL);
+    contributor_id INTEGER PRIMARY KEY, seen_at INTEGER NOT NULL, state TEXT NOT NULL, version TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '');
 -- What installs say about their own pace, every few minutes while they collect (see note_pace).
 CREATE TABLE IF NOT EXISTS contributor_pace(
     contributor_id INTEGER NOT NULL, at INTEGER NOT NULL, version TEXT NOT NULL, report TEXT NOT NULL);
@@ -175,10 +177,23 @@ def connect():
         db = sqlite3.connect(path, timeout=10)
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(SCHEMA)
+        add_seen_detail(db)
         add_outbox(db)
         prepared.add(path)
     db.execute("PRAGMA synchronous=NORMAL")
     return db
+
+
+def add_seen_detail(db):
+    """The `detail` column of contributor_seen, in a database made before it existed. Two workers starting at
+    once may both try; the second finds the column there."""
+    if "detail" in {row[1] for row in db.execute("PRAGMA table_info(contributor_seen)")}:
+        return
+    try:
+        db.execute("ALTER TABLE contributor_seen ADD COLUMN detail TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError as error:
+        if "duplicate column" not in str(error):
+            raise
 
 
 def add_outbox(db):
@@ -310,23 +325,27 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_BODY     # larger bodies are refused before being read
 recent = defaultdict(deque)                     # contributor id -> times of recent requests
 recent_lock = threading.Lock()
-seen_written = {}                               # (contributor id, state) -> when this worker last stored it
+seen_written = {}                               # (contributor id, state, detail) -> when this worker last stored it
 SEEN_EVERY = 60                                 # store a contributor's "last seen" at most this often per state
 
 
 def note_seen(db, contributor, now):
-    """Remember when an install last got in touch and what it said it was doing, for health checks."""
+    """Remember when an install last got in touch, what it said it was doing and why (X-Collector-Detail, a short
+    fixed code; collectors after 0.3.7 send it), for health checks."""
     state = request.headers.get("X-Collector-State", "")
     state = state if re.fullmatch(r"[a-z_]{1,32}", state) else "unknown"     # "_fast" at the end: fast mode is on
+    detail = request.headers.get("X-Collector-Detail", "")
+    detail = detail if re.fullmatch(r"[a-z0-9_.]{0,64}", detail) else "unknown"
     agent = request.headers.get("User-Agent", "")
     version = agent.split("/", 1)[1] if agent.startswith("arenasweats-collector/") else ""
     version = version if re.fullmatch(r"[0-9A-Za-z.+-]{1,20}", version) else ""
     with recent_lock:
-        if now - seen_written.get((contributor, state), 0) < SEEN_EVERY:
+        if now - seen_written.get((contributor, state, detail), 0) < SEEN_EVERY:
             return
-        seen_written[(contributor, state)] = now
+        seen_written[(contributor, state, detail)] = now
     with db:
-        db.execute("INSERT OR REPLACE INTO contributor_seen VALUES(?, ?, ?, ?)", (contributor, int(now), state, version))
+        db.execute("INSERT OR REPLACE INTO contributor_seen(contributor_id, seen_at, state, version, detail) "
+                   "VALUES(?, ?, ?, ?, ?)", (contributor, int(now), state, version, detail))
 
 
 def fail(status, message, **headers):
@@ -813,13 +832,14 @@ def cmd_set_key(db, args, disabled):
 
 def cmd_keys(db, _args):
     rows = db.execute("""
-        SELECT c.name, c.disabled, COUNT(m.game_id), MAX(m.received_at), s.seen_at, s.state, s.version
+        SELECT c.name, c.disabled, COUNT(m.game_id), MAX(m.received_at), s.seen_at, s.state, s.version, s.detail
         FROM contributors c LEFT JOIN games m ON m.contributor_id = c.id
         LEFT JOIN contributor_seen s ON s.contributor_id = c.id GROUP BY c.id ORDER BY c.name""").fetchall()
     when = lambda moment: time.strftime("%Y-%m-%d %H:%M", time.localtime(moment)) if moment else "never"
-    for name, disabled, count, last, seen, state, version in rows:
-        print("%-24s %-4s %8d matches   last upload: %-16s   last seen: %-16s %s %s" % (
-            name, "OFF" if disabled else "on", count, when(last), when(seen), state or "", version or ""))
+    for name, disabled, count, last, seen, state, version, detail in rows:
+        print("%-24s %-4s %8d matches   last upload: %-16s   last seen: %-16s %s %s%s" % (
+            name, "OFF" if disabled else "on", count, when(last), when(seen), state or "", version or "",
+            "   why: " + detail if detail else ""))
 
 
 def cmd_pace(db, args):

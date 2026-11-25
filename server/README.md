@@ -79,10 +79,34 @@ Trust covers what a match says, not its size or shape:
   keeps it equal to the newest GitHub release, checking the release's SHA-256, from the normal
   user's cron every 30 minutes.
 - Every request records when that install was last seen and what it was doing
-  (`X-Collector-State`: collecting, paused, waiting_for_client, client_unreachable, client_failing;
-  with `_fast` added when its user turned the beta fast mode on, such as collecting_fast).
-  Collectors check in every 10 minutes even while paused. `ingest.py keys` shows it, and
-  `relay status` reports installs seen in the last hour and day by state.
+  (`X-Collector-State`: starting (signed up, no League client found yet; collectors up to 0.3.7
+  say collecting here), collecting, paused, waiting_for_client, client_unreachable,
+  client_failing, switched_off, and as it stops error or stopped; with `_fast` added when its
+  user turned the beta fast mode on, such as collecting_fast). Collectors after 0.3.7 also say
+  why they are not collecting (`X-Collector-Detail`), as a short fixed code, never a path, a
+  name or an error message:
+  - paused: `phase_` and the client's state, such as `phase_endofgame` or `phase_inprogress`,
+    or `phase_status_` and the status when the client would not say (0: no answer).
+  - waiting_for_client: `no_client` (no LeagueClient program running), with `.launcher` when
+    WeGame, TCLS or the Riot Client is running, and `.lock_` and a result when a lockfile was
+    found anyway.
+  - client_unreachable: `path_seen` or `path_hidden` (whether Windows says where the client
+    runs from; hidden when it runs as administrator), then `lock_` and the result for the first
+    lockfile found and `cmd_` and the result for the client's command line. Results: `none`
+    (nothing found), `login` and the client's status (it answered, nobody logged in yet, such
+    as `login404`), `badfile` (no port and password in it, as in the Tencent client's lockfile),
+    `refused` (nothing listening: a lockfile left from an earlier start), `reset`, `tls`,
+    `denied`, `gone`, `oserror`, `failed`. `path_hidden.lock_none.cmd_none` or
+    `path_seen.lock_badfile.cmd_none` means Windows does not let a normal program reach the
+    client: the collector has to run as administrator.
+  - error: `error.`, the kind of error and the collector's function it happened in, such as
+    `error.keyerror.work_round` (the details are in the volunteer's collector.log); stopped:
+    `ctrl_c`.
+
+  Until an install has collected anything, a change is sent at once (at most every 10 seconds),
+  so an install that is closed within a minute still shows why. After that, collectors check in
+  every 10 minutes, also while paused. `ingest.py keys` shows the last state and detail
+  (`why: ...`), and `relay status` reports installs seen in the last hour and day by state.
 - Every 5 minutes while it collects, a collector newer than 0.3.7 sends a few numbers about its own pace with
   one of its requests (`X-Collector-Pace`): how many requests it made to the League client, how many
   failed or were answered 429, how long the client took to answer (matches, and match lists by the
