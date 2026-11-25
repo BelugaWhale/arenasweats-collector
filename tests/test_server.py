@@ -178,7 +178,8 @@ class Keys(ServerCase):
     def test_why_an_install_is_not_collecting_is_kept(self):
         # Why: this code is the only way to learn why an install sends nothing; lost or mangled, we are blind again.
         headers = {"Authorization": "Bearer " + self.key, "X-Collector-State": "client_unreachable",
-                   "X-Collector-Detail": "path_hidden.lock_badfile.cmd_none", "User-Agent": "arenasweats-collector/0.3.8"}
+                   "X-Collector-Detail": "path_hidden.lock_badfile.cmd_none",
+                   "User-Agent": "arenasweats-collector/0.3.8"}
         self.client.get("/v1/policy", headers=headers)
         self.assertEqual(self.db.execute("SELECT state, detail FROM contributor_seen").fetchone(),
                          ("client_unreachable", "path_hidden.lock_badfile.cmd_none"))

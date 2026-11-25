@@ -1342,7 +1342,7 @@ class Server:
             raise Fatal("The upload address must start with https://")
         self.key = key or None      # None until this install has signed up (Collector.sign_up)
         self.state = "starting"     # what this collector is doing, sent with every request (see Collector.heartbeat)
-        self.detail = ""            # ... and, when it is not collecting, why: a short fixed code, never a path or a name
+        self.detail = ""            # ... and when it is not collecting why: a short fixed code, never a path or name
         self.told = None            # the (state, detail) that ArenaSweats last received
         self.problem = []           # after a call that got no answer: what went wrong (NoAnswer.tries)
         log.info("network: %s", network_setup(self.url))
@@ -1578,9 +1578,8 @@ class Collector:
             answered = any(result.startswith("login") for result in by_lockfile)
             if running and not answered:
                 by_command_line = []
-                for port, token, scheme in command_line_logins():
-                    by_command_line.append(self.try_client(
-                        "the client's command line", lambda port=port, token=token, scheme=scheme: Lcu(port, token, scheme)))
+                for login in command_line_logins():         # (port, password, protocol)
+                    by_command_line.append(self.try_client("the client's command line", lambda login=login: Lcu(*login)))
                     if by_command_line[-1] == "connected":
                         return
                 answered = any(result.startswith("login") for result in by_command_line)
@@ -1637,10 +1636,10 @@ class Collector:
         """Ask where League is installed, when the client is open but Windows will not say where. Nobody may be at
         the PC, so after FOLDER_SECONDS without an answer it carries on looking (and checking in) by itself."""
         self.folder_asks += 1
-        print(both("Windows does not let the collector see the League client. This happens when the client runs as\n"
-                   "administrator. Close this window and start the collector with right-click > 'Run as administrator',\n"
-                   "or tell the collector the folder League is installed in. To find it, right-click your League\n"
-                   "shortcut and choose 'Open file location'.",
+        print(both("Windows does not let the collector see the League client. This happens when the client runs\n"
+                   "as administrator. Close this window and start the collector with right-click >\n"
+                   "'Run as administrator', or tell the collector the folder League is installed in. To find it,\n"
+                   "right-click your League shortcut and choose 'Open file location'.",
                    "Windows 不让采集器看到英雄联盟客户端，这通常是因为客户端以管理员身份运行。请关闭此窗口，右键点击采集器，"
                    "选择“以管理员身份运行”；\n或者告诉采集器英雄联盟的安装文件夹：右键点击英雄联盟的快捷方式，"
                    "选择“打开文件所在的位置”即可找到。", 0))
@@ -1676,8 +1675,8 @@ class Collector:
         status, region = lcu.get("/riotclient/region-locale")
         log.info("connected via %s, account %s..., region-locale: %s %s", path, puuid[:8], status, region)
         self.watch.describe_soon()
-        self.say(both("Connected to the League client%s." % (" in " + os.path.dirname(path) if os.path.isabs(path) else ""),
-                      "已连接到英雄联盟客户端。"))
+        place = " in " + os.path.dirname(path) if os.path.isabs(path) else ""
+        self.say(both("Connected to the League client%s." % place, "已连接到英雄联盟客户端。"))
         self.say(both("Collecting only while you are not playing, one request every %.1f seconds, matches since %s."
                       % (self.delay, time.strftime("%Y-%m-%d", time.gmtime(self.season_start / 1000))),
                       "只在你不玩游戏时采集。"))
@@ -2751,8 +2750,9 @@ def save_config(**values):
             json.dump(config, handle, indent=2, ensure_ascii=False)
     except OSError as error:
         log.warning("could not save config.json: %s", error)
-        print(both("Could not save config.json beside the program (%s). The collector carries on, but next time it\n"
-                   "will not remember this. Move ArenaSweatsCollector.exe into a folder of its own that you can write to."
+        print(both("Could not save config.json beside the program (%s). The collector carries on, but next time\n"
+                   "it will not remember this. Move ArenaSweatsCollector.exe into a folder of its own that you can\n"
+                   "write to."
                    % (error.strerror or error),
                    "无法在程序旁边保存 config.json（%s）。采集器会继续运行，但下次启动时不会记得这次的设置。"
                    "请把 ArenaSweatsCollector.exe 移到一个你可以写入的单独文件夹。" % (error.strerror or error), 0))
