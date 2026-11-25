@@ -68,6 +68,50 @@ Live at `https://arenasweats.lol/collector/` on the website server.
   A report that arrives after its stretch went to someone else still adds the matches it
   saw to the wanted list, but cannot move the list's progress backwards or forwards.
 
+### What the order was measured against
+
+`python server/tools/simulate.py` plays the rules on a made-up world of players shaped like
+HN1's (how much they play, who queues together, lists of 20), prints how well the old rules
+replayed on HN1's real requests of 13-24 Nov give what really happened, and compares rules
+from there. `--endpoint` also plays `ingest.py` itself on the same world; a small run of
+that is one of the tests. At HN1's size, 30 days on from 25 Nov:
+
+| | requests a match: first 30 days, once caught up | days until half, 80% of the season is held | a new match is held after: half, 9 in 10 |
+| --- | --- | --- | --- |
+| HN1, 84,000 requests a day, rules until 25 Nov | 4.6, 7.5 | 2.0, 9.5 | 11 h, 40 h |
+| the same, rules now | 3.0, 3.2 | 1.0, 7.8 | 4 h, 20 h |
+| HN1 with 3 times the requests, rules until 25 Nov | 6.4, 10.4 | 0.8, 2.8 | 5 h, 33 h |
+| the same, rules now | 3.1, 3.2 | 0.5, 2.0 | 3 h, 20 h |
+| new server like HN10, 36,000 a day, rules until 25 Nov | 2.8, 4.8 | 10.8, 23.5 | 21 h, 133 h |
+| the same, rules now | 2.4, 3.5 | 7.0, 16.8 | 4 h, 19 h |
+| that server with 3 times the requests, rules until 25 Nov | 4.9, 9.4 | 3.0, 6.2 | 6 h, 46 h |
+| the same, rules now | 2.5, 3.3 | 2.0, 4.5 | 3 h, 19 h |
+
+What it also says, with the same caution (other seeds and a world twice the size move these
+numbers by a few tenths; how much players play other modes was fitted, not measured):
+
+- HN1 has about 10,000-11,000 Arena matches a day (0.3% of its match-id counter), not the
+  30,000-39,000 that 1% of the counter gives. Only near 11,000 does the replay give the fall
+  in new matches per list (4.0 to 1.1) and the age of the matches received (22 days on
+  24 Nov) that were measured; at 20,000 it gives 2.5 per list and 2 days. The days of
+  12-18 Nov, of which lists read a week later showed 96-100% as held, have 8,500-12,800
+  held each.
+- On 25 Nov HN1 held about 42% of its season, and as much again was still in somebody's
+  latest 20. The rest is out of reach, so no order gets to 95%; 80% is close to the limit.
+- Most of the faster filling comes from reading one page. The order adds: new matches
+  held three to five times sooner, none lost (on a server with one collector the old rules
+  lost 0.8% for good), and less than half the requests once caught up, when HN1's
+  collectors wait about 60% of the time.
+- `TARGET_SEEN` trades requests for delay: 5 gives 4.1 requests a match once caught up and
+  a third less delay, 15 gives 2.8 and a fifth more.
+- Reading every list at least weekly (as before) costs 7.6 requests a match for the same
+  matches. Judging a list by the matches no other list had shown, instead of all it shows,
+  is cheaper (2.5) but loses matches when the players whose lists did the showing stop
+  (94% held).
+- Which kind goes first while both wait (lists due again, players never read) moves the
+  80% mark by a day and the 9-in-10 delay by 7 hours, in opposite directions; half each
+  is the middle.
+
 ## What is still checked
 
 Trust covers what a match says, not its size or shape:

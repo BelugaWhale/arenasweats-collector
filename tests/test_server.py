@@ -22,14 +22,17 @@ import unittest.mock
 import urllib.error
 import urllib.request
 import warnings
+from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "server"))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
+sys.path.insert(0, os.path.join(ROOT, "server", "tools"))
 
 import collector  # noqa: E402
 import ingest  # noqa: E402
+import simulate  # noqa: E402
 from fake_lcu import FakeClient  # noqa: E402
 from test_collector import CollectorCase, history  # noqa: E402
 from werkzeug.serving import make_server  # noqa: E402
@@ -656,6 +659,39 @@ class Work(ServerCase):
     def test_reading_cannot_be_marked_beyond_the_present(self):
         self.work([self.report(self.handed(self.PLAYER), [], read_to=2 ** 52)], more=False)
         self.assertLessEqual(self.player(self.PLAYER)[1], int(self.now * 1000))
+
+
+class MadeUpWorld(unittest.TestCase):
+    """The rules for handing out work, played through the real endpoint on a small made-up world of players whose
+    lists show their latest 20 matches only (server/tools/simulate.py)."""
+
+    def test_ten_days_of_matches_are_collected_without_waste(self):
+        # These rules decide what every volunteer's collector does all day. A slip (a match asked for twice, a list
+        # read over and over, regular players never read again) would spend their requests on nothing for days.
+        ingest.recent.clear()
+        world = simulate.World(22, 40, seed=5)
+        start = next(p for p in range(world.players) if sum(1 for when in world.ptimes[p] if 10 < when < 12) > 5)
+        results = []
+        for make in (simulate.Endpoint, simulate.Proposed):               # ingest.py itself, then its stand-in
+            rules, counts = make(world, start), defaultdict(Counter)
+            if make is simulate.Endpoint:
+                self.addCleanup(rules.close)
+            simulate.collect(rules, 12.0, 22.0, lambda now: 300, counts)  # ten days, 300 client requests a day
+            fetches = sum(day["fetches"] for day in counts.values())
+            pages = sum(day["pages"] for day in counts.values())
+            later = [match for match, when in enumerate(world.mtime) if 14 <= when < 20]
+            results.append((sum(rules.held[match] for match in later) / len(later), (fetches + pages) / fetches))
+            self.assertEqual(fetches, len(rules.held_at))                 # no match was fetched twice
+            if make is simulate.Endpoint:                                 # and the daily counts say the same
+                asked, seen, already, new = rules.db.execute(
+                    "SELECT SUM(pages), SUM(seen), SUM(held), SUM(new) FROM read_days").fetchone()
+                self.assertEqual((asked, new), (pages, fetches))
+                self.assertGreater(already / seen, 0.5)                   # most matches a list shows are held already
+        (held, requests), (held_stand_in, requests_stand_in) = results
+        self.assertGreater(held, 0.97)                                    # the matches played meanwhile are held ...
+        self.assertLess(requests, 6.0)                                    # ... using well under half of the 300 requests a day
+        self.assertAlmostEqual(held, held_stand_in, delta=0.02)           # and the simulator's stand-in does the same
+        self.assertAlmostEqual(requests, requests_stand_in, delta=0.3)
 
 
 class Urgent(ServerCase):
