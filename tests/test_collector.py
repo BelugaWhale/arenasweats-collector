@@ -772,7 +772,7 @@ class ClientPrograms(CollectorCase):
         self.addCleanup(setattr, sys, "stdin", sys.stdin)
         sys.stdin = io.StringIO()          # not a console: the collector must not stop to ask for the folder
         self.run_collector(minutes=60, league_dir=None)
-        self.assertIn("cannot reach it yet", self.output.getvalue())
+        self.assertIn("Windows hides the League client from the collector", self.output.getvalue())
         self.assertLessEqual(len(self.opened), 3 * (3600 / collector.QUERY_RETRY + 1))   # was 3 every 10 seconds
 
     def test_a_new_program_with_the_same_process_id_is_read_again(self):
