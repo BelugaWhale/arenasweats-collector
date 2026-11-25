@@ -7,9 +7,10 @@ WHAT IT DOES
      the client was started with (what Task Manager shows for it).
   2. While you are not playing, slowly asks that client for this season's Arena
      match history: match lists of players, and the full record of Arena matches.
-     Fast mode, which you can turn on at start, waits a fifth as long between
-     requests, still one at a time. BETA: please only use it with unimportant
-     accounts for now.
+     Fast mode, which you can turn on at start, sends a request about every
+     0.4 seconds without waiting for the last one's answer, with at most 4 on
+     their way at once, and fewer whenever the client is slow to answer or
+     fails. BETA: please only use it with unimportant accounts for now.
   3. Sends the matches to ArenaSweats (DEFAULT_SERVER below), which tells it which
      players and matches to read next, so no two collectors read the same thing.
      The first time, it asks ArenaSweats for this install's own upload key and
@@ -23,9 +24,11 @@ WHAT IT NEVER DOES
   - It never touches the game itself (its process, memory or files).
   - It never sends your login token, password or account details anywhere.
     What leaves this computer, and only to the upload address, is: match
-    records, which Arena matches a player's list contains, and your own player
+    records, which Arena matches a player's list contains, your own player
     id (the same id that is in your match records; a server with no players
-    yet starts from it).
+    yet starts from it), and a few numbers about the collector's own pace
+    (how many requests it made, how many failed, how long the client took to
+    answer: see pace_report).
   - It keeps the computer awake while it runs (the screen can still turn off),
     and stops a click in its window from freezing it.
   - It needs no administrator rights and installs nothing. (When the League
@@ -47,14 +50,17 @@ import logging
 import logging.handlers
 import ntpath
 import os
+import queue
 import random
 import re
 import socket
 import sqlite3
 import ssl
+import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -62,7 +68,7 @@ import urllib.request
 import warnings
 import zipfile
 import zlib
-from collections import Counter, namedtuple
+from collections import Counter, deque, namedtuple
 
 VERSION = "0.3.7"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
@@ -75,10 +81,21 @@ KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 # ---------------------------------------------------------------------------
 MIN_DELAY = 1.0        # hard floor at the normal pace: at most one match-history request per second
 DEFAULT_DELAY = 2.0    # normal gap between match-history requests, in seconds
-FAST_FACTOR = 5        # fast mode (beta, only when the user turns it on) divides the gap by this, still one at a time,
-FAST_MIN_DELAY = 0.4   # never below its own hard floor; ArenaSweats can raise it (policy "fast_delay")
+FAST_FACTOR = 5        # fast mode (beta, only when the user turns it on) divides the gap by this,
+FAST_MIN_DELAY = 0.4   # never below its own hard floor; ArenaSweats can raise it (policy "fast_delay"). In fast mode
+                       # the gap runs from one request's start to the next one's: it does not wait for the answer first,
+FAST_MAX_FLIGHT = 4    # so several can be on their way at once, never more than this; ArenaSweats can lower it
+                       # (policy "fast_flight"). It starts with one at a time and allows one more after
+FLIGHT_CLEAN = 50      # this many good answers in a row that the next request was waiting for,
+FLIGHT_HOLD = 600      # but not for this long after trouble took one away (twice as long each time trouble comes
+                       # back soon after, up to FAST_REST).
+SLOW_FACTOR = 1.5      # Trouble is a failed request, or answers taking this many times as long as they do one at a time
+FLIGHT_WINDOW = 20     # (the middle one of this many answers of the same kind, against that of the last ones sent alone).
 FAST_SPEEDUP = "3"     # matches an hour in fast mode against the normal pace (fake client, real client's answer times)
 FAST_REST = 3600       # in fast mode, a 429 or 3 failed requests in a row bring back the normal pace for this long
+FAST_AHEAD = 5         # fast mode asks ArenaSweats for more work when this few requests are left to send,
+FAST_LISTS = 20        # for this many match lists at a time (ArenaSweats decides how many it hands out),
+FAST_WORK_SECONDS = 3  # and at most this often (the normal pace: WORK_SECONDS)
 PAGE_SIZE = 20         # matches per match-list request
 MAX_PAGES = 50         # never read further back than this many pages of one player's list
 FIRST_PAGES = 1        # a list is read one page at first ...
@@ -94,6 +111,7 @@ MAX_BACKOFF = 600      # longest extra wait after repeated failures, in seconds
 OUTBOX_LIMIT = 2000    # stop collecting when this many matches are waiting to upload
 UPLOAD_BATCH = 20      # matches per upload
 POLICY_SECONDS = 600   # how often to ask the server whether collection should continue
+PACE_SECONDS = 300     # how often ArenaSweats is told a few numbers about this collector's own pace (see pace_report)
 TEST_MINUTES = 15      # length of a test run (no upload address set)
 MAX_LCU_BYTES = 8 * 1024 * 1024
 
@@ -145,10 +163,6 @@ class ClientGone(Exception):
 
 class Done(Exception):
     """The time limit was reached."""
-
-
-class WorkExpired(Exception):
-    """Work from the upload server was held too long (for example through a game) and may be someone else's now."""
 
 
 class Fatal(Exception):
@@ -793,6 +807,78 @@ def describe(game):
         ", ".join("%s=%s" % (name, "yes" if name in stats else "NO") for name in wanted))
 
 
+def request_kind(path):
+    """Which answer times a match-history request's belong with: the first page of a list ("top", the
+    slow one), a further page ("page") or a match ("match")."""
+    return "match" if "/games/" in path else "top" if "begIndex=0&" in path else "page"
+
+
+class ListRead:
+    """One stretch of a player's match list, read a page at a time: up to `pages` pages from place
+    `begin`, no further back than `since` (ms). Collector.take_page takes in each page's answer."""
+
+    def __init__(self, puuid, since, begin=0, pages=MAX_PAGES):
+        self.puuid, self.since, self.begin, self.pages = puuid, since, begin, pages
+        self.page = 0                                   # pages read so far
+        self.arena, self.newest, self.complete, self.following = [], 0, True, 0
+        self.done = begin >= MAX_PAGES * PAGE_SIZE      # nothing (more) to ask for
+
+    @property
+    def path(self):
+        """The address of the next page."""
+        start = self.begin + self.page * PAGE_SIZE
+        return "/lol-match-history/v1/products/lol/%s/matches?begIndex=%d&endIndex=%d" % (
+            self.puuid, start, start + PAGE_SIZE - 1)
+
+    def fail(self):
+        """The read did not work: nothing it found counts, and it is tried again another time."""
+        self.arena, self.newest, self.complete, self.following, self.done = [], 0, False, 0, True
+
+    def result(self):
+        """(the Arena matches found, the newest match time seen, whether every request worked,
+        the place the list goes on from, or 0 when the end or `since` was reached)."""
+        return (self.arena, self.newest, self.complete,
+                self.following if self.following < MAX_PAGES * PAGE_SIZE else 0)
+
+
+class MatchFetch:
+    """One match to ask the client for in full."""
+
+    def __init__(self, game_id):
+        self.game_id = game_id
+        self.path = "/lol-match-history/v1/games/%d" % game_id
+
+
+class Flights:
+    """Calls that are on their way, each in a thread of its own, so that the next request need not wait
+    for the last one's answer. A thread only makes its one call. Everything that is done with the
+    answer happens in the main thread, which takes it with `land`."""
+
+    def __init__(self):
+        self.landed = queue.Queue()
+        self.count = 0                  # calls started whose answer has not been taken yet
+
+    def start(self, tag, call):
+        self.count += 1
+        threading.Thread(target=self.fly, args=(tag, call), daemon=True).start()
+
+    def fly(self, tag, call):
+        try:
+            answer = call()
+        except Exception as error:      # handed to the main thread like an answer; it decides what to do
+            answer = error
+        self.landed.put((tag, answer))
+
+    def land(self, seconds):
+        """The next call that finished, as (tag, answer), waiting up to `seconds` for one. None when none did."""
+        try:
+            landed = self.landed.get(timeout=seconds) if seconds > 0 else self.landed.get_nowait()
+        except queue.Empty:
+            return None
+        self.count -= 1
+        return landed
+
+
 # ---------------------------------------------------------------------------
 # Local store: one small SQLite file per account, in the data folder
 # ---------------------------------------------------------------------------
@@ -1252,14 +1338,19 @@ class Server:
         self.problem = []           # after a call that got no answer: what went wrong (NoAnswer.tries)
         log.info("network: %s", network_setup(self.url))
         self.fast = False           # the user turned fast mode on: "_fast" is added to the state sent
+        self.pace = None            # numbers about this collector's own pace (Collector.pace_report): the next
+                                    # request takes them along, once
 
     def call(self, method, path, payload=None):
         """Returns (status, parsed JSON or None, seconds the server asked us to wait).
         Status 0 = unreachable; `problem` then says why."""
         headers = {"Accept": "application/json", "User-Agent": "arenasweats-collector/" + VERSION,
                    "X-Collector-State": self.state + ("_fast" if self.fast else "")}
+        pace, self.pace = self.pace, None
         if self.key:
             headers["Authorization"] = "Bearer " + self.key
+            if pace:
+                headers["X-Collector-Pace"] = pace
         body = None
         if payload is not None:
             body = gzip.compress(json.dumps(payload, separators=(",", ":")).encode())
@@ -1291,7 +1382,21 @@ class Collector:
         self.platform = None               # which server this account is on, learned from a match list
         self.reports, self.last_work, self.work_failures = [], float("-inf"), 0    # dealings with the upload server
         self.introduced = False
-        self.work_deadline = None          # work from the server must be done before this time (see WorkExpired)
+        self.next_ask = 0.0                # earliest time of the next request for work (later after a failed one)
+        self.todo = deque()                # what ArenaSweats handed out and has still to be asked of the client
+        self.flights, self.flying, self.flown = Flights(), {}, 0    # requests on their way: number -> what it reads
+        self.asking = self.sending = None  # a request for work / an upload on its way: (reports | rows sent, when)
+        self.flight = 1                    # fast mode: how many requests may be on their way at once right now,
+        self.policy_flight = FAST_MAX_FLIGHT    # and ArenaSweats' ceiling for that (policy "fast_flight")
+        self.clean = 0                     # good answers in a row that the next request was waiting for
+        self.flight_hold, self.rise_at = FLIGHT_HOLD, float("-inf")    # after trouble: no more at once before rise_at
+        self.eased_at = float("-inf")      # when trouble last took one away
+        self.failed_at = float("-inf")     # when a match-history request last failed
+        kinds = ("top", "page", "match")   # answer times (s) of the last requests of each kind (see request_kind):
+        self.alone = {kind: deque(maxlen=FLIGHT_WINDOW) for kind in kinds}      # ... sent with no other on its way,
+        self.shared = {kind: deque(maxlen=FLIGHT_WINDOW) for kind in kinds}     # ... and with others on their way
+        self.pace, self.pace_at = Counter(), now()                              # for pace_report
+        self.pace_times = {kind: [] for kind in kinds + ("call",)}
         self.older_rest = {}               # player -> when a failing older part may be tried again (test runs)
         self.next_allowed = 0.0            # earliest time of the next match-history request
         self.failures = 0                  # match-history requests that failed in a row
@@ -1332,6 +1437,16 @@ class Collector:
         FAST_FACTOR, but nothing can lower it below the floor."""
         delay = max(MIN_DELAY, self.opts.delay, self.policy_delay)
         return max(self.floor, delay / FAST_FACTOR) if self.fast_on else delay
+
+    def gap(self):
+        """The wait before the next match-history request, a little different every time."""
+        return max(self.floor, self.delay * random.uniform(0.8, 1.2))
+
+    @property
+    def flight_limit(self):
+        """How many match-history requests may be on their way at once: one, or in fast mode as many as
+        the client has taken well so far, never more than FAST_MAX_FLIGHT or than ArenaSweats allows."""
+        return max(1, min(self.flight, FAST_MAX_FLIGHT, self.policy_flight)) if self.fast_on else 1
 
     def say(self, text, once=False):
         if once and text == self.last_said:
@@ -1482,17 +1597,26 @@ class Collector:
                  % (self.delay, time.strftime("%Y-%m-%d", time.gmtime(self.season_start / 1000))))
 
     def step(self):
-        self.upload()
-        if self.server and self.store.count(PENDING) + self.store.count(REFUSED) >= OUTBOX_LIMIT:
-            self.say("ArenaSweats is not taking uploads from this collector right now, so collection is paused.",
-                     once=True)
-            self.sleep(60)
-        elif self.server:
-            self.work_round()
-        else:
-            self.own_round()
+        try:
+            if self.outbox_full():
+                self.upload()
+            if self.outbox_full():
+                self.say("ArenaSweats is not taking uploads from this collector right now, so collection is paused.",
+                         once=True)
+                self.sleep(60)
+            elif self.server:
+                self.work_round()
+            else:
+                self.own_round()
+        except ClientGone:
+            self.drop_flying()      # no answer comes from a client that is gone,
+            self.todo.clear()       # and what was still to be read is left to other collectors
+            raise
         if self.now() - self.last_status >= 30:
             self.status()
+
+    def outbox_full(self):
+        return bool(self.server) and self.store.count(PENDING) + self.store.count(REFUSED) >= OUTBOX_LIMIT
 
     # -- deciding what to read, on its own (no upload address) -----------------------
     def own_round(self):
@@ -1583,7 +1707,12 @@ class Collector:
 
     # -- deciding what to read, with ArenaSweats (upload address set) ----------------
     def work_round(self):
-        """Tell ArenaSweats what the match lists just read contained, then read and fetch what it hands out."""
+        """One turn of the work with ArenaSweats: send it the matches that are waiting, ask it for more work
+        when it is time, send the client the next request that may go, then take in the next answer.
+        Uploads and requests for work travel in the background, so reading never waits for ArenaSweats.
+        At the normal pace one request to the client is on its way at a time, and more work is asked for
+        once the last has been done and sent; in fast mode there can be a few, and work is asked for a
+        little ahead."""
         if self.platform is None:
             # One look at the top of my own match list shows which server this account is on.
             self.read_list(self.me, int(self.wall() * 1000), 0, 1)
@@ -1591,65 +1720,207 @@ class Collector:
                 self.say("Could not tell yet which server this account is on. Trying again in a minute.", once=True)
                 self.sleep(60)
                 return
-        self.gate()         # work is only taken on when it can be done straight away (a pause hands in first)
-        work = self.ask_for_work()
-        if work is None:
+        began = self.now()
+        self.gate()         # nothing is read or taken on while you play (a pause hands in first: see hand_in)
+        if self.now() - began >= 1:
+            self.pace["paused"] += self.now() - began
+        if self.failures:
+            self.heartbeat("client_failing")
+        if self.now() - self.pace_at >= PACE_SECONDS:
+            self.server.pace = json.dumps(self.pace_report(), separators=(",", ":"))
+        self.send_matches()
+        self.ask_ahead()
+        self.start_request()
+        began, idle = self.now(), not self.todo and not self.flying
+        self.take(self.await_landing(self.patience()))
+        if idle:
+            self.pace["idle"] += self.now() - began
+        if self.fast and self.fast_allowed and self.now() < self.fast_rest_until:
+            self.pace["rested"] += self.now() - began
+
+    def patience(self):
+        """How long to wait for an answer before looking again at what may be sent: until the pace allows
+        the next request or it is time to ask for work, and never more than 5 seconds, so that the
+        client is looked at that often."""
+        waits = [5.0]
+        if self.todo and len(self.flying) < self.flight_limit:
+            waits.append(self.next_allowed - self.now())
+        if self.asking is None and self.wants_work():
+            waits.append(self.ask_at() - self.now())
+        return max(0.001, min(waits))
+
+    def await_landing(self, seconds):
+        """Wait up to `seconds` for a call that is on its way. Returns it as (tag, answer), or None."""
+        if not self.flights.count:
+            self.sleep(seconds)
+            return None
+        end = self.now() + seconds
+        while True:
+            if self.deadline is not None and self.now() >= self.deadline:
+                raise Done()
+            self.watch.tick(self.doing)
+            left = end - self.now()
+            landed = self.flights.land(min(max(left, 0.0), 1.0))
+            if landed or left <= 0:
+                return landed
+
+    def take(self, landed):
+        """Take in a call that was on its way: an upload, a request for work, or a request to the client
+        (whose answer is not looked at when it was dropped meanwhile: see drop_flying)."""
+        if landed is None:
             return
-        games = [i for i in as_list(work.get("games"))[:MAX_WORK_GAMES] if match_id({"gameId": i})]
-        players = [as_dict(item) for item in as_list(work.get("players"))[:MAX_WORK_PLAYERS]]
-        lease = work.get("lease")
-        lease = lease if isinstance(lease, int) and not isinstance(lease, bool) and 120 <= lease <= 3600 else 900
-        self.work_deadline = self.now() + lease - 60
-        try:
-            for game_id in games:
-                game, _ = self.get_game(game_id, self.platform)
-                if game:
-                    self.store.save_game(self.platform, game_id, game)
-                    self.upload()
-            for item in players:
-                def number(name, low, high, default):
-                    value = item.get(name)
-                    good = isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
-                    return value if good else default
-                if isinstance(item.get("puuid"), str) and PUUID_RE.fullmatch(item["puuid"]):
-                    report = self.list_report(
-                        item["puuid"], max(number("since", 0, 2 ** 53, 0), self.season_start),
-                        number("begin", 0, MAX_PAGES * PAGE_SIZE, 0), number("pages", 1, 10, FIRST_PAGES))
-                    job = item.get("job")
-                    report["job"] = job[:64] if isinstance(job, str) else None
-                    self.reports.append(report)
-        except WorkExpired:
-            # Held too long (usually through a game): the server has handed the rest to someone else.
-            log.info("the rest of this round's work waited too long; it is left to other collectors")
-        finally:
-            self.work_deadline = None
-        self.upload(final=True)
-        if not games and not players:
-            wait = work.get("wait")
-            wait = wait if isinstance(wait, (int, float)) and not isinstance(wait, bool) and 10 <= wait <= 3600 else 60
-            self.say("ArenaSweats has nothing for this collector to read right now. Asking again shortly.", once=True)
-            self.sleep(wait)
+        tag, answer = landed
+        if isinstance(answer, Exception) and not isinstance(answer, ClientGone):
+            raise answer
+        if tag == "upload":
+            (rows, began), self.sending = self.sending, None
+            self.pace_times["call"].append(self.now() - began)
+            self.uploaded(rows, answer)
+        elif tag == "work":
+            self.asked(answer)
+        elif tag in self.flying:
+            self.landed(self.flying.pop(tag), answer)
 
-    def list_report(self, puuid, since, begin, pages):
-        """Read a stretch of a player's match list and put what ArenaSweats needs to know about it in a small record."""
+    def settle(self):
+        """Wait for the upload and the request for work that are on their way, and take in their answers."""
+        while (self.sending is not None or self.asking is not None) and self.flights.count:
+            self.take(self.flights.land(1.0))
+
+    def drop_flying(self):
+        """Give up on the match-history requests that are on their way: their answers will not be looked
+        at. What they asked for goes back to the front of the queue."""
+        self.todo.extendleft(reversed(self.flying.values()))
+        self.flying.clear()
+
+    def start_request(self):
+        """Send the client the next match-history request, if the pace and the number on their way allow."""
+        if len(self.flying) >= self.flight_limit or self.now() < self.next_allowed:
+            return
+        while self.todo:
+            job = self.todo.popleft()
+            if self.now() > job.deadline:
+                # Held too long (usually through a game): the server has handed it to someone else.
+                self.pace["expired"] += 1
+                log.info("%s waited too long; it is left to other collectors", request_kind(job.path))
+            elif isinstance(job, ListRead) and job.done:
+                self.report_list(job)
+            else:
+                self.flown += 1
+                lcu, path = self.lcu, job.path
+                job.started, job.alone = self.now(), not self.flying
+                for other in self.flying.values():
+                    other.alone = False
+                self.flying[self.flown] = job
+                self.pace["most"] = max(self.pace["most"], len(self.flying))
+                self.flights.start(self.flown, lambda: lcu.get(path))
+                # In fast mode the gap runs from this start. At the normal pace it runs from the answer
+                # (see answered), which is awaited first: only one request is on its way.
+                self.next_allowed = self.now() + self.gap()
+                return
+
+    def landed(self, job, answer):
+        """Take in the answer to a request that was on its way: a match, or a page of a match list."""
+        gone = answer if isinstance(answer, ClientGone) else None
+        status, data = (0, None) if gone else answer
+        kind, seconds, new_trouble = request_kind(job.path), self.now() - job.started, job.started >= self.failed_at
+        # Was the next request only waiting for this answer? Then more at once would be used.
+        awaited = bool(self.todo) and self.now() >= self.next_allowed and len(self.flying) + 1 >= self.flight_limit
+        data = self.answered(job.path, job.started, status, data, gone, flown=True)
+        if data is None and new_trouble:
+            self.ease_off("a request failed")
+        elif data is not None:
+            self.clean += awaited
+            (self.alone if job.alone else self.shared)[kind].append(seconds)
+            self.adjust_flight(kind, awaited)
+        if isinstance(job, MatchFetch):
+            game, _ = self.check_game(job.game_id, self.platform, data)
+            if game:
+                self.store.save_game(self.platform, job.game_id, game)
+            return
         try:
-            arena, newest, complete, following = self.read_list(puuid, since, begin, pages)
+            self.take_page(job, data)
         except DATA_ERRORS:
-            log.exception("unexpected data while reading player %s", puuid[:8])
-            arena, newest, complete, following = [], 0, False, 0
-        return {"puuid": puuid, "ids": [match_id(game) for game in arena], "newest": newest, "begin": begin,
-                "next": following, "failed": not complete}
+            log.exception("unexpected data while reading player %s", job.puuid[:8])
+            job.fail()
+        if job.done:
+            self.report_list(job)
+        else:
+            self.todo.appendleft(job)       # the next page of this list goes before anything else
 
-    def ask_for_work(self, more=True):
-        """Send the waiting match-list reports. Returns what to do next, or None when the server did not answer."""
-        if more:                        # (the last hand-in at the end of a run does not wait)
-            self.sleep(self.last_work + WORK_SECONDS - self.now())
-        self.last_work = self.now()
+    def report_list(self, read):
+        """Put what ArenaSweats needs to know about a stretch of a match list that was read in a small record."""
+        arena, newest, complete, following = read.result()
+        self.stats["players"] += 1
+        self.reports.append({"puuid": read.puuid, "ids": [match_id(game) for game in arena], "newest": newest,
+                             "begin": read.begin, "next": following, "failed": not complete, "job": read.token})
+
+    def adjust_flight(self, kind, awaited):
+        """After a good answer: one fewer at once when answers of its kind have become slower with others
+        on their way than they are alone. One more when the client has kept up for a while and the next
+        request was waiting for this answer; with others on their way already, only once there are
+        enough answers of this kind to tell that they are no slower."""
+        alone, shared = self.alone[kind], self.shared[kind]
+        compared = len(alone) >= 5 and len(shared) == FLIGHT_WINDOW
+        if compared and statistics.median(shared) > SLOW_FACTOR * statistics.median(alone) + 0.1:
+            self.ease_off("answers took %.2fs with others on their way, %.2fs alone"
+                          % (statistics.median(shared), statistics.median(alone)))
+        elif (awaited and self.fast_on and self.clean >= FLIGHT_CLEAN and self.now() >= self.rise_at
+              and self.flight < min(FAST_MAX_FLIGHT, self.policy_flight) and (compared or self.flight == 1)):
+            self.flight += 1
+            self.clean = 0
+            for times in self.shared.values():
+                times.clear()
+            log.info("the client keeps up: up to %d requests at once now", self.flight)
+
+    def ease_off(self, why):
+        """The client did not take this many requests at once well: one fewer, and no more for a while,
+        which is longer each time trouble comes back soon after more were allowed again."""
+        if self.now() - self.eased_at > 2 * self.flight_hold:
+            self.flight_hold = FLIGHT_HOLD
+        if self.flight > 1:
+            log.info("%s: down to %d requests at once, no more for %s", why, self.flight - 1, duration(self.flight_hold))
+        self.flight = max(1, self.flight - 1)
+        self.eased_at, self.rise_at = self.now(), self.now() + self.flight_hold
+        self.flight_hold = min(FAST_REST, self.flight_hold * 2)
+        self.clean = 0
+        for times in self.shared.values():
+            times.clear()
+
+    def wants_work(self):
+        """Whether to ask ArenaSweats for more work now: at the normal pace once everything handed out
+        has been done and sent, in fast mode already when little is left, so reading need not stop."""
+        if self.fast_on:
+            return len(self.todo) <= FAST_AHEAD
+        return not self.todo and not self.flying and self.sending is None
+
+    def work_request(self, more=True):
+        """What a request for work says: the match-list reports that are waiting, and whether more work is wanted."""
         request = {"version": VERSION, "platform": self.platform, "reports": self.reports[:MAX_WORK_PLAYERS],
                    "more": more}
         if not self.introduced:         # a server that knows no players yet starts from this account's list
             request["start"] = self.me
-        status, work, retry = self.server.call("POST", "/v1/work", request)
+        if more and self.fast_on:
+            request["lists"] = FAST_LISTS
+        self.asking, self.last_work = (len(request["reports"]), self.now()), self.now()
+        return request
+
+    def ask_at(self):
+        """The earliest time of the next request for work."""
+        return max(self.next_ask, self.last_work + (FAST_WORK_SECONDS if self.fast_on else WORK_SECONDS))
+
+    def ask_ahead(self):
+        """Start a request for work when it is time for one (see wants_work, ask_at)."""
+        if self.asking is not None or not self.wants_work() or self.now() < self.ask_at():
+            return
+        request = self.work_request()
+        self.flights.start("work", lambda: self.server.call("POST", "/v1/work", request))
+
+    def asked(self, answer, more=True):
+        """Take in ArenaSweats' answer to a request for work: the reports it carried are done with, and what
+        it hands out is queued. After a failure the next try waits longer each time."""
+        (sent, began), self.asking = self.asking, None
+        self.pace_times["call"].append(self.now() - began)
+        status, work, retry = answer
         if status in (401, 403):
             raise self.bad_key()
         if status != 200 or not isinstance(work, dict):
@@ -1659,13 +1930,43 @@ class Collector:
             if self.work_failures == 3:
                 self.say("Cannot reach ArenaSweats right now. Trying again later.")
             del self.reports[:-MAX_WORK_PLAYERS]        # keep only the latest reports while it is away
-            if more:
-                self.sleep(wait)
-            return None
+            self.next_ask = self.now() + wait
+            return
         self.work_failures, self.introduced = 0, True
-        del self.reports[:MAX_WORK_PLAYERS]
+        del self.reports[:sent]
         self.apply_policy(work.get("policy"))
-        return work
+        if more:
+            self.take_work(work)
+
+    def take_work(self, work):
+        """Queue what ArenaSweats handed out: matches to fetch, then match lists to read. A piece that has
+        not been asked of the client when its time is nearly up is dropped (see start_request)."""
+        games = [i for i in as_list(work.get("games"))[:MAX_WORK_GAMES] if match_id({"gameId": i})]
+        players = [as_dict(item) for item in as_list(work.get("players"))[:MAX_WORK_PLAYERS]]
+        lease = work.get("lease")
+        lease = lease if isinstance(lease, int) and not isinstance(lease, bool) and 120 <= lease <= 3600 else 900
+        jobs = [MatchFetch(game_id) for game_id in games]
+        for item in players:
+            def number(name, low, high, default):
+                value = item.get(name)
+                good = isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+                return value if good else default
+            if isinstance(item.get("puuid"), str) and PUUID_RE.fullmatch(item["puuid"]):
+                read = ListRead(item["puuid"], max(number("since", 0, 2 ** 53, 0), self.season_start),
+                                number("begin", 0, MAX_PAGES * PAGE_SIZE, 0), number("pages", 1, 10, FIRST_PAGES))
+                job = item.get("job")
+                read.token = job[:64] if isinstance(job, str) else None
+                jobs.append(read)
+        for job in jobs:
+            job.deadline = self.now() + lease - 60
+        self.todo.extend(jobs)
+        if not games and not players:
+            wait = work.get("wait")
+            wait = wait if isinstance(wait, (int, float)) and not isinstance(wait, bool) and 10 <= wait <= 3600 else 60
+            if not self.todo and not self.flying:
+                self.say("ArenaSweats has nothing for this collector to read right now. Asking again shortly.",
+                         once=True)
+            self.next_ask = self.now() + wait
 
     # -- reading match history -------------------------------------------------
     def wait_until_idle(self):
@@ -1695,11 +1996,13 @@ class Collector:
             self.sleep(5)
 
     def hand_in(self):
-        """Send ArenaSweats the matches and match-list reports that are ready, taking on no new work."""
+        """Send ArenaSweats the matches and match-list reports that are ready, taking on no new work.
+        Nothing more is read now, so requests that are still on their way are dropped."""
+        self.drop_flying()
         if self.server:
             self.upload(final=True)
             if self.reports and self.platform:
-                self.ask_for_work(more=False)
+                self.asked(self.server.call("POST", "/v1/work", self.work_request(more=False)), more=False)
 
     def gate(self):
         """Return only when collecting is allowed: you are not playing and ArenaSweats has not switched it off."""
@@ -1721,8 +2024,6 @@ class Collector:
             if self.failures:
                 self.heartbeat("client_failing")
             self.gate()
-            if self.work_deadline is not None and self.now() > self.work_deadline:
-                raise WorkExpired()
             if self.now() >= self.next_allowed:
                 break
         started, status, data, gone = self.now(), 0, None, None
@@ -1730,17 +2031,35 @@ class Collector:
             status, data = self.lcu.get(path)
         except ClientGone as error:     # a dropped connection counts as a failure too
             gone = error
+        return self.answered(path, started, status, data, gone)
+
+    def answered(self, path, started, status, data, gone=None, flown=False):
+        """Take in the answer to one match-history request, or its failure: after failures the next request
+        waits longer and longer, and fast mode rests. Returns what the client sent, or None on failure.
+        `flown`: the request was one of those sent on their way by start_request."""
         ok = status == 200 and data is not None
-        self.failures = 0 if ok else self.failures + 1
+        if ok:
+            self.failures = 0
+        elif started >= self.failed_at or not self.failures:
+            self.failures += 1          # (requests sent before the last failure was known count with it)
+        if not ok:
+            self.failed_at = self.now()
         if not ok and self.fast_on and (status == 429 or self.failures >= 3):
             self.fast_rest_until = self.now() + FAST_REST       # the client is pushing back: no fast mode for a while
+            self.flight = 1
             self.say("The League client is struggling, so fast mode rests for an hour (normal pace). "
                      "客户端响应异常，快速模式暂停一小时（恢复正常速度）。")
         # After failures, wait longer and longer (3s, 6s, 12s ... up to MAX_BACKOFF).
         backoff = 0 if ok else min(MAX_BACKOFF, 3 * 2 ** min(self.failures - 1, 10))
-        self.next_allowed = self.now() + max(self.floor, self.delay * random.uniform(0.8, 1.2)) + backoff
+        if not (ok and flown and self.fast_on):     # (fast mode's gap already runs, from the request's start)
+            self.next_allowed = self.now() + self.gap() + backoff
         self.stats["requests"] += 1
         self.stats["failed"] += 0 if ok else 1
+        self.pace["requests"] += 1
+        self.pace["failed"] += 0 if ok else 1
+        self.pace["refused"] += 1 if status == 429 else 0
+        if ok:
+            self.pace_times[request_kind(path)].append(self.now() - started)
         short = re.sub(PUUID, lambda found: found.group(0)[:8], path.split("/lol-match-history/v1/")[-1])
         log.info("GET %s -> %s in %.2fs%s", short, gone or status, self.now() - started,
                  "" if ok else "  body: %.200s  (next wait +%ds)" % (data, backoff))
@@ -1754,41 +2073,47 @@ class Collector:
         Returns (the Arena matches found, the newest match time seen, whether every request worked,
         the place the list goes on from, or 0 when the end or `since` was reached).
         """
-        arena, newest, complete, following = [], 0, True, 0
-        for page in range(pages):
-            start = begin + page * PAGE_SIZE
-            if start >= MAX_PAGES * PAGE_SIZE:
-                break
-            data = self.history_get("/lol-match-history/v1/products/lol/%s/matches?begIndex=%d&endIndex=%d"
-                                    % (puuid, start, start + PAGE_SIZE - 1))
-            if data is None:
-                complete = False
-                break
-            games = match_list(data)
-            if self.platform is None:       # the list says which server it is from
-                for value in [as_dict(data).get("platformId")] + [game.get("platformId") for game in games]:
-                    if isinstance(value, str) and PLATFORM_RE.fullmatch(value):
-                        self.platform = value
-                        log.info("this account is on server %s", value)
-                        break
-            fresh = [game for game in games if created_ms(game) is None or created_ms(game) > since]
-            found = [game for game in fresh if is_arena(game) and match_id(game)]
-            log.info("  %d matches listed, %d newer than %s, %d of those Arena", len(games), len(fresh),
-                     time.strftime("%Y-%m-%d %H:%M", time.gmtime(since / 1000)), len(found))
-            for game in fresh:
-                self.modes["%.20s/%.10s" % (game.get("gameMode"), game.get("queueId"))] += 1
-                newest = max(newest, created_ms(game) or 0)
-            arena += found
-            if len(fresh) < len(games) or len(games) < PAGE_SIZE:
-                break      # reached matches that are too old or already read, or the end of the list
-        else:
-            following = begin + pages * PAGE_SIZE       # the list goes on beyond what was asked for
+        read = ListRead(puuid, since, begin, pages)
+        while not read.done:
+            self.take_page(read, self.history_get(read.path))
         self.stats["players"] += 1
-        return arena, newest, complete, following if following < MAX_PAGES * PAGE_SIZE else 0
+        return read.result()
+
+    def take_page(self, read, data):
+        """Take in the client's answer for the next page of a match list being read (None: the request failed)."""
+        if data is None:
+            read.complete, read.done = False, True
+            return
+        games = match_list(data)
+        if self.platform is None:       # the list says which server it is from
+            for value in [as_dict(data).get("platformId")] + [game.get("platformId") for game in games]:
+                if isinstance(value, str) and PLATFORM_RE.fullmatch(value):
+                    self.platform = value
+                    log.info("this account is on server %s", value)
+                    break
+        fresh = [game for game in games if created_ms(game) is None or created_ms(game) > read.since]
+        found = [game for game in fresh if is_arena(game) and match_id(game)]
+        log.info("  %d matches listed, %d newer than %s, %d of those Arena", len(games), len(fresh),
+                 time.strftime("%Y-%m-%d %H:%M", time.gmtime(read.since / 1000)), len(found))
+        for game in fresh:
+            self.modes["%.20s/%.10s" % (game.get("gameMode"), game.get("queueId"))] += 1
+            read.newest = max(read.newest, created_ms(game) or 0)
+        read.arena += found
+        read.page += 1
+        if len(fresh) < len(games) or len(games) < PAGE_SIZE:
+            read.done = True        # reached matches that are too old or already read, or the end of the list
+        elif read.page == read.pages:
+            read.following = read.begin + read.pages * PAGE_SIZE       # the list goes on beyond what was asked for
+            read.done = True
+        elif read.begin + read.page * PAGE_SIZE >= MAX_PAGES * PAGE_SIZE:
+            read.done = True
 
     def get_game(self, game_id, platform):
         """Ask the client for one match in full. Returns (the record, None) or (None, why not)."""
-        game = self.history_get("/lol-match-history/v1/games/%d" % game_id)
+        return self.check_game(game_id, platform, self.history_get("/lol-match-history/v1/games/%d" % game_id))
+
+    def check_game(self, game_id, platform, game):
+        """Look at the client's answer for one match. Returns (the record, None) or (None, why not)."""
         problem = None
         if game is None:
             return None, "request failed"
@@ -1813,8 +2138,8 @@ class Collector:
 
     # -- uploading ---------------------------------------------------------------
     def apply_policy(self, policy):
-        """What the server can set: pause, go slower, switch fast mode off or slow it down, show a short
-        message, the date the season began."""
+        """What the server can set: pause, go slower, switch fast mode off, slow it down or let it send
+        fewer requests at once, show a short message, the date the season began."""
         if not isinstance(policy, dict):
             return
         self.policy_at = self.now()
@@ -1834,6 +2159,9 @@ class Collector:
         fast_delay = policy.get("fast_delay")      # fast mode's shortest gap; never below FAST_MIN_DELAY
         if isinstance(fast_delay, (int, float)) and not isinstance(fast_delay, bool) and 0 <= fast_delay <= 3600:
             self.policy_fast_delay = min(60.0, float(fast_delay))
+        flight = policy.get("fast_flight")         # fast mode's most requests at once; never above FAST_MAX_FLIGHT
+        if isinstance(flight, int) and not isinstance(flight, bool) and 1 <= flight <= 1000:
+            self.policy_flight = flight
         message = policy.get("message")
         if isinstance(message, str) and message != self.message:
             self.message = message
@@ -1896,41 +2224,92 @@ class Collector:
             self.cannot_reach(status)
 
     def upload(self, final=False):
-        """Send waiting matches to ArenaSweats, one batch at a time."""
+        """Send waiting matches to ArenaSweats, one batch at a time, waiting for each to arrive: when a game
+        starts, on the way out, and while ArenaSweats is not taking uploads. (While reading, send_matches
+        sends them without holding the reading up.)"""
+        self.settle()
         while self.server and self.now() >= self.next_upload:
             rows = self.store.pending(self.batch)
             if not rows or (len(rows) < self.batch and not final and self.now() - self.last_upload < 60):
                 return
-            status, data, retry = self.server.call(
-                "POST", "/v1/games", {"version": VERSION, "games": [game for _, game in rows]})
-            self.last_upload = self.now()
-            keys = [key for key, _ in rows]
-            if status == 200 and isinstance(data, dict):
-                reasons = {as_dict(item).get("gameId"): as_dict(item).get("reason")
-                           for item in as_list(data.get("rejected"))[:len(rows)]}
-                refused = [key for key in keys if key[1] in reasons]
-                self.store.mark_uploaded([key for key in keys if key[1] not in reasons])
-                self.store.mark_refused(refused)
-                self.upload_failures = 0
-                self.stats["uploaded"] += len(rows) - len(refused)
-                log.info("uploaded %d matches, %d refused%s", len(rows) - len(refused), len(refused),
-                         "".join("  %s: %.60s" % (key[1], reasons[key[1]]) for key in refused))
-                self.apply_policy(data.get("policy"))
-            elif status in (401, 403):
-                raise self.bad_key()
-            elif status == 413 and self.batch > 1:
-                self.batch = max(1, self.batch // 2)       # too big for the server: send fewer at a time
-            elif status == 413:
-                log.warning("match %s is too large for the server", keys[0])
-                self.store.mark_refused(keys)
-            else:
-                self.upload_failures += 1
-                wait = max(retry, min(600, 30 * 2 ** min(self.upload_failures - 1, 10)))
-                self.next_upload = self.now() + wait
-                log.warning("upload failed (status %s); next try in %ds", status, wait)
-                if self.upload_failures == 3:
-                    self.say("Cannot reach ArenaSweats right now. Matches are kept and will be sent later.")
+            if not self.uploaded(rows, self.server.call("POST", "/v1/games", self.batch_of(rows))):
                 return
+
+    @staticmethod
+    def batch_of(rows):
+        return {"version": VERSION, "games": [game for _, game in rows]}
+
+    def send_matches(self):
+        """Start sending a batch of the waiting matches, unless one is on its way: a full batch at once,
+        fewer when nothing is left to read and no work is on its way, or the last upload was a minute ago."""
+        if self.sending is not None or self.now() < self.next_upload:
+            return
+        waiting = self.store.count(PENDING)
+        last = not self.todo and not self.flying and self.asking is None
+        if waiting >= self.batch or (waiting and (last or self.now() - self.last_upload >= 60)):
+            rows = self.store.pending(self.batch)
+            games = self.batch_of(rows)
+            self.sending = (rows, self.now())
+            self.flights.start("upload", lambda: self.server.call("POST", "/v1/games", games))
+
+    def uploaded(self, rows, answer):
+        """Take in ArenaSweats' answer to an upload of `rows`. False when it failed and uploads must wait."""
+        status, data, retry = answer
+        self.last_upload = self.now()
+        keys = [key for key, _ in rows]
+        if status == 200 and isinstance(data, dict):
+            reasons = {as_dict(item).get("gameId"): as_dict(item).get("reason")
+                       for item in as_list(data.get("rejected"))[:len(rows)]}
+            refused = [key for key in keys if key[1] in reasons]
+            self.store.mark_uploaded([key for key in keys if key[1] not in reasons])
+            self.store.mark_refused(refused)
+            self.upload_failures = 0
+            self.stats["uploaded"] += len(rows) - len(refused)
+            log.info("uploaded %d matches, %d refused%s", len(rows) - len(refused), len(refused),
+                     "".join("  %s: %.60s" % (key[1], reasons[key[1]]) for key in refused))
+            self.apply_policy(data.get("policy"))
+        elif status in (401, 403):
+            raise self.bad_key()
+        elif status == 413 and self.batch > 1:
+            self.batch = max(1, self.batch // 2)       # too big for the server: send fewer at a time
+        elif status == 413:
+            log.warning("match %s is too large for the server", keys[0])
+            self.store.mark_refused(keys)
+        else:
+            self.upload_failures += 1
+            wait = max(retry, min(600, 30 * 2 ** min(self.upload_failures - 1, 10)))
+            self.next_upload = self.now() + wait
+            log.warning("upload failed (status %s); next try in %ds", status, wait)
+            if self.upload_failures == 3:
+                self.say("Cannot reach ArenaSweats right now. Matches are kept and will be sent later.")
+            return False
+        return True
+
+    def pace_report(self):
+        """A few numbers about this collector's own pace since the last report, so ArenaSweats can see where
+        the time goes. Nothing but counts, seconds and milliseconds:
+          requests, failed, refused (answered 429): match-history requests
+          top, page, match, calls: [how many, the middle answer time, a slow one (9 in 10 are quicker)] in ms,
+            for first pages of lists, further pages, matches, and requests to ArenaSweats
+          paused: seconds not collecting (you were playing, or ArenaSweats switched collection off)
+          rested: seconds at the normal pace because the client pushed back in fast mode
+          idle: seconds with nothing to read; expired: pieces of work dropped because they waited too long
+          fast: 1 when you turned fast mode on; flight: requests allowed on their way at once now; most: the
+            most there were"""
+        def answers(times):
+            if not times:
+                return [0, 0, 0]
+            times = sorted(times)
+            return [len(times), round(1000 * times[len(times) // 2]), round(1000 * times[len(times) * 9 // 10])]
+        pace, times = self.pace, self.pace_times
+        report = {"seconds": int(self.now() - self.pace_at), "requests": pace["requests"], "failed": pace["failed"],
+                  "refused": pace["refused"], "top": answers(times["top"]), "page": answers(times["page"]),
+                  "match": answers(times["match"]), "calls": answers(times["call"]), "paused": int(pace["paused"]),
+                  "rested": int(pace["rested"]), "idle": int(pace["idle"]), "expired": pace["expired"],
+                  "fast": int(self.fast), "flight": self.flight_limit, "most": pace["most"]}
+        self.pace, self.pace_at = Counter(), self.now()
+        self.pace_times = {kind: [] for kind in times}
+        return report
 
     # -- reporting ---------------------------------------------------------------
     def status(self):
@@ -1954,9 +2333,7 @@ class Collector:
             self.say("Stopped before a logged-in League client was found. Nothing was collected.")
         else:
             try:
-                self.upload(final=True)
-                if self.server and self.platform and self.reports:
-                    self.ask_for_work(more=False)       # hand in the last reports without taking on more
+                self.hand_in()      # the last matches and reports, without taking on more
             except (Fatal, Done) as error:
                 if isinstance(error, Fatal):
                     self.say(str(error))

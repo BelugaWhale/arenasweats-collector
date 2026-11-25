@@ -37,6 +37,46 @@ class Clock:
         self.events.append((when, action))
 
 
+class PretendFlights:
+    """Stands in for collector.Flights when time is pretend, so that answers can take pretend time and
+    overlap: each call is made on the spot, and its answer is handed over once its answer time has
+    passed (FakeClient.delay for the client; `server` seconds for a call to ArenaSweats)."""
+
+    def __init__(self, clock, fake, server=0.0):
+        self.clock, self.fake, self.server = clock, fake, server
+        self.waiting = []                     # (due, order, tag, answer)
+        self.count = self.order = 0
+        self.most = self.together = 0         # the most requests to the client at once; how many were not sent alone
+
+    def start(self, tag, call):
+        self.fake.took = 0.0
+        try:
+            answer = call()
+        except Exception as error:
+            answer = error
+        took = self.fake.took if isinstance(tag, int) else self.server    # requests to the client are numbered
+        self.count += 1
+        self.order += 1
+        self.waiting.append((self.clock.now() + took, self.order, tag, answer))
+        if isinstance(tag, int):
+            self.most = max(self.most, self.flying())
+            self.together += self.flying() > 1
+
+    def flying(self):
+        """How many requests to the client are on their way."""
+        return sum(1 for flight in self.waiting if isinstance(flight[2], int))
+
+    def land(self, seconds):
+        first = min(self.waiting) if self.waiting else None
+        if first is None or first[0] > self.clock.now() + seconds:
+            self.clock.sleep(seconds)
+            return None
+        self.clock.sleep(first[0] - self.clock.now())
+        self.waiting.remove(first)
+        self.count -= 1
+        return first[2], first[3]
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.fake.handle(self, "GET")
@@ -66,6 +106,10 @@ class FakeClient:
         self.wrong_record = {}                # match id -> a different record to answer with
         self.drop = lambda path: False        # tests set this to cut the connection for a path
         self.list_hook = None                 # tests set this to change a match-list page: hook(player, page)
+        self.delay = lambda path: 0.0         # tests set this: seconds a match-history answer takes. Without a
+        self.took = 0.0                       # pretend clock it is really waited; with one, PretendFlights reads it here
+        self.flying = self.most_at_once = 0   # match-history requests being answered right now, and the most there were
+        self.lock = threading.Lock()
         self.requests = []                    # (method, path, pretend time)
         for _ in range(arena):
             self.add_game("CHERRY", 1700, self.random.sample(self.players, 16))
@@ -128,6 +172,21 @@ class FakeClient:
     # -- answering requests ----------------------------------------------------
     def handle(self, handler, method):
         self.requests.append((method, handler.path, self.clock.now() if self.clock else time.monotonic()))
+        history = handler.path.startswith("/lol-match-history/")
+        with self.lock:
+            self.flying += history
+            self.most_at_once = max(self.most_at_once, self.flying)
+        try:
+            if history and self.clock is None:
+                time.sleep(self.delay(handler.path))
+            elif history:
+                self.took = self.delay(handler.path)
+            self.answer(handler, method)
+        finally:
+            with self.lock:
+                self.flying -= history
+
+    def answer(self, handler, method):
         expected = "Basic " + base64.b64encode(("riot:" + self.token).encode()).decode()
         if handler.headers.get("Authorization") != expected:
             return self.reply(handler, 401, {"errorCode": "RPC_ERROR", "httpStatus": 401, "message": "Unauthorized"})

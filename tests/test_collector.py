@@ -233,8 +233,9 @@ class Gentle(CollectorCase):
 
 
 class FastMode(CollectorCase):
-    """Fast mode (beta, only when the user turns it on): a fifth of the gap, never below its own floor, still one
-    request at a time, with every other limit kept."""
+    """Fast mode (beta, only when the user turns it on): a fifth of the gap, never below its own floor, with every
+    other limit kept. These are test runs, which read one request at a time in fast mode too; fast mode with
+    ArenaSweats, where several requests can be on their way at once, is in test_server.py (SeveralAtOnce)."""
 
     def setUp(self):
         super().setUp()
@@ -382,8 +383,10 @@ class FastMode(CollectorCase):
                 texts[path] = " ".join(handle.read().split())
             self.assertNotIn("throwaway", texts[path], path)
             self.assertNotIn("not sure", texts[path], path)
-        self.assertIn("Fast mode collects about 3 times faster: about two requests a second, still one at a time. "
+        self.assertIn("Fast mode collects about 3 times faster: about two requests a second, sent without waiting for "
+                      "the last one's answer, so up to four can be on their way at once. "
                       "**BETA: Please only use with unimportant accounts for now.**", texts["README.md"])
+        self.assertEqual(collector.FAST_MAX_FLIGHT, 4)
 
     def test_the_flag_turns_it_on_and_says_so_every_start(self):
         for flags, on in ((["--fast"], True), (["--no-fast"], False), ([], False)):
