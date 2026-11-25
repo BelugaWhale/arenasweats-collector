@@ -2336,6 +2336,8 @@ class Updates(WithServer):
                                 ("stdin", Console(typed))):
                 stack.enter_context(unittest.mock.patch.object(sys, name, value, create=True))
             stack.enter_context(unittest.mock.patch.object(collector, "offer_update", offer_update))
+            # already administrator: the question about it (test_collector.AdminRights) is not what is tested here
+            stack.enter_context(unittest.mock.patch.object(collector, "is_elevated", lambda: True))
             stack.enter_context(unittest.mock.patch.object(collector, "os", WindowsOs()))
             output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = collector.main()

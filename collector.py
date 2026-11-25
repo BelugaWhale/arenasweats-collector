@@ -36,11 +36,11 @@ WHAT IT NEVER DOES
     long the client took to answer: see pace_report).
   - It keeps the computer awake while it runs (the screen can still turn off),
     and stops a click in its window from freezing it.
-  - It installs nothing. Only when Windows hides the League client from it
-    (which happens when the client itself runs as administrator) does it ask
-    Windows to start it again as administrator; once allowed, that is kept in
-    config.json, and --no-admin forgets it. As administrator it makes the same
-    requests and nothing else.
+  - It installs nothing. At start it asks whether to run as administrator,
+    which the Chinese client needs (it runs as administrator, and Windows then
+    hides it from other programs); a yes is kept in config.json (--no-admin
+    forgets it), a no is asked again at the next start. As administrator it
+    makes the same requests and nothing else.
 
 Only the Python standard library is used, so this one file is the whole program.
 """
@@ -201,10 +201,6 @@ class Done(Exception):
 
 class Fatal(Exception):
     """Something the user has to fix; the message says what."""
-
-
-class HandedOver(Exception):
-    """This copy has started another copy of itself, as administrator, which takes over; this one ends."""
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1713,23 +1709,13 @@ class Collector:
         self.idle_at = float("-inf")       # last time the client was seen idle
         self.ended = False                 # why it stops has been told to ArenaSweats (tell_end)
         self.elevated = is_elevated()      # this copy runs as administrator (None: not Windows)
-        self.handed_over = False           # a copy started as administrator takes over from this one
-        # When Windows hides the client (see admin_round): what to do next (raise: ask Windows for administrator
-        # rights; question: put up the question whether to; None: nothing more this run), the code that tells
-        # ArenaSweats how that went, and whether the question is up.
-        self.admin_next, self.admin_code, self.admin_quiet, self.admin_asks = "raise", "", False, 0
-        self.standing = None               # the line that stays up for an answer, one at a time: admin (the question
-                                           # whether to ask Windows again) or folder (where League is installed)
+        self.standing = None               # a line that stays up for an answer: folder (where League is installed)
         self.folder_given = False          # a folder typed in this run led to League
         self.found_code = ""               # which step of the search found the client in use (report_found)
-        if self.elevated:
-            self.admin_next, self.admin_code = None, "admin"
-        elif self.elevated is None or getattr(opts, "elevated", False):
-            self.admin_next = None
-        elif getattr(opts, "no_admin", False):
-            self.admin_next, self.admin_code = None, "admin_no"
-        elif getattr(opts, "admin_start", None):        # a saved yes, but Windows did not start it as administrator
-            self.admin_next, self.admin_code = "question", "admin_" + opts.admin_start
+        # Administrator rights (asked at start, see main), for the reason codes: this copy runs as administrator;
+        # or asked and answered no (or nothing), or --no-admin; or answered yes and Windows did not start it so.
+        start = "no" if getattr(opts, "no_admin", False) else getattr(opts, "admin_start", None)
+        self.admin_code = "admin" if self.elevated else "admin_" + start if start else ""
         self.set_state("starting", self.admin_code)
 
     # -- small helpers -------------------------------------------------------
@@ -1819,7 +1805,7 @@ class Collector:
                     self.sleep(10)
         except Done:
             self.say("Time limit reached.")
-        except (Fatal, HandedOver):
+        except Fatal:
             raise
         except Exception as error:
             log.exception("unexpected error")       # logged here so a test run's report includes it
@@ -1874,21 +1860,18 @@ class Collector:
                 if not needs_admin or self.elevated:
                     self.say(both("The League client is open, but the collector cannot reach it yet. It keeps trying.",
                                   "英雄联盟客户端已打开，但采集器暂时连接不上它，正在继续尝试。"), once=True)
-                elif self.admin_next or self.standing == "admin":
-                    if rounds >= 2:         # a moment later: a client that is still starting can look the same
-                        self.admin_round(state, steps)      # on a yes to Windows, a new copy takes over
-                elif not self.admin_quiet:  # nothing more it can do itself this run: say what would help
+                else:                       # only the question at start can change this: say so, ask nothing here
                     self.say(both("Windows hides the League client from the collector, because League runs as "
-                                  "administrator.\n         To collect: close this window, right-click the collector "
-                                  "and choose 'Run as administrator'.",
+                                  "administrator.\n         To collect: close this window, start the collector again "
+                                  "and answer y to the administrator question.",
                                   "英雄联盟以管理员身份运行，所以 Windows 不让采集器看到它。\n         "
-                                  "要开始采集：请关闭此窗口，右键点击采集器，选择“以管理员身份运行”。"), once=True)
+                                  "要开始采集：请关闭此窗口，重新启动采集器，在询问是否以管理员身份运行时回答 y。"), once=True)
                 # A folder can lead to the client only where Windows hides where the client is and no lockfile
                 # was found, and only for Riot's own client: the Tencent client's lockfile is empty, so its
                 # folder cannot help (it is known by its lockfile, or by WeGame or TCLS running).
                 tencent = tencent_lockfile or any(word in name.lower() for name in related_running
                                                   for word in ("wegame", "tcls"))
-                if hidden and not by_lockfile and not tencent and rounds >= 2 and self.admin_next is None:
+                if hidden and not by_lockfile and not tencent and rounds >= 2:
                     self.offer_folder()
             else:
                 self.say(both("Waiting for the League client. Open League and log in.",
@@ -1896,95 +1879,18 @@ class Collector:
             self.heartbeat(state, ".".join(steps + ([self.admin_code] if self.admin_code else [])))
             self.wait_round(10)
 
-    def admin_round(self, state, steps):
-        """League is open, but Windows hides it from the collector because League runs as administrator, so the
-        collector has to run as administrator too. The first time in a run it asks Windows to start it again as
-        administrator, which shows Windows' own permission request (no one needs to type anything). Never while a
-        match is on: that request covers the whole screen. Accepted: the new copy takes over (HandedOver), and the
-        yes is kept in config.json, so every later start goes to administrator at once (main). Refused, or nobody
-        answered: Windows is not asked again by itself in this run; instead a question stays up, "Ask Windows
-        again? [Y/n]", while the collector keeps looking and checking in (wait_round reads the answer). As
-        administrator it makes exactly the same requests."""
-        if self.standing == "admin":
-            return
-        if self.admin_next == "question":       # Windows was asked at start already
-            self.admin_next = None
-            if answerable():
-                self.put_question()
-            return
-        if game_running():
-            if self.admin_code != "admin_game":
-                self.say(both("Waiting for the match to end before asking Windows for administrator rights: its "
-                              "permission request would cover the game.",
-                              "等这局游戏结束后再向 Windows 请求管理员权限：它的权限请求窗口会挡住游戏。"))
-            self.admin_code = "admin_game"
-            return
-        if not self.admin_asks:
-            self.say(both("Windows hides the League client from the collector, because League runs as administrator."
-                          "\n         Asking Windows to restart the collector as administrator.",
-                          "英雄联盟以管理员身份运行，所以 Windows 不让采集器看到英雄联盟客户端。\n         "
-                          "正在请 Windows 以管理员身份重新启动采集器。"))
-        else:
-            self.say(both("Asking Windows again to restart the collector as administrator.",
-                          "正在再次请 Windows 以管理员身份重新启动采集器。"))
-        self.admin_asks += 1
-        self.admin_code = "admin_asked"
-        self.set_state(state, ".".join(steps + [self.admin_code]))
-        if self.server and self.server.key:
-            self.refresh_policy()               # told now: the answer can take Windows two minutes
-        asked_at = self.now()
-        argv = [arg for arg in getattr(self.opts, "argv", []) if arg not in ("--fast", "--no-fast", "--elevated")]
-        outcome = start_elevated(argv + ["--elevated", "--no-update", "--fast" if self.fast else "--no-fast"])
-        if outcome == "started":
-            save_config(admin=True)
-            print(both("The collector now runs as administrator in a new window. This window closes.",
-                       "采集器已在新窗口中以管理员身份运行。此窗口即将关闭。", 0))
-            self.handed_over = True
-            raise HandedOver()
-        if outcome == "declined" and self.now() - asked_at >= UAC_GIVES_UP:
-            outcome = "timed_out"
-        self.admin_code, self.admin_next = "admin_" + outcome, None
-        print({"declined": both("Windows' permission request was declined.", "Windows 的权限请求被拒绝了。", 0),
-               "timed_out": both("Nobody answered Windows' permission request.", "没有人回应 Windows 的权限请求。", 0),
-               "failed": both("Windows could not restart the collector as administrator.",
-                              "Windows 无法以管理员身份重新启动采集器。", 0)}[outcome])
-        if answerable():
-            self.put_question()
-        else:
-            print(both("It asks Windows again the next time the collector is started.",
-                       "下次启动采集器时会再请 Windows 试一次。", 0))
-
-    def put_question(self):
-        """Put up the question whether to ask Windows again; it stays up, without a time limit (wait_round)."""
-        print("The collector needs administrator rights to keep collecting, because Windows hides League. "
-              "Ask Windows again? [Y/n]")
-        print("采集器需要管理员权限才能继续采集，因为 Windows 不让它看到英雄联盟。要再请 Windows 试一次吗？[Y/n]")
-        typed.clear()                       # it takes the place of the folder line, if that was up
-        self.standing = "admin"
-
     def wait_round(self, seconds):
-        """Wait before looking for the client again. While a line is up for an answer, the answer is taken within
-        a second: a yes to Windows' question asks Windows straight away, and a folder that leads to League is
-        looked at straight away."""
+        """Wait before looking for the client again. While the folder line is up, an answer is taken within a
+        second, and a folder that leads to League is looked at straight away."""
         for _ in range(int(seconds)):
             if self.standing:
                 answer = read_typed()
-                if answer is not None and self.standing == "admin":
-                    self.standing = None
-                    if answer.strip().lower() in ("", "y", "yes", "是"):
-                        self.admin_next = "raise"
-                        return
-                    self.admin_code, self.admin_quiet = "admin_no", True
-                    print(both("OK. It will ask again the next time it is started.", "好的。下次启动时会再问。", 0))
-                elif answer is not None and self.take_folder(answer):
+                if answer is not None and self.take_folder(answer):
                     return
             self.sleep(1)
 
     def drop_question(self):
-        """The client can be reached: the line that was up for an answer, if any, is no longer needed."""
-        if self.standing == "admin":
-            self.say(both("The collector can reach League now, so there is no need to answer.",
-                          "采集器现在能连接到英雄联盟了，不用再回答。"))
+        """The client can be reached: the folder line, if it is up, is no longer needed."""
         self.standing = None
         typed.clear()
 
@@ -2889,9 +2795,7 @@ class Collector:
             self.store = None
 
     def finish(self):
-        if self.store is None and self.handed_over:
-            pass                    # the copy that took over says what it does
-        elif self.store is None:
+        if self.store is None:
             self.say(both("Stopped before a logged-in League client was found. Nothing was collected.",
                           "在找到已登录的英雄联盟客户端之前就停止了，没有采集到任何数据。"))
         else:
@@ -3116,6 +3020,35 @@ def ask_fast_mode(ask=timed_input):
     return answer.strip().lower() in ("y", "yes", "是")
 
 
+def ask_admin(ask=timed_input):
+    """Ask at start whether to run as administrator, which the Chinese client needs (it runs as administrator, and
+    Windows then hides it from a program that does not). Only a yes is yes; Enter, or no answer within
+    ANSWER_SECONDS, is no."""
+    print("League on Chinese servers runs as administrator, and Windows then hides it from the collector.")
+    print("Run the collector as administrator? Your yes is remembered. [y/N]")
+    print("国服英雄联盟以管理员身份运行，Windows 因此不让采集器看到它。")
+    try:
+        answer = ask("以管理员身份运行采集器吗？你的“是”会被记住。[y/N]  No answer = no / 不回答即否: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+    if answer is None:
+        print("No answer: running without administrator rights. 无人回答：以普通权限运行。")
+        return False
+    return answer.strip().lower() in ("y", "yes", "是")
+
+
+def become_admin(argv, sleep=time.sleep):
+    """Start this program again as administrator with the same arguments: Windows shows its own permission box,
+    which covers the whole screen, so not while a match is on. Returns start_elevated's outcome; on "started" this
+    copy ends and the new one, in its own window, asks the start-up questions."""
+    if game_running():
+        print(both("A match is on, and Windows' permission box would cover it: the collector waits until it ends.",
+                   "正在进行一局游戏，Windows 的权限窗口会挡住它：采集器等这局结束后再继续。", 0))
+        while game_running():
+            sleep(5)
+    return start_elevated(list(argv) + ["--elevated"])
+
+
 def remove_old_program():
     """Delete the previous version left behind by an update, once it is no longer running."""
     try:
@@ -3127,7 +3060,7 @@ def remove_old_program():
 
 def load_config(folder):
     """config.json beside the program may hold: server, key, league_dir, and admin (true: the person chose to have
-    it start as administrator, see Collector.admin_round)."""
+    it start as administrator, see ask_admin)."""
     try:
         with open(os.path.join(folder, "config.json"), "r", encoding="utf-8-sig") as handle:
             config = json.load(handle)
@@ -3186,30 +3119,20 @@ def keep_awake():
         pass
 
 
-def lock_single_instance(wait=0):
-    """Refuse to start twice: two copies would double the request rate. `wait`: seconds to wait for another copy
-    to let go first (the copy that started this one as administrator, which is closing)."""
+def lock_single_instance():
+    """Refuse to start twice: two copies would double the request rate."""
     handle = open(os.path.join(tempfile.gettempdir(), "arenasweats-collector.lock"), "w")
-    end = time.monotonic() + wait
-    while True:
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return handle      # stays locked for as long as this object is kept
-        except OSError:
-            if time.monotonic() >= end:
-                handle.close()
-                raise Fatal(both("The collector is already running on this computer.", "采集器已经在这台电脑上运行。", 0))
-            time.sleep(0.5)
-
-
-HANDOVER_SECONDS = 60   # a copy started as administrator waits this long for the copy that started it to close
-UAC_GIVES_UP = 90       # Windows stops waiting for an answer to its permission request after about two minutes;
-                        # a refusal after this long means nobody answered (timed out), not that somebody declined
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise Fatal(both("The collector is already running on this computer.", "采集器已经在这台电脑上运行。", 0))
+    return handle      # stays locked for as long as this object is kept
 
 
 def answerable():
@@ -3346,27 +3269,31 @@ def main(argv=None):
         save_config(admin=None)
         del config["admin"]
         print(both("Forgot the choice to start as administrator.", "已取消“以管理员身份启动”的选择。", 0))
-    # Windows' permission was given once (Collector.admin_round): start again as administrator at once, before the
-    # questions below, so that they are asked once, in the copy that runs as administrator. Not while a match is
-    # on (the request covers the screen): then the collector asks once League turns out to be hidden.
-    opts.admin_start = None         # what became of that request: declined, timed_out or failed
-    if config.get("admin") is True and not opts.export and not opts.elevated and is_elevated() is False:
-        if game_running():
-            print(both("A match is on, so the collector asks Windows for administrator rights after it.",
-                       "正在进行一局游戏，采集器会在游戏结束后再向 Windows 请求管理员权限。", 0))
-        else:
+    # Administrator rights, asked before the questions below, so that after a yes those are asked once, in the
+    # copy that runs as administrator. A yes is kept in config.json; then later starts go to administrator at once.
+    opts.admin_start = None         # for the reason codes: no (answered no, or nothing), declined (Windows did not)
+    if not opts.export and not opts.elevated and is_elevated() is False:
+        wanted = config.get("admin") is True
+        if wanted:
             print(both("Starting as administrator, as you chose: Windows hides League from it otherwise.",
                        "按你的选择以管理员身份启动：否则 Windows 不让采集器看到英雄联盟客户端。", 0))
-            asked_at = time.monotonic()
-            outcome = start_elevated(opts.argv + ["--elevated"])
-            if outcome == "started":
+        elif not opts.no_admin and answerable():
+            wanted = ask_admin()
+            if wanted:
+                save_config(admin=True)
+                print(both("Starting as administrator: Windows asks for your permission, then the collector opens in "
+                           "a new window.", "正在以管理员身份启动：Windows 会请你允许，然后采集器会在新窗口中打开。", 0))
+            else:
+                opts.admin_start = "no"
+        if wanted:
+            if become_admin(opts.argv) == "started":
                 return 0
-            if outcome == "declined" and time.monotonic() - asked_at >= UAC_GIVES_UP:
-                outcome = "timed_out"
-            opts.admin_start = outcome
-            early_notes.append("Windows did not start the collector as administrator: %s" % outcome)
-            print(both("Windows did not start it as administrator, so this time it runs without administrator "
-                       "rights.", "Windows 没有以管理员身份启动采集器，所以这次以普通权限运行。", 0))
+            save_config(admin=None)
+            opts.admin_start = "declined"
+            early_notes.append("Windows did not start the collector as administrator")
+            print(both("Windows did not start it as administrator, so it runs without administrator rights this time "
+                       "and asks again at the next start.",
+                       "Windows 没有以管理员身份启动采集器，所以这次以普通权限运行，下次启动时会再问。", 0))
     if getattr(sys, "frozen", False) and os.name == "nt":       # the packaged Windows program
         remove_old_program()
         if not opts.no_update and not opts.export and sys.stdin and sys.stdin.isatty():
@@ -3393,7 +3320,7 @@ def main(argv=None):
     for text in early_notes:
         log.info("%s", text)
 
-    code, lock, made, handed_over = 0, None, None, False
+    code, lock, made = 0, None, None
     try:
         opts.league_dir = opts.league_dir or config.get("league_dir")
         try:
@@ -3404,7 +3331,7 @@ def main(argv=None):
         server = Server(server_url, opts.key or config.get("key")) if server_url else None
         if opts.minutes is None:
             opts.minutes = 0 if server else TEST_MINUTES
-        lock = lock_single_instance(HANDOVER_SECONDS if opts.elevated else 0)
+        lock = lock_single_instance()
         print("ArenaSweats collector %s - reads Arena match history from your League client. Read-only." % VERSION)
         print("ArenaSweats 采集器 %s：从你的英雄联盟客户端读取斗魂竞技场的对局记录，只读不改。" % VERSION)
         if server is None:
@@ -3426,8 +3353,6 @@ def main(argv=None):
         made = Collector(opts, data_dir, server)
         with told_on_close(made.closing):
             made.run()
-    except HandedOver:
-        handed_over = True              # its window shows what happens next; this one closes at once
     except KeyboardInterrupt:
         print("Stopped.")
         if made:
@@ -3450,8 +3375,7 @@ def main(argv=None):
             lock.close()
         log.removeHandler(handler)
         handler.close()
-    if not handed_over:
-        keep_window_open()
+    keep_window_open()
     return code
 
 

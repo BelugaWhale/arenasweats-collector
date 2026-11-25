@@ -42,8 +42,8 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   how many failed, and how long the client took to answer. Never a file or folder name,
   nor anything that identifies you or your PC.
 - **Nothing to install.** No background service. Close the window and it stops. Delete its
-  folder and it's gone. It runs as administrator only if you allow it when Windows asks, which
-  happens only when Windows hides the League client from it (see below).
+  folder and it's gone. It runs as administrator only if you say yes when it asks (see
+  below).
 - **Open source.** The download is built by GitHub straight from the code in this
   repository, so what you run is exactly what you can read here.
 
@@ -62,14 +62,13 @@ counting down 10 seconds; pressing Enter, or no answer, keeps it off. So it stil
 the PC. To skip the fast mode question, add `--fast` or `--no-fast` to the end of a
 shortcut's target. While fast mode is on, it says so every time it starts.
 
-If Windows hides the League client from it (this happens when League itself runs as
-administrator), it asks Windows to restart it as administrator, never during a match, and
-Windows shows its own permission request. If you allow it, that is remembered in
-`config.json` and it starts as administrator by itself from then on; to undo that, start it
-once with `--no-admin`, or delete the `"admin"` line from `config.json`. If the request is
-declined or nobody answers, it does not ask Windows again by itself: it asks you in its
-window whether to, and keeps looking for League meanwhile. As administrator it makes exactly
-the same read-only requests, and nothing else. Where knowing the folder League is installed
+Before those questions it asks whether to run as administrator, which League on Chinese
+servers needs (it runs as administrator, and Windows then hides it from other programs),
+again counting down 10 seconds; no answer means no, and it asks again at the next start. A
+yes is remembered in `config.json`, and from then on it starts as administrator by itself
+(Windows asks your permission each time); to undo that, start it once with `--no-admin`, or
+delete the `"admin"` line from `config.json`. As administrator it makes exactly the same
+read-only requests, and nothing else. Where knowing the folder League is installed
 in can help (Riot's own client; the Chinese client's folder cannot help), a line in its
 window offers to take it, and it keeps looking meanwhile.
 

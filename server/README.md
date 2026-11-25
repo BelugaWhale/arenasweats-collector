@@ -223,14 +223,11 @@ Trust covers what a match says, not its size or shape:
     `英雄联盟...`, `LOL` or `League of Legends` in a drive's top, `WeGameApps`, `腾讯游戏`,
     `Program Files`, ...), `scan` (the drives searched), `cmdline` (the client's command line),
     `typed` (only the folder the person typed in led to it). Never the folder itself.
-  - Administrator rights, at the end of the waiting_for_client and client_unreachable codes and
-    as the detail of starting: `admin` (this copy runs as administrator), or what became of
-    asking Windows for them (done when Windows hides the client): `admin_game` (waiting for the
-    match to end first), `admin_asked` (sent just before Windows shows its permission request),
-    `admin_declined`, `admin_timed_out` (nobody answered it; Windows gives up after about two
-    minutes, inferred from the time the answer took), `admin_failed`, `admin_no` (answered n to
-    "Ask Windows again?", or started with `--no-admin`). Once allowed, it is remembered, so that
-    install's next copies report `admin`.
+  - Administrator rights (asked at start), at the end of the waiting_for_client and
+    client_unreachable codes and as the detail of starting: `admin` (this copy runs as
+    administrator), `admin_no` (asked, and answered no or nothing; or started with
+    `--no-admin`), `admin_declined` (answered yes, but Windows' permission box was declined or
+    failed). A yes is remembered, so that install's next copies report `admin`.
   - error: `error.`, the kind of error and the collector's function it happened in, such as
     `error.keyerror.work_round` (the details are in the volunteer's collector.log); stopped:
     `ctrl_c`; closed: `window`, `logoff` or `shutdown` (sent in the seconds Windows gives a
