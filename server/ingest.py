@@ -60,19 +60,20 @@ MIN_FREE_BYTES = 5 * 1024 ** 3   # uploads also wait when the disk has less free
 
 # ---- handing out work
 LEASE_SECONDS = 15 * 60          # a collector has this long to do what it was given
-PLAYERS_PER_ROUND = 5            # match lists handed out per work request
 GAMES_PER_ROUND = 40             # matches handed out per work request
 GAME_TRIES = 6                   # a match nobody could fetch after this many tries is not handed out again
-TARGET_NEW = 8                   # read a player's list again when about this many new matches are expected
+PLAYERS_PER_ROUND = 10           # match lists handed out per work request ...
+NEW_PLAYERS_PER_ROUND = 5        # ... of which this many are kept for players never read, while any are waiting
+LIST_PAGES = 1                   # a list is read one page: the League client gives a player's latest 20 matches and,
+                                 # unless it is the account logged in, the same 20 again when asked for older places
+                                 # (measured on HN1, HN10 and NA1: see README.md)
+TARGET_SEEN = 10                 # read a list again when about this many more Arena matches are expected in its 20 places
 MIN_INTERVAL = 3600              # ...but not more often than this
-MAX_INTERVAL = 7 * 86400         # ...and not less often than this
-NEW_PLAYER_BONUS = 6 * 3600      # each further match a not-yet-read player is seen in moves them this much earlier
+MAX_INTERVAL = 30 * 86400        # ...and not less often than this (a list that showed no Arena match)
+UNKNOWN_SPAN = 86400             # with no held match to tell when a list's matches were played, they count as a day's worth
 RETRY_SECONDS = 600              # first retry after a failed read; doubles each time
-FIRST_PAGES = 1                  # a list is read one page (20 matches) at first ...
-MORE_PAGES = 3                   # ... then three pages at a time, for as long as that turns up matches not held.
-                                 # After a stretch with nothing new, the older part is set aside and only read
-                                 # when no fresher work is waiting, so nothing is missed in the end.
-MAX_INDEX = 1000                 # never further back than this many matches
+MAX_INDEX = 1000                 # the furthest place in a list a report may name
+SETTLED_SECONDS = 2 * 86400      # a match this old that turns up in a list should be held by now (see seen_days)
 
 # ---- event games the rankings server is waiting for (see relay `urgent`): handed out before anything else
 URGENT_GAME_SECONDS = 300        # such a match not held yet is handed out again this often (it may not have ended)
@@ -108,26 +109,47 @@ CREATE TABLE IF NOT EXISTS wanted(
 -- Matches nobody could fetch after GAME_TRIES tries. Kept apart so they are not asked for again.
 CREATE TABLE IF NOT EXISTS given_up(
     platform TEXT NOT NULL, game_id INTEGER NOT NULL, PRIMARY KEY(platform, game_id));
--- Every player seen in a held match, and how far their match list has been read.
+-- Every player seen in a held match, and when their match list was last read.
 CREATE TABLE IF NOT EXISTS players(
     platform TEXT NOT NULL, puuid TEXT NOT NULL,
     games INTEGER NOT NULL DEFAULT 0,          -- held matches this player is in
-    read_to INTEGER NOT NULL DEFAULT 0,        -- the top of their list has been read down to this time (ms)
-    checked_at INTEGER NOT NULL DEFAULT 0,     -- when the top of their list was last read (0 = never)
-    due_at INTEGER NOT NULL,                   -- when to read the top again; the most overdue goes first
+    read_to INTEGER NOT NULL DEFAULT 0,        -- their list has been read up to this time (ms): only newer matches are asked for
+    checked_at INTEGER NOT NULL DEFAULT 0,     -- when their list was last read (0 = never)
+    due_at INTEGER NOT NULL,                   -- when to read it again (never read: from when on it may be read)
     fails INTEGER NOT NULL DEFAULT 0,          -- reads that failed in a row
     leased_until INTEGER NOT NULL DEFAULT 0,   -- a collector is reading this list until then ...
     job TEXT,                                  -- ... and its report must carry this token
-    job_kind INTEGER NOT NULL DEFAULT 0,       -- that read is 0: from the top, 1: of the older part
-    walk_newest INTEGER NOT NULL DEFAULT 0,    -- a read from the top in progress: newest match seen (ms) ...
-    walk_new INTEGER NOT NULL DEFAULT 0,       -- ... and matches not held it has found so far
-    resume INTEGER,                            -- the older part of the list, from this place on, is unread ...
-    resume_floor INTEGER NOT NULL DEFAULT 0,   -- ... back to this time (ms) ...
-    older_due INTEGER NOT NULL DEFAULT 0,      -- ... and may be read from this time on (later after failures)
+    job_kind INTEGER NOT NULL DEFAULT 0,       -- This column and the five below are no longer used. They were for reading
+    walk_newest INTEGER NOT NULL DEFAULT 0,    -- further back than a list's latest 20 matches, which the League client
+    walk_new INTEGER NOT NULL DEFAULT 0,       -- does not give. They stay so that a database made by an earlier version
+    resume INTEGER,                            -- still fits, and the earlier version can still run on this one.
+    resume_floor INTEGER NOT NULL DEFAULT 0,
+    older_due INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(platform, puuid));
-CREATE INDEX IF NOT EXISTS players_due ON players(platform, due_at);
-CREATE INDEX IF NOT EXISTS players_older_part ON players(platform, games) WHERE resume IS NOT NULL;
-CREATE INDEX IF NOT EXISTS players_unread ON players(platform) WHERE checked_at = 0;
+-- The two orders lists are handed out in (see `work`): lists read before, by when they are due again; and players
+-- never read, by the held matches they are in. The three indexes before them are no longer used.
+DROP INDEX IF EXISTS players_due;
+DROP INDEX IF EXISTS players_older_part;
+DROP INDEX IF EXISTS players_unread;
+CREATE INDEX IF NOT EXISTS players_again ON players(platform, due_at) WHERE checked_at > 0;
+CREATE INDEX IF NOT EXISTS players_never ON players(platform, games) WHERE checked_at = 0;
+-- What the list reads of each day (UTC) found, per server.
+CREATE TABLE IF NOT EXISTS read_days(
+    platform TEXT NOT NULL, day TEXT NOT NULL,
+    pages INTEGER NOT NULL DEFAULT 0,          -- list pages handed out to be read
+    lists INTEGER NOT NULL DEFAULT 0,          -- reads reported back ...
+    failed INTEGER NOT NULL DEFAULT 0,         -- ... of which failed
+    seen INTEGER NOT NULL DEFAULT 0,           -- Arena matches those reads showed that were new to their list ...
+    held INTEGER NOT NULL DEFAULT 0,           -- ... of which were held already ...
+    new INTEGER NOT NULL DEFAULT 0,            -- ... and of which no list had shown before
+    PRIMARY KEY(platform, day));
+-- The same reads' matches that were played SETTLED_SECONDS or longer before the read, by the day they were played:
+-- how many turned up and how many of those were held already. That share says how complete a day played is
+-- (it leans high: the lists read belong to players found through held matches).
+CREATE TABLE IF NOT EXISTS seen_days(
+    day TEXT NOT NULL, platform TEXT NOT NULL, played TEXT NOT NULL,     -- day: when the lists were read
+    seen INTEGER NOT NULL DEFAULT 0, held INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(day, platform, played));
 CREATE INDEX IF NOT EXISTS games_by_time ON games(created_ms);
 CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS games_by_arrival ON games(received_at, platform, contributor_id);
@@ -535,13 +557,12 @@ def games():
                 duplicates += 1         # already held: the first copy stays
                 continue
             accepted += 1
-            # Everyone in the match becomes a player whose list is worth reading. Someone not read yet
-            # moves earlier in the queue with every further match they turn up in.
+            # Everyone in the match becomes a player whose list is worth reading. Of the players not read
+            # yet, the ones in the most held matches are read first (see `work`).
             db.executemany("""
                 INSERT INTO players(platform, puuid, games, due_at) VALUES(?, ?, 1, ?)
-                ON CONFLICT(platform, puuid) DO UPDATE SET games = games + 1,
-                    due_at = CASE WHEN checked_at = 0 AND fails = 0 THEN due_at - ? ELSE due_at END""",
-                           [(platform, puuid, now, NEW_PLAYER_BONUS) for puuid in players])
+                ON CONFLICT(platform, puuid) DO UPDATE SET games = games + 1""",
+                           [(platform, puuid, now) for puuid in players])
     return jsonify({"accepted": accepted, "duplicates": duplicates, "skipped": skipped, "rejected": rejected,
                     "policy": rules})
 
@@ -566,20 +587,22 @@ def work():
     more = body.get("more") is not False and rules["enabled"]
     fetch, handed = [], []
 
-    def hand(puuid, kind, begin, since, pages):
-        """Give one stretch of a list to this collector, with a token its report must carry."""
-        job = secrets.token_hex(8)
-        db.execute("UPDATE players SET leased_until = ?, job = ?, job_kind = ? WHERE platform = ? AND puuid = ?",
-                   (now + LEASE_SECONDS, job, kind, platform, puuid))
-        handed.append({"puuid": puuid, "job": job, "since": since, "begin": begin, "pages": pages})
+    def hand(sql, values, places):
+        """Give up to `places` lists to this collector, each with a token its report must carry. Returns them."""
+        rows = db.execute(sql, values + (max(places, 0),)).fetchall()
+        for puuid, read_to in rows:
+            job = secrets.token_hex(8)
+            db.execute("UPDATE players SET leased_until = ?, job = ? WHERE platform = ? AND puuid = ?",
+                       (now + LEASE_SECONDS, job, platform, puuid))
+            handed.append({"puuid": puuid, "job": job, "since": max(read_to, season), "begin": 0, "pages": LIST_PAGES})
+        return rows
 
     db.execute("BEGIN IMMEDIATE")       # so two collectors are never handed the same work
     with db:
         for report in reports:
             cleaned = clean_report(report, now)
-            onward = take_report(db, platform, now, season, cleaned) if cleaned else None
-            if onward and more and len(handed) < MAX_REPORTS:
-                hand(*onward)           # that list goes on, and the same collector carries on with it
+            if cleaned:
+                take_report(db, platform, now, season, cleaned)
         # A collector names its own account once, so that a server with no players yet has one to start from.
         start = body.get("start")
         if isinstance(start, str) and PUUID_RE.fullmatch(start) and start.strip("0-"):
@@ -613,112 +636,123 @@ def work():
                 db.executemany("DELETE FROM wanted WHERE platform = ? AND game_id = ?", spent)
                 if not spent:
                     break
-            # The lists of the players in those event games, from the top, ahead of every other list. Each goes
-            # out again after URGENT_LIST_SECONDS, whether its last read worked or not, until the game is held.
-            urgent = db.execute(
+            # The lists of the players in those event games, ahead of every other list. Each goes out again
+            # after URGENT_LIST_SECONDS, whether its last read worked or not, until the game is held.
+            urgent = hand(
                 "SELECT p.puuid, p.read_to FROM urgent_players up "
                 "JOIN urgent_games u ON u.platform = up.platform AND u.game_id = up.game_id "
                 "JOIN players p ON p.platform = up.platform AND p.puuid = up.puuid "
                 "WHERE up.platform = ? AND u.until > ? AND up.handed_at <= ? AND p.leased_until < ? "
                 "AND NOT EXISTS (SELECT 1 FROM games g WHERE g.platform = u.platform AND g.game_id = u.game_id) "
                 "GROUP BY p.puuid ORDER BY MIN(up.handed_at), p.puuid LIMIT ?",
-                (platform, now, now - URGENT_LIST_SECONDS, now, max(PLAYERS_PER_ROUND - len(handed), 0))).fetchall()
-            for puuid, read_to in urgent:
-                hand(puuid, 0, 0, max(read_to, season), FIRST_PAGES)
+                (platform, now, now - URGENT_LIST_SECONDS, now), PLAYERS_PER_ROUND)
             db.executemany("UPDATE urgent_players SET handed_at = ? WHERE platform = ? AND puuid = ?",
                            [(now, platform, puuid) for puuid, _ in urgent])
             # While there is a full load of matches to fetch, no new lists are started: finding more
             # matches would only lengthen the queue.
             room = PLAYERS_PER_ROUND - len(handed) if len(fetch) < GAMES_PER_ROUND else 0
-            # 2. The top of the lists that are most overdue.
-            for puuid, read_to in db.execute(
-                    "SELECT puuid, read_to FROM players WHERE platform = ? AND due_at <= ? AND leased_until < ? "
-                    "ORDER BY due_at LIMIT ?", (platform, now, now, max(room, 0))).fetchall():
-                hand(puuid, 0, 0, max(read_to, season), FIRST_PAGES)
-            # 3. With nothing fresher waiting: the older parts of lists that were set aside,
-            #    starting with the players seen in the most matches.
-            if room > 0:
-                for puuid, resume, floor in db.execute(
-                        "SELECT puuid, resume, resume_floor FROM players WHERE platform = ? AND resume IS NOT NULL "
-                        "AND older_due <= ? AND leased_until < ? ORDER BY games DESC LIMIT ?",
-                        (platform, now, now, max(PLAYERS_PER_ROUND - len(handed), 0))).fetchall():
-                    hand(puuid, 1, resume, max(floor, season), MORE_PAGES)
+            # 2. Lists read before that are due again, the most overdue first. While players never read are
+            #    waiting, NEW_PLAYERS_PER_ROUND of the places are kept for them.
+            room -= len(hand(DUE_AGAIN, (platform, now, now), room - NEW_PLAYERS_PER_ROUND))
+            # 3. Players never read: the ones in the most held matches first, and of those the latest found.
+            room -= len(hand(NEVER_READ, (platform, now, now), room))
+            # (with fewer of them than places kept: more of the lists that are due again)
+            hand(DUE_AGAIN, (platform, now, now), room)
+            if handed:
+                count_reads(db, platform, now, pages=len(handed) * LIST_PAGES)
     return jsonify({"games": fetch, "players": handed, "wait": 0 if fetch or handed else 60,
                     "lease": LEASE_SECONDS, "policy": rules})
 
 
+# Both name their index, so a missing one is an error at once and never a slow search of every player.
+DUE_AGAIN = ("SELECT puuid, read_to FROM players INDEXED BY players_again WHERE platform = ? AND checked_at > 0 "
+             "AND due_at <= ? AND leased_until < ? ORDER BY due_at LIMIT ?")
+NEVER_READ = ("SELECT puuid, read_to FROM players INDEXED BY players_never WHERE platform = ? AND checked_at = 0 "
+              "AND due_at <= ? AND leased_until < ? ORDER BY games DESC, rowid DESC LIMIT ?")
+
+
+def utc_day(seconds):
+    return time.strftime("%Y-%m-%d", time.gmtime(seconds))
+
+
+def count_reads(db, platform, now, **counts):
+    """Add to today's row of read_days: what the list reads of a day found."""
+    names = sorted(counts)
+    db.execute("INSERT INTO read_days(platform, day, %s) VALUES(?, ?, %s) ON CONFLICT(platform, day) DO UPDATE SET %s" % (
+        ", ".join(names), ", ".join("?" * len(names)),
+        ", ".join("%s = %s + excluded.%s" % (name, name, name) for name in names)),
+        [platform, utc_day(now)] + [counts[name] for name in names])
+
+
+def played_at(db, platform, game_id):
+    """When a match was played (ms), judged by the nearest match held: on one server, ids go up with time
+    (measured on HN1: within 4 minutes for half the matches, within an hour for 99 in 100). None with nothing held."""
+    row = db.execute("SELECT created_ms FROM games WHERE platform = ? AND game_id <= ? ORDER BY game_id DESC LIMIT 1",
+                     (platform, game_id)).fetchone() or db.execute(
+        "SELECT created_ms FROM games WHERE platform = ? AND game_id > ? ORDER BY game_id LIMIT 1",
+        (platform, game_id)).fetchone()
+    return row[0] if row else None
+
+
 def take_report(db, platform, now, season, report):
-    """A collector read a stretch of one player's match list. Returns the next stretch to hand it, or None.
+    """A collector read one player's match list: the latest 20 matches, which is all the client gives.
 
     The matches not held yet become wanted, whoever reports them. The list's own progress is only
     taken from the report of the read currently handed out (its token must match): a report that
     arrives after its read was handed to someone else is out of date and changes nothing.
-
-    A read from the top goes further back only while that keeps turning up matches not held. After a
-    stretch with nothing new, the older part is set aside: it is read later, when no fresher work is
-    waiting, so that nothing is missed in the end.
     """
     ids = report["ids"]
-    held = set()
+    held = {}                           # match -> when it was played (ms); None for one given up on
     for start in range(0, len(ids), 500):
         chunk = ids[start:start + 500]
         marks = ",".join("?" * len(chunk))
-        held.update(row[0] for row in db.execute(
-            "SELECT game_id FROM games WHERE platform = ? AND game_id IN (%s) UNION "
-            "SELECT game_id FROM given_up WHERE platform = ? AND game_id IN (%s)" % (marks, marks),
+        held.update(db.execute(
+            "SELECT game_id, NULL FROM given_up WHERE platform = ? AND game_id IN (%s) UNION ALL "
+            "SELECT game_id, created_ms FROM games WHERE platform = ? AND game_id IN (%s)" % (marks, marks),
             [platform] + chunk + [platform] + chunk))
     missing = [game_id for game_id in ids if game_id not in held]
-    db.executemany("INSERT OR IGNORE INTO wanted(platform, game_id) VALUES(?, ?)",
-                   [(platform, game_id) for game_id in missing])
+    new = db.executemany("INSERT OR IGNORE INTO wanted(platform, game_id) VALUES(?, ?)",
+                         [(platform, game_id) for game_id in missing]).rowcount
+    # What this read found, for the daily counts. Its matches played long enough ago that they should be held
+    # by now are also counted by the day they were played.
+    count_reads(db, platform, now, lists=1, failed=int(report["failed"]), seen=len(ids),
+                held=len(ids) - len(missing), new=new)
+    settled = defaultdict(lambda: [0, 0])           # day played -> [matches seen, of which held]
+    for game_id in ids:
+        played = held.get(game_id) or played_at(db, platform, game_id)
+        if played and played <= (now - SETTLED_SECONDS) * 1000:
+            counts = settled[utc_day(played // 1000)]
+            counts[0] += 1
+            counts[1] += held.get(game_id) is not None
+    db.executemany("INSERT INTO seen_days(day, platform, played, seen, held) VALUES(?, ?, ?, ?, ?) "
+                   "ON CONFLICT(day, platform, played) DO UPDATE SET seen = seen + excluded.seen, held = held + excluded.held",
+                   [(utc_day(now), platform, played, seen, of_them) for played, (seen, of_them) in settled.items()])
 
     where = (platform, report["puuid"])
-    row = db.execute("SELECT job, job_kind, read_to, checked_at, fails, walk_newest, walk_new, resume, resume_floor "
-                     "FROM players WHERE platform = ? AND puuid = ?", where).fetchone()
+    row = db.execute("SELECT job, read_to, checked_at, fails FROM players WHERE platform = ? AND puuid = ?",
+                     where).fetchone()
     if row is None or row[0] is None or row[0] != report["job"]:
-        return None                     # not the read currently handed out: out of date
-    _, kind, read_to, checked_at, fails, walk_newest, walk_new, resume, floor = row
-    following = report["next"]
+        return                          # not the read currently handed out: out of date
+    _, read_to, checked_at, fails = row
     db.execute("UPDATE players SET job = NULL, leased_until = 0 WHERE platform = ? AND puuid = ?", where)
 
     if report["failed"]:
-        # Try again later, waiting longer each time. A read from the top starts again from the top;
-        # an older part keeps its place. Nothing that was not read is marked as read.
+        # Try again later, waiting longer each time. Nothing that was not read is marked as read.
         later = now + min(MAX_INTERVAL, RETRY_SECONDS * 2 ** min(fails, 10))
-        if kind == 0:
-            db.execute("UPDATE players SET fails = fails + 1, due_at = ?, older_due = ?, walk_newest = 0, "
-                       "walk_new = 0 WHERE platform = ? AND puuid = ?", (later, later) + where)
-        else:
-            db.execute("UPDATE players SET fails = fails + 1, older_due = ? WHERE platform = ? AND puuid = ?",
-                       (later,) + where)
-        return None
+        db.execute("UPDATE players SET fails = fails + 1, due_at = ? WHERE platform = ? AND puuid = ?", (later,) + where)
+        return
 
-    if kind == 1:
-        # A stretch of an older part that had been set aside. Note how far it got.
-        db.execute("UPDATE players SET resume = ?, fails = 0, older_due = 0 WHERE platform = ? AND puuid = ?",
-                   (following or None,) + where)
-        if following and missing:
-            return report["puuid"], 1, following, max(floor, season), MORE_PAGES
-        return None
-
-    # A stretch read from the top of the list (the first one starts at place 0).
-    since = max(read_to, season)
-    walk_newest, walk_new = max(walk_newest, report["newest"]), walk_new + len(missing)
-    if following and missing:
-        db.execute("UPDATE players SET walk_newest = ?, walk_new = ?, fails = 0 WHERE platform = ? AND puuid = ?",
-                   (walk_newest, walk_new) + where)
-        return report["puuid"], 0, following, since, MORE_PAGES
-    # It stops here: either everything since the last read has been seen, or this stretch had nothing
-    # new and the rest, back to `since`, is set aside (merged with any part set aside before).
-    if following:
-        resume, floor = (following, since) if resume is None else (min(resume, following), min(floor, since))
-    # Come back to the top when about TARGET_NEW new matches are expected, judging by how many this
-    # read found in the time since the last one (or since the season began).
-    elapsed = max(60, now - max(checked_at, season // 1000))
-    interval = min(MAX_INTERVAL, max(MIN_INTERVAL, elapsed * TARGET_NEW / max(walk_new, 0.5)))
-    db.execute("UPDATE players SET read_to = ?, checked_at = ?, due_at = ?, fails = 0, older_due = 0, "
-               "walk_newest = 0, walk_new = 0, resume = ?, resume_floor = ? WHERE platform = ? AND puuid = ?",
-               (max(read_to, walk_newest), now, now + int(interval), resume, floor) + where)
-    return None
+    # Read it again when about TARGET_SEEN more Arena matches are expected in it, judging by how many this read
+    # showed and the time they came in: since the last read, or, when every place was new to us (a first read, or
+    # one that came too late to see everything), since the oldest of them was played.
+    if ids and (report["next"] or not checked_at):
+        oldest = played_at(db, platform, ids[0])
+        elapsed = now - oldest // 1000 if oldest else UNKNOWN_SPAN
+    else:
+        elapsed = now - max(checked_at, season // 1000)
+    interval = min(MAX_INTERVAL, max(MIN_INTERVAL, max(60, elapsed) * TARGET_SEEN / max(len(ids), 0.5)))
+    db.execute("UPDATE players SET read_to = ?, checked_at = ?, due_at = ?, fails = 0 WHERE platform = ? AND puuid = ?",
+               (max(read_to, report["newest"]), now, now + int(interval)) + where)
 
 
 @app.errorhandler(413)
@@ -792,11 +826,15 @@ def cmd_stats(db, _args):
         print("  matches to fetch:  %d (%d given up on)" % (
             one("SELECT COUNT(*) FROM wanted WHERE platform = ?"),
             one("SELECT COUNT(*) FROM given_up WHERE platform = ?")))
-        print("  players known:     %d (%d never read, %d due to be read now, %d with an older part still to read)" % (
+        print("  players known:     %d (%d never read; of the others, %d due to be read again now)" % (
             one("SELECT COUNT(*) FROM players WHERE platform = ?"),
             one("SELECT COUNT(*) FROM players WHERE platform = ? AND checked_at = 0"),
-            one("SELECT COUNT(*) FROM players WHERE platform = ? AND due_at <= ?", now),
-            one("SELECT COUNT(*) FROM players WHERE platform = ? AND resume IS NOT NULL")))
+            one("SELECT COUNT(*) FROM players WHERE platform = ? AND checked_at > 0 AND due_at <= ?", now)))
+        for day, pages, lists, failed, seen, held, new in db.execute(
+                "SELECT day, pages, lists, failed, seen, held, new FROM read_days WHERE platform = ? AND day >= ? "
+                "ORDER BY day", (platform, utc_day(now - 2 * 86400))):
+            print("  lists read %s: %d (%d failed) for %d pages asked; Arena matches they showed: %d, "
+                  "%d held already, %d not seen before" % (day, lists, failed, pages, seen, held, new))
     if not platforms:
         print("Nothing received yet.")
     relay = relay_status(db, now)
@@ -826,10 +864,10 @@ def cmd_policy(db, args):
             if value is not None:
                 db.execute("INSERT OR REPLACE INTO settings VALUES(?, ?)", (name, str(value)))
         if season is not None and season < before:
-            # Lists were only read back to the old date. Every list read so far gets the stretch between
-            # the two dates set aside, to be read when there is room (from the top, as its place is unknown).
-            changed = db.execute("UPDATE players SET resume = 0, resume_floor = ? WHERE checked_at > 0",
-                                 (season,)).rowcount
+            # Lists were only read back to the old date. Every list read so far is due again at once, and is
+            # asked for everything since the new date (as far as its latest 20 matches go back).
+            changed = db.execute("UPDATE players SET read_to = 0, due_at = MIN(due_at, ?) WHERE checked_at > 0",
+                                 (int(clock()),)).rowcount
             print("The season now starts earlier: %d match lists will be read again back to the new date." % changed)
     print("Policy: %s, new installs %s" % (get_policy(db), "can sign up" if signups_open(db) else "cannot sign up"))
 
@@ -947,6 +985,18 @@ def relay_status(db, now):
                               (now - seconds, platform)).fetchone()[0] for seconds in (3600, 86400)]
         platforms[platform] = {"held": held, "last_received_at": newest, "hourly_newest_first": hourly,
                                "senders_last_hour": senders[0], "senders_last_day": senders[1]}
+    # What list reads found: the last 7 days' counts, and for each day played how many of its matches turned up in
+    # lists read in those 7 days (at least SETTLED_SECONDS after they were played) and how many of those were held.
+    since = utc_day(now - 7 * 86400)
+    reads = defaultdict(lambda: {"days": [], "played": []})
+    for platform, day, pages, lists, failed, seen, held, new in db.execute(
+            "SELECT platform, day, pages, lists, failed, seen, held, new FROM read_days WHERE day > ? ORDER BY day", (since,)):
+        reads[platform]["days"].append({"day": day, "pages": pages, "lists": lists, "failed": failed, "seen": seen,
+                                        "held": held, "new": new})
+    for platform, played, seen, held in db.execute(
+            "SELECT platform, played, SUM(seen), SUM(held) FROM seen_days WHERE day > ? GROUP BY platform, played "
+            "ORDER BY played", (since,)):
+        reads[platform]["played"].append({"day": played, "seen": seen, "held": held})
     policy = get_policy(db)
     return {"now": now, "season_start": policy["season_start"], "collecting": policy["enabled"], "fast": policy["fast"],
             "signups": signups_open(db), "waiting": db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],
@@ -957,7 +1007,7 @@ def relay_status(db, now):
             "urgent_not_held": db.execute(
                 "SELECT COUNT(*) FROM urgent_games u WHERE u.until > ? AND NOT EXISTS "
                 "(SELECT 1 FROM games g WHERE g.platform = u.platform AND g.game_id = u.game_id)", (now,)).fetchone()[0],
-            "uploads_paused": backlog_full(db), "platforms": platforms,
+            "uploads_paused": backlog_full(db), "platforms": platforms, "reads": reads,
             "installs_seen": {label: dict(db.execute(
                 "SELECT state, COUNT(*) FROM contributor_seen WHERE seen_at > ? GROUP BY state", (now - seconds,)))
                 for label, seconds in (("last_hour", 3600), ("last_day", 86400))}}

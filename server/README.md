@@ -20,8 +20,25 @@ Live at `https://arenasweats.lol/collector/` on the website server.
   could fetch after 6 tries is set apart and not asked for again.
 - **Nothing from before the season.** Lists are read back to the season's start only, and
   an older match that is sent anyway is not kept. The start is 2026-10-06 UTC until
-  changed with `policy --season-start`. Moving it earlier has every list read so far read
-  again back to the new date, when there is room.
+  changed with `policy --season-start`. Moving it earlier makes every list read so far due
+  again at once, back to the new date (as far as its latest 20 matches go).
+- **A player's list is their latest 20 matches, and no more.** The League client shows a
+  player's latest 20 matches (all modes together). Asked for older places (`begIndex=20`
+  and up) it answers with the same 20, except for the account that is logged in. Measured
+  on 25 Nov 2026 on the 121,500 lists read on HN1 (HN10 and NA1 show the same):
+  - of the 51,865 reads that went on past the first page, 51,619 found nothing there;
+  - of the 154,600 matches that one list read alone can have found, 99.5% were among that
+    player's 20 newest Arena matches: places 15 to 20 brought in about 6,900 matches each,
+    place 21 brought 482 and place 23 brought 20;
+  - 11 players' reads on HN1 and 1 on HN10 did bring in older matches (90 and 12 of them):
+    on HN10, with one collector, that is its own account.
+
+  So a list is read one page at a time (`LIST_PAGES`). Until that day the endpoint asked for
+  three more pages whenever the first showed something new, which was 31% of all client
+  requests on HN1 (156,600 of 510,000). And a match can only be found while it is among the
+  latest 20 of one of its 18 players. A busy player's list turns over in a day or two;
+  someone who stopped playing keeps theirs for good. What no list shows any more cannot be
+  had.
 - **Whose list to read next:**
   0. ArenaSweats Events games that the rankings server is waiting for go out before anything
      else, until they are held here, every 5 minutes (one may not have ended yet), however
@@ -30,31 +47,26 @@ Live at `https://arenasweats.lol/collector/` on the website server.
      server's relay key can name these games (`relay urgent`, below); collectors cannot.
   1. Matches on the wanted list go out first, newest first. While there is a full load of
      them, no new lists are started.
-  2. Then the top of the lists that are most overdue. A player never read yet is due at
-     once, and moves earlier with every further match they are seen in, so the players in
-     the most matches are read first.
-  3. A list is read one page (20 matches) at first, then three pages at a time for as
-     long as that turns up matches not held. After a stretch with nothing new, the older
-     part is set aside and read only when steps 1 and 2 leave room. Nothing is skipped
-     for good.
-  4. A player is read again when about 8 new matches are expected, judging by how many
-     the last read found: between 1 hour and 7 days later. A read that fails is tried
-     again after 10 minutes, then 20, 40 and so on.
+  2. Then lists read before that are due again, the most overdue first.
+  3. Then players never read: the ones in the most held matches first, and of those the
+     latest found. While both kinds are waiting, each gets half of the 10 lists handed out
+     per request (`NEW_PLAYERS_PER_ROUND`); when only one kind is, it gets them all.
+  4. A list is due again when about 10 more Arena matches are expected in it
+     (`TARGET_SEEN`: half of its 20 places), judging by how many its last read showed and
+     how long those took to come in: between 1 hour and 30 days later. One that showed no
+     Arena match comes back after 30 days. A read that fails is tried again after 10
+     minutes, then 20, 40 and so on.
+- **What the reads found is counted.** `read_days` has, per server and day: list pages
+  asked for, reads reported and failed, the Arena matches they showed, and how many of
+  those were held already or had not been seen in any list. `seen_days` splits the matches
+  that were at least two days old when a list showed them by the day they were played:
+  the share of them held already says how complete that day is (it leans high, as the
+  lists read belong to players found through held matches). `stats` prints the last days;
+  `relay status` gives the last 7 days under `reads`.
 - **Out-of-date reports change nothing.** Each stretch of a list is handed out with a
   token, and the list's progress is only taken from the report carrying the current token.
   A report that arrives after its stretch went to someone else still adds the matches it
   saw to the wanted list, but cannot move the list's progress backwards or forwards.
-
-In a simulation (1,500 matches, three collectors), every match was captured and none was
-fetched twice. Client requests per match captured:
-
-| | 90% held | all held | reading every list in full |
-| --- | --- | --- | --- |
-| Lists mostly Arena (300 players) | 1.5 | 2.2 | 2.9 |
-| Arena a small share (1,500 players) | 2.8 | 4.4 | 8.3 |
-
-Finishing the set-aside older parts afterwards costs about as much as reading every list in
-full, but that only happens when there is nothing fresher to do.
 
 ## What is still checked
 

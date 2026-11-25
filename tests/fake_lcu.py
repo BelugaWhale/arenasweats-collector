@@ -117,6 +117,14 @@ class FakeClient:
     def arena_ids(self):
         return {game_id for game_id, game in self.games.items() if game["gameMode"] == "CHERRY"}
 
+    def listed_arena_ids(self):
+        """The Arena matches among some player's latest 20 matches: all that the real client's lists ever show
+        (asked for older places it answers with the same 20, which this stand-in does not copy)."""
+        listed = set()
+        for ids in self.history.values():
+            listed.update(sorted(ids, key=lambda i: -self.games[i]["gameCreation"])[:20])
+        return listed & self.arena_ids()
+
     def summary(self, game_id, puuid):
         """A match as it appears in one player's match list: only that player's own row."""
         game = dict(self.games[game_id])
