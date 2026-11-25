@@ -1427,15 +1427,17 @@ class FastWithServer(WithServer):
 
 class SeveralAtOnce(WithServer):
     """Fast mode sends the next request before the last one is answered. Here the fake client's answers take
-    pretend time (a list 1.5 s, a match 0.05 s, about what Chinese clients were measured to take), so requests
-    can be on their way together."""
+    pretend time (a list 1.5 s, about what Chinese clients were measured to take; a match 0.5 s, longer than
+    theirs, so that every answer keeps the next request waiting whatever the mix of lists and matches), so
+    requests can be on their way together."""
 
     def setUp(self):
         super().setUp()
         self.fake.close()
-        self.fake = FakeClient(players=400, arena=1600, clock=self.clock)   # enough to keep it reading for a while
+        # Every list is one page here, and there is enough to read for 40 minutes at fast mode's full pace.
+        self.fake = FakeClient(players=3000, arena=3000, other=0, clock=self.clock)
         self.fake.write_lockfile(self.league_dir)
-        self.fake.delay = lambda path: 0.05 if "/games/" in path else 1.5
+        self.fake.delay = lambda path: 0.5 if "/games/" in path else 1.5
 
     def collector(self, *args, **kwargs):
         made = super().collector(*args, **kwargs)
@@ -1469,6 +1471,8 @@ class SeveralAtOnce(WithServer):
         self.assertEqual(early, [1])                                     # it starts with one at a time
         self.assertEqual(self.flights.most, collector.FAST_MAX_FLIGHT)   # and works up to the ceiling, not beyond
         self.assertEqual(made.flight, collector.FAST_MAX_FLIGHT)
+        for kind in ("top", "match"):       # how long each kind of request takes alone was measured first
+            self.assertGreaterEqual(len(made.alone[kind]), collector.FLIGHT_ALONE)
         self.assertGreaterEqual(min(self.gaps()), collector.FAST_MIN_DELAY - 0.001)
         late = self.gaps(start + 600)
         self.assertLess(sorted(late)[len(late) // 2], 0.5)               # a request every 0.4 s, whatever answers take
@@ -1482,7 +1486,7 @@ class SeveralAtOnce(WithServer):
 
         def one_after_the_other(path):          # the client works on one request at a time: the others wait
             begins = max(self.clock.now(), free[0])
-            free[0] = begins + (0.05 if "/games/" in path else 1.5)
+            free[0] = begins + 1.5
             return free[0] - self.clock.now()
         self.fake.delay = one_after_the_other
         with self.assertLogs(collector.log, "INFO") as logs:
@@ -1497,7 +1501,7 @@ class SeveralAtOnce(WithServer):
         # A client that fails or says "too many requests" must be left alone at once, or the account is at risk.
         start = self.clock.now()
         failing = {}
-        self.fake.fail = lambda path: failing.pop("status", None) if "/matches?" in path else None
+        self.fake.fail = lambda path: failing.pop("status", None) if "match-history" in path else None
         for when, status in ((250, 500), (400, 500), (410, 500), (800, 429)):
             self.clock.at(start + when, lambda status=status: failing.update(status=status))
         self.clock.at(start + 830, lambda: setattr(self.flights, "most", 0))
@@ -1570,17 +1574,18 @@ class SeveralAtOnce(WithServer):
                 for number in value if name in ("top", "page", "match", "calls") else [value]:
                     self.assertIs(type(number), int, name)
             self.assertTrue(295 <= report["seconds"] <= 310)
-            self.assertGreater(report["requests"], 400)
+            self.assertGreater(report["requests"], 300)
             self.assertEqual(report["top"][1:], [1500, 1500])            # how long a list's first page took, in ms
-            self.assertEqual(report["match"][1:], [50, 50])
-        self.assertTrue(1 < reports[1]["flight"] <= collector.FAST_MAX_FLIGHT)
-        self.assertEqual(reports[1]["most"], reports[1]["flight"])
+            self.assertEqual(report["match"][1:], [500, 500])
+            self.assertTrue(1 <= report["most"] <= report["flight"] <= collector.FAST_MAX_FLIGHT, report)
+        self.assertGreater(reports[1]["flight"], 1)
 
     def test_real_requests_overlap_in_fast_mode_only(self):
         # The other tests here use pretend time; this one proves the real threads keep the same two promises.
         ingest.clock = time.time
         self.addCleanup(setattr, collector, "FLIGHT_CLEAN", collector.FLIGHT_CLEAN)
-        collector.FLIGHT_CLEAN = 3
+        self.addCleanup(setattr, collector, "FLIGHT_ALONE", collector.FLIGHT_ALONE)
+        collector.FLIGHT_CLEAN, collector.FLIGHT_ALONE = 3, 2             # so that a few seconds are enough
         fake = FakeClient(players=60, arena=200)                         # no pretend clock: its answers really take time
         self.addCleanup(fake.close)
         fake.delay = lambda path: 0.02 if "/games/" in path else 0.5

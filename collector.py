@@ -91,7 +91,8 @@ FLIGHT_HOLD = 600      # but not for this long after trouble took one away (twic
                        # back soon after, up to FAST_REST).
 FLIGHT_FAILURES = 100  # Trouble is two failed requests within this many (one alone happens one at a time too),
 SLOW_FACTOR = 1.5      # or answers taking this many times as long as they do one at a time
-FLIGHT_WINDOW = 20     # (the middle one of this many answers of the same kind, against that of the last ones sent alone).
+FLIGHT_WINDOW = 20     # (the middle one of this many answers of the same kind, against that of the last ones sent alone;
+FLIGHT_ALONE = 5       # the first this many requests of each kind are always sent alone, to know how long that takes).
 FAST_SPEEDUP = "3"     # matches an hour in fast mode against the normal pace (fake client, real client's answer times)
 FAST_REST = 3600       # in fast mode, a 429 or 3 failed requests in a row bring back the normal pace for this long
 FAST_AHEAD = 5         # fast mode asks ArenaSweats for more work when this few requests are left to send,
@@ -1745,7 +1746,7 @@ class Collector:
         the next request or it is time to ask for work, and never more than 5 seconds, so that the
         client is looked at that often."""
         waits = [5.0]
-        if self.todo and len(self.flying) < self.flight_limit:
+        if self.todo and not self.must_wait():
             waits.append(self.next_allowed - self.now())
         if self.asking is None and self.wants_work():
             waits.append(self.ask_at() - self.now())
@@ -1794,31 +1795,47 @@ class Collector:
         self.todo.extendleft(reversed(self.flying.values()))
         self.flying.clear()
 
-    def start_request(self):
-        """Send the client the next match-history request, if the pace and the number on their way allow."""
-        if len(self.flying) >= self.flight_limit or self.now() < self.next_allowed:
-            return
+    def skip_stale(self):
+        """Take off the front of the queue what is not to be asked of the client: work held too long (usually
+        through a game: the server has handed it to someone else), and lists with nothing to ask for."""
         while self.todo:
-            job = self.todo.popleft()
+            job = self.todo[0]
             if self.now() > job.deadline:
-                # Held too long (usually through a game): the server has handed it to someone else.
                 self.pace["expired"] += 1
                 log.info("%s waited too long; it is left to other collectors", request_kind(job.path))
             elif isinstance(job, ListRead) and job.done:
                 self.report_list(job)
             else:
-                self.flown += 1
-                lcu, path = self.lcu, job.path
-                job.started, job.alone = self.now(), not self.flying
-                for other in self.flying.values():
-                    other.alone = False
-                self.flying[self.flown] = job
-                self.pace["most"] = max(self.pace["most"], len(self.flying))
-                self.flights.start(self.flown, lambda: lcu.get(path))
-                # In fast mode the gap runs from this start. At the normal pace it runs from the answer
-                # (see answered), which is awaited first: only one request is on its way.
-                self.next_allowed = self.now() + self.gap()
                 return
+            self.todo.popleft()
+
+    def must_wait(self):
+        """Whether the next request in the queue has to wait for an answer before it may go: as many as may
+        be are on their way, or it (or one that is on its way) goes alone, to learn how long requests of
+        its kind take alone."""
+        if not self.flying:
+            return False
+        return (len(self.flying) >= self.flight_limit or any(job.learning for job in self.flying.values())
+                or len(self.alone[request_kind(self.todo[0].path)]) < FLIGHT_ALONE)
+
+    def start_request(self):
+        """Send the client the next match-history request, if the pace and the number on their way allow."""
+        self.skip_stale()
+        if not self.todo or self.must_wait() or self.now() < self.next_allowed:
+            return
+        job = self.todo.popleft()
+        self.flown += 1
+        lcu, path = self.lcu, job.path
+        job.started, job.alone = self.now(), not self.flying
+        job.learning = len(self.alone[request_kind(path)]) < FLIGHT_ALONE
+        for other in self.flying.values():
+            other.alone = False
+        self.flying[self.flown] = job
+        self.pace["most"] = max(self.pace["most"], len(self.flying))
+        self.flights.start(self.flown, lambda: lcu.get(path))
+        # In fast mode the gap runs from this start. At the normal pace it runs from the answer
+        # (see answered), which is awaited first: only one request is on its way.
+        self.next_allowed = self.now() + self.gap()
 
     def landed(self, job, answer):
         """Take in the answer to a request that was on its way: a match, or a page of a match list."""
@@ -1866,7 +1883,7 @@ class Collector:
         request was waiting for this answer; with others on their way already, only once there are
         enough answers of this kind to tell that they are no slower."""
         alone, shared = self.alone[kind], self.shared[kind]
-        compared = len(alone) >= 5 and len(shared) == FLIGHT_WINDOW
+        compared = len(alone) >= FLIGHT_ALONE and len(shared) == FLIGHT_WINDOW
         if compared and statistics.median(shared) > SLOW_FACTOR * statistics.median(alone) + 0.1:
             self.ease_off("answers took %.2fs with others on their way, %.2fs alone"
                           % (statistics.median(shared), statistics.median(alone)))
