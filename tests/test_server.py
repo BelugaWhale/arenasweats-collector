@@ -898,6 +898,40 @@ class ListsInOneRequest(ServerCase):
         self.assertEqual(handed["a"]["since"], self.db.execute("SELECT read_to FROM players WHERE puuid = ?",
                                                                ("a" * 36,)).fetchone()[0] or self.season)
 
+    def test_progress_back_to_the_season_start_is_shown_per_server(self):
+        # Admin decides from these lines whether the season's matches can be had in time and what to change: wrong
+        # numbers here would send volunteers' time the wrong way for days.
+        self.admin("policy", "--block", "1000")
+        ingest.DEFAULT_RATE = 4.0
+        players = [(1, 0, 0, 50), (1, 0, 0, 40), (2, 200, 8640, 30), (3, 100, 8640, 30), (0, 0, 0, 25), (0, 0, 0, 3)]
+        self.db.executemany("INSERT INTO players(platform, puuid, back, depth, pace, games, checked_at, due_at) "
+                            "VALUES('OC1', ?, ?, ?, ?, ?, ?, ?)", [("p%035d" % n, back, depth, pace, games, 1 if back else 0,
+                                                                     int(self.now) + 86400)
+                                                                    for n, (back, depth, pace, games) in enumerate(players)])
+        today = utc_date(self.now)
+        self.db.execute("INSERT INTO size_days(day, platform, asked, fresh, listed, took_ms) VALUES(?, 'OC1', 200, 5, 1000, "
+                        "80000)", (today,))
+        self.db.execute("INSERT INTO read_days(platform, day, lists) VALUES('OC1', ?, 5)", (today,))
+        self.db.execute("INSERT INTO seen_days(day, platform, played, seen, held) VALUES(?, 'OC1', '2026-10-10', 100, 53)",
+                        (today,))
+        self.db.commit()
+        state = ingest.progress(self.db, "OC1", int(self.now))
+        first, further = 4 * self.days, 10 * self.days * ingest.SPARE_DEEP + 20      # (10 matches a day in that list)
+        self.assertEqual({name: state[name] for name in ("reached", "as_far", "further", "not_back", "not_back_regulars")},
+                         {"reached": 2, "as_far": 1, "further": 1, "not_back": 2, "not_back_regulars": 1})
+        self.assertAlmostEqual(state["places_left"], 2 * first + further, delta=1)
+        self.assertAlmostEqual(state["places_left_regulars"], first + further, delta=1)
+        self.assertEqual(state["seconds_a_place"], 0.08)
+        self.assertAlmostEqual(state["hours_left"], (2 * first + further) * 0.08 / 3600, delta=0.1)
+        self.assertEqual(state["season_held"], 0.53)
+        self.assertEqual(json.loads(self.relay("status"))["reads"]["OC1"]["progress"], state)
+        stats = self.admin("stats")
+        self.assertIn("back to the season's start: 2 lists got there, 1 are as far back as they go (or as one request may "
+                      "go), 1 are to be read further back, 2 are not read back yet (1 of them of players in 20 or more "
+                      "held matches)", stats)
+        self.assertIn("client hours at 0.080 s a listed match, as first asked for;", stats)
+        self.assertIn("the season held: about 53%, judged by the list reads of the last 7 days", stats)
+
     def test_the_most_valuable_lists_are_read_back_first(self):
         # Client time is the volunteers' own: the lists worth the most Arena matches not yet seen go first.
         ingest.DEFAULT_RATE = 1000.0
@@ -921,8 +955,9 @@ class ListsInOneRequest(ServerCase):
     def test_lists_never_read_in_one_request_are_asked_for_what_similar_lists_held(self):
         # A first read decides how far back that client can ever see the list: too few places and the list must be read
         # again elsewhere, too many and the volunteer's client lists matches from before the season for nothing.
-        ingest.FIT_MIN = 3
-        self.addCleanup(setattr, ingest, "FIT_MIN", 30)
+        for name, value in (("FIT_MIN", 3), ("FIRST_QUANTILE", 0.6)):
+            self.addCleanup(setattr, ingest, name, getattr(ingest, name))
+            setattr(ingest, name, value)
         rows = [("OC1", "h%035d" % n, 100, 86400 // rate) for n, rate in enumerate((2, 4, 6, 8, 10))]   # 64-127 held
         rows += [("OC1", "l%035d" % n, 5, 86400 // rate) for n, rate in enumerate((1, 2, 3))]            # 4-7 held
         rows += [("KR", "k%035d" % n, 5, 86400 // rate) for n, rate in enumerate((20, 20, 20))]

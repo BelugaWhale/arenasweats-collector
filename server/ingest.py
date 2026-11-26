@@ -82,11 +82,11 @@ SPARE = 1.5                      # a list read again for what is new at its top 
                                  # that should be enough
 SPARE_DEEP = 1.25                # a list read back to the season's start whose pace is known (all modes, from an earlier
                                  # read) is asked for this many times the places since the season began, and a page more
-FIRST_QUANTILE = 0.6             # a list never read in one request is asked for as many places as reached back to the
+FIRST_QUANTILE = 0.75            # a list never read in one request is asked for as many places as reached back to the
                                  # season's start for this share of the lists read of players in about as many held matches
-                                 # (see list_rates). Measured on 2,143 lists of HN1 and HN10 (25-26 Nov 2026): the places
-                                 # needed differ about twofold between players alike, so asking for more than the middle
-                                 # costs little more than asking for less and reading the rest again (see README.md).
+                                 # (see list_rates). Played on 2,143 lists of HN1 and HN10 read on 25-26 Nov 2026, with up
+                                 # to 1,000 allowed: 764 places a list, 1.25 reads, against 995 places for 20 a held match
+                                 # (asking for the middle: 800, 1.5 reads); 96% get there either way (see README.md).
 FIT_MIN = 30                     # ... judged from at least this many lists (else all of the server's, else all servers')
 FIT_SECONDS = 600                # ... and judged again this often
 DEFAULT_RATE = 8.0               # matches a day (all modes) in a list, when no list has been read in one request anywhere:
@@ -792,11 +792,8 @@ def work():
                 # Seen back to the season's start before (or as far as it goes): what came since, with places to spare.
                 count = (now - checked_at) / pace * SPARE + 5 if pace else PAGE
             elif block and not top:
-                # Not seen that far back yet: everything since the season began. How many places that takes is known
-                # once a read has told how fast the list fills (its pace); before that, judged from similar players'.
-                days = (now - season // 1000) / 86400
-                count = days * 86400 / pace * SPARE_DEEP + PAGE if pace else days * rates[band(games)]
-                since = season
+                # Not seen that far back yet: everything since the season began.
+                count, since = deep_places(pace, games, now, season, rates), season
             count = min(block or PAGE, PAGE * max(1, -int(-count // PAGE)))      # whole pages of 20
             if handed and sum(item.get("count", PAGE) for item in handed) + count > PLACES_PER_ROUND:
                 break
@@ -918,6 +915,14 @@ NEVER_READ = ("SELECT " + COLUMNS + ", 0 FROM players INDEXED BY players_never W
 def band(games):
     """Players are judged by others in about as many held matches: 1, 2-3, 4-7, ... 256-511, 512 and more."""
     return min(max(games, 1).bit_length(), 10)
+
+
+def deep_places(pace, games, now, season, rates):
+    """How many places of a list to ask for to see it back to the season's start (before whole pages and limits). How
+    many that takes is known once a read has told how fast the list fills (its pace); before that, it is judged by
+    what similar players' lists held (see list_rates)."""
+    days = (now - season // 1000) / 86400
+    return days * 86400 / pace * SPARE_DEEP + PAGE if pace else days * rates[band(games)]
 
 
 rate_fits = {}      # (database, server) -> (when judged, {band: matches a day}); see list_rates
@@ -1147,6 +1152,59 @@ def sizes(db, platform, since):
     return out
 
 
+def season_held(db, platform, now):
+    """The share of the season's matches held, as judged by the list reads of the last 7 days: of the matches they
+    showed that were played at least SETTLED_SECONDS before, how many were held already (see seen_days). An
+    estimate, and it leans high: the lists read belong to players found through held matches. None: no such reads."""
+    seen, held = db.execute("SELECT SUM(seen), SUM(held) FROM seen_days WHERE platform = ? AND day > ?",
+                            (platform, utc_day(now - 7 * 86400))).fetchone()
+    return round(held / seen, 3) if seen else None
+
+
+def progress(db, platform, now):
+    """How far the server's lists are from being read back to the season's start: lists that got there, that are as
+    far back as they go (or as one request may go), that are to be read further back, and that no read in one request
+    has seen back yet (of those, how many belong to players in REGULAR or more held matches). Then how many places
+    collectors would be asked for to read them back (as `hand` would ask now; reads that fall short and are read
+    again come on top), what a listed place took the clients in the last 3 days, and so how many hours of client
+    time that is, and how many days at the hours lists took in those 3 days. None where nothing was measured."""
+    season, ceiling = get_policy(db)["season_start"], block_limit(db)
+    counts = dict(db.execute("SELECT back, COUNT(*) FROM players INDEXED BY players_top WHERE platform = ? "
+                             "AND back IN (1, 2) GROUP BY back", (platform,)))
+    rates = list_rates(db, platform, now)
+    places = {"all": 0, "regulars": 0}
+    not_back = regulars = 0
+    for games, count in db.execute("SELECT games, COUNT(*) FROM players INDEXED BY players_back WHERE platform = ? "
+                                   "AND back = 0 GROUP BY games", (platform,)):
+        asked = count * min(ceiling, deep_places(0, games, now, season, rates))
+        places["all"] += asked
+        not_back += count
+        if games >= REGULAR:
+            places["regulars"] += asked
+            regulars += count
+    further = 0
+    for (pace,) in db.execute("SELECT pace FROM players INDEXED BY players_deeper WHERE platform = ? AND back = 3",
+                              (platform,)):
+        asked = min(ceiling, deep_places(pace, 0, now, season, rates))
+        places["all"] += asked
+        places["regulars"] += asked
+        further += 1
+    since = utc_day(now - 2 * 86400)
+    took_ms, listed = db.execute("SELECT SUM(took_ms), SUM(listed) FROM size_days WHERE platform = ? AND day >= ?",
+                                 (platform, since)).fetchone()
+    a_place = took_ms / 1000 / listed if took_ms and listed else None
+    a_day = took_ms / 3600 / ((now - date_ms(since) // 1000) / 86400) / 1000 if took_ms else None
+    hours = {name: round(number * a_place / 3600, 1) if a_place else None for name, number in places.items()}
+    return {"reached": counts.get(1, 0), "as_far": counts.get(2, 0), "further": further,
+            "not_back": not_back, "not_back_regulars": regulars,
+            "places_left": round(places["all"]), "places_left_regulars": round(places["regulars"]),
+            "seconds_a_place": round(a_place, 4) if a_place else None,
+            "hours_left": hours["all"], "hours_left_regulars": hours["regulars"],
+            "list_hours_a_day": round(a_day, 1) if a_day else None,
+            "days_left_regulars": round(hours["regulars"] / a_day, 1) if a_day and hours["regulars"] is not None else None,
+            "season_held": season_held(db, platform, now)}
+
+
 def cmd_add_key(db, args):
     key = "as_" + secrets.token_urlsafe(24)
     with db:
@@ -1228,8 +1286,23 @@ def cmd_stats(db, _args):
             one("SELECT COUNT(*) FROM players WHERE platform = ?"),
             one("SELECT COUNT(*) FROM players WHERE platform = ? AND checked_at = 0"),
             one("SELECT COUNT(*) FROM players WHERE platform = ? AND checked_at > 0 AND due_at <= ?", now)))
-        print("  not seen back to the season's start yet: %d of the lists read" % one(
-            "SELECT COUNT(*) FROM players WHERE platform = ? AND back = 0 AND checked_at > 0"))
+        state = progress(db, platform, now)
+        print("  back to the season's start: %d lists got there, %d are as far back as they go (or as one request may "
+              "go), %d are to be read further back, %d are not read back yet (%d of them of players in %d or more held "
+              "matches)" % (state["reached"], state["as_far"], state["further"], state["not_back"],
+                            state["not_back_regulars"], REGULAR))
+        if state["seconds_a_place"]:
+            print("  to read them back: about %.0f client hours at %.3f s a listed match, as first asked for; %.0f for "
+                  "those players and the ones to be read further back, %.1f days at the %.1f client hours a day lists "
+                  "took in the last 3 days" % (state["hours_left"], state["seconds_a_place"],
+                                               state["hours_left_regulars"], state["days_left_regulars"],
+                                               state["list_hours_a_day"]))
+        else:
+            print("  to read them back: %d listed matches as first asked for (no list read in the last 3 days to time "
+                  "them by)" % state["places_left"])
+        held = state["season_held"]
+        print("  the season held: about %s, judged by the list reads of the last 7 days (it leans high)" % (
+            "%.0f%%" % (100 * held) if held is not None else "? (none)"))
         for day, pages, places, lists, failed, saved, back, seen, held, new in db.execute(
                 "SELECT day, pages, places, lists, failed, saved, back, seen, held, new FROM read_days "
                 "WHERE platform = ? AND day >= ? ORDER BY day", (platform, utc_day(now - 2 * 86400))):
@@ -1424,6 +1497,7 @@ def relay_status(db, now):
         reads[row[0]]["days"].append(dict(zip(names, row[1:])))
     for platform in list(reads):
         reads[platform]["sizes"] = sizes(db, platform, since)
+        reads[platform]["progress"] = progress(db, platform, now)
     for platform, played, seen, held in db.execute(
             "SELECT platform, played, SUM(seen), SUM(held) FROM seen_days WHERE day > ? GROUP BY platform, played "
             "ORDER BY played", (since,)):

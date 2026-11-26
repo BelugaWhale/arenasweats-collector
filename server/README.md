@@ -32,24 +32,36 @@ Live at `https://arenasweats.lol/collector/` on the website server.
   the next page, as collectors did up to 0.3.7, never got past the first 20: on HN1, of the
   51,865 reads that went on past the first page, 51,619 found nothing there, and the extra
   pages were 31% of all client requests until 25 Nov (156,600 of 510,000).
-  - A collector from 0.3.8 on says the most it can ask for in one request (`block`: 200)
-    and how many lists it has room for (`lists`). Each list it is handed says how many
-    matches to ask for (`count`). A collector up to 0.3.7 is handed one page of 20, as
-    before.
+  - A collector from 0.3.8 on says the most it can ask for in one request (`block`: 200;
+    1,000 from 0.3.9) and how many lists it has room for (`lists`). Each list it is handed
+    says how many matches to ask for (`count`). A collector up to 0.3.7 is handed one page
+    of 20, as before.
   - `policy --block N` sets the most any collector is asked for (200 until changed). It is
     in force from the next request for work, with no restart: `--block 20` is one page for
-    everybody again. Raising it has the lists that were cut short read back again.
-  - How many are asked for. A list not seen back to the season's start yet: 20 for every
-    held match its player is in (200 from 10 held matches on, one page for somebody seen
-    once); once a read has told how fast the list fills, enough for the whole season and
-    half as many again. A list seen that far back before: what should have come in since
-    its last read and half as many again, 20 at least.
+    everybody again. Raising it has the lists that were cut short read further back.
+  - How many are asked for. Every listed match costs the volunteer's client about 0.08 s,
+    whatever its mode, so a read asks for what should reach back to the season's start and
+    no more:
+    - a list never read in one request: as many as reached back to the season's start for
+      75% of the lists read on that server of players in about as many held matches (1,
+      2-3, 4-7, ... 512 or more), judged from their pace every 10 minutes; with fewer than
+      30 such lists, from all of the server's, then all servers', then 8 a day;
+    - a list whose pace is known (an earlier read listed so many matches back to such a
+      day): 1.25 times what that pace gives since the season began, and a page more;
+    - a list seen back to the season's start before: what should have come in since its
+      last read and half as many again, 20 at least.
   - Only a read whose oldest match is from before the season counts as back to the
-    season's start. One that listed all it was asked for and still goes on, or fewer than
-    it was asked for (the list's own end, or all that client gives), is left at that
-    (`back` 2, with how many it listed in `depth`). A failed read, an empty list, or an
-    answer from the client's saved copy (10 matches or more in under 0.3 s) is no read at
-    all: it is tried again after 10 minutes, then 20, 40 and so on.
+    season's start (`back` 1). One that listed fewer than it was asked for (the list's end,
+    or all that client gives), or all that the policy lets a collector ask for, is left at
+    that (`back` 2, with how many it listed in `depth`); raising the policy reads the second
+    kind further back. One that listed all it was asked for, less than allowed, and goes on
+    is read further back (`back` 3), as far as its pace says, by another install: a client
+    answers every later request for a list from the copy it made at the first, so the
+    install that read it is not handed it again for a day (`COPY_SECONDS`), and only a
+    collector that can ask for all the policy allows gets it (0.3.8 asks for 200 at most,
+    0.3.9 for 1,000). A failed read, an empty list, or an answer from the client's saved
+    copy (10 matches or more in under 0.3 s) is no read at all: it is tried again after
+    10 minutes, then 20, 40 and so on (and that install keeps away from it for a day).
   - Not known until a client on a Chinese server has reported: whether it gives more than
     20, how long it takes, and how long it keeps its copy (minutes, or until it is
     restarted). While a client keeps its copy of a list it cannot fetch that list again,
@@ -65,13 +77,18 @@ Live at `https://arenasweats.lol/collector/` on the website server.
   2. Then lists read before that are due again, the most overdue first. They show what was
      played since their last read, so with step 1 new matches keep arriving while older
      ones are caught up on. One place of the 10 handed out per request is kept for step 3,
-     and while there is a full load of matches to fetch, only these lists go out.
-  3. Then lists not seen back to the season's start yet: the players in the most held
-     matches first, and of those the latest found. For a collector from 0.3.8 on that is
-     every player never read and every player only ever read as a page of 20 (on HN1 on
-     25 Nov: 181,000 never read, in 2.6 held matches on average, and 121,000 read as a
-     page, in 30: so those come first). A collector up to 0.3.7 cannot see further back
-     than a page and gets the players never read.
+     and while there is a full load of matches to fetch, only these lists go out. For a
+     collector from 0.3.8 on these are the lists seen back to the season's start (or as far
+     as they go); the others are read back in step 3, which shows what is new at their top
+     as well.
+  3. Then lists not seen back to the season's start yet, the most valuable first: the most
+     Arena matches expected in the part of the list no read has listed. For a list never
+     read in one request (never read, or only as a page of 20) that is the held matches
+     its player is in (on HN1 about half the season was held on 26 Nov, so about as many
+     again are not), of those the latest found first; for one to be read further back, what
+     its last read showed: as many Arena matches for every day not read yet as for every day
+     it listed (`want`). A collector up to 0.3.7 cannot see further back than a page and
+     gets the players never read, the ones in the most held matches first.
   4. A list is due again when about 10 more Arena matches are expected in it
      (`TARGET_SEEN`), judging by how many its last read showed and how long those took to
      come in: between 1 hour and 30 days later. One that showed no Arena match comes back
@@ -83,10 +100,24 @@ Live at `https://arenasweats.lol/collector/` on the website server.
     on): lists handed out, failed, answered from a saved copy, fetched afresh; and of the
     ones fetched afresh how many listed fewer than asked, how many matches they listed, how
     many reached the season's start, how many days back their oldest match was, and how
-    long the client took (answers of up to 1, 2, 5, 10, 20, 40, 80 seconds, and longer).
-    They also count the Arena matches those reads showed that no list had shown before.
-    `stats` prints three days of it in one line a size, `relay status` seven days under
-    `reads`, `sizes`. Whether a server's clients give more than 20 is read off it at once:
+    long the client took (answers of up to 1, 2, 5, 10, 20, 40, 80 seconds, and longer;
+    and all of them together, `took_ms`). They also count the Arena matches those reads
+    showed that no list had shown before. `stats` prints three days of it in one line a
+    size, `relay status` seven days under `reads`, `sizes`.
+  - How far each server is from the season's start, in `stats` (three lines a server) and
+    in `relay status` under `reads`, `progress`: lists that got there (`reached`), that are
+    as far back as they go or as one request may go (`as_far`), that are to be read further
+    back (`further`), and that no read in one request has seen back yet (`not_back`; of
+    them `not_back_regulars`, of players in 20 or more held matches). Then the places
+    collectors would be asked for to read those back, as they would be asked now
+    (`places_left`, and `places_left_regulars` for the regulars and the ones to be read
+    further back; reads that fall short and are read again come on top), what a listed
+    match took the clients in the last 3 days (`seconds_a_place`), so the client hours
+    (`hours_left`, `hours_left_regulars`), the client hours a day lists took in those 3
+    days (`list_hours_a_day`) and the days the regulars' lists take at that
+    (`days_left_regulars`). And `season_held`: of the matches this week's list reads showed
+    that were played 2 days or more before, the share held already (an estimate that leans
+    high, see `seen_days`). Where nothing was measured the value is null. Whether a server's clients give more than 20 is read off it at once:
     "lists of 200 places: ... 950 fetched afresh; those listed 196 matches each (40 fewer
     than asked), back 31 days" is a client that gives what it is asked for; "listed 20
     matches each (950 fewer than asked)" is one that does not, and then `policy --block 20`
