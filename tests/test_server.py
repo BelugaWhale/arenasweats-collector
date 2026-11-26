@@ -651,10 +651,13 @@ class Work(ServerCase):
     def test_choosing_lists_never_looks_through_every_player(self):
         # Work is handed out while holding the database's only write lock, with 300,000 players on one server:
         # a search or a sort through all of them would stall every upload.
-        for sql in (ingest.DUE_AGAIN, ingest.NEVER_READ):
-            plan = " | ".join(row[3] for row in self.db.execute("EXPLAIN QUERY PLAN " + sql, ("OC1", 0, 0, 5)))
-            self.assertRegex(plan, r"^SEARCH players USING INDEX players_(again|never) \(platform=\?")
+        for sql in (ingest.DUE_AGAIN, ingest.NEVER_READ, ingest.DUE_TOP, ingest.FIRST_READS, ingest.DEEPER_READS):
+            plan = " | ".join(row[3] for row in self.db.execute("EXPLAIN QUERY PLAN " + sql, ("OC1",) + (0,) * (sql.count("?") - 1)))
+            self.assertRegex(plan, r"^SEARCH players USING INDEX players_(again|never|top|back|deeper) \(platform=\?")
             self.assertNotIn("B-TREE", plan)                              # nothing is sorted
+        plan = " ".join(row[3] for row in self.db.execute("EXPLAIN QUERY PLAN SELECT platform, games, pace FROM players "
+                                                           "INDEXED BY players_paced WHERE pace > 0"))
+        self.assertIn("COVERING INDEX players_paced", plan)              # (judging how fast lists fill reads only that)
 
     def test_a_database_from_the_version_before_carries_on(self):
         # The live database holds 300,000 players and 200,000 lists waiting: the change-over must lose none of that
@@ -664,8 +667,11 @@ class Work(ServerCase):
         reader = max(counts, key=counts.get)
         self.db.executescript("""
             DROP INDEX players_again; DROP INDEX players_never; DROP INDEX players_back;
+            DROP INDEX players_top; DROP INDEX players_deeper; DROP INDEX players_paced;
             DROP TABLE read_days; DROP TABLE seen_days; DROP TABLE size_days;
             ALTER TABLE players DROP COLUMN back; ALTER TABLE players DROP COLUMN depth; ALTER TABLE players DROP COLUMN pace;
+            ALTER TABLE players DROP COLUMN want; ALTER TABLE players DROP COLUMN reader;
+            ALTER TABLE players DROP COLUMN reader_at;
             CREATE INDEX players_due ON players(platform, due_at);
             CREATE INDEX players_older_part ON players(platform, games) WHERE resume IS NOT NULL;
             CREATE INDEX players_unread ON players(platform) WHERE checked_at = 0;""")
@@ -682,7 +688,8 @@ class Work(ServerCase):
         ingest.prepared.clear()
         ingest.connect().close()                                          # the new version starts on that file
         indexes = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
-        self.assertTrue({"players_again", "players_never", "players_back"} <= indexes)
+        self.assertTrue({"players_again", "players_never", "players_back", "players_top", "players_deeper",
+                         "players_paced"} <= indexes)
         self.assertFalse({"players_due", "players_older_part", "players_unread"} & indexes)
         answer = self.work([{"puuid": reader, "job": "old-token", "ids": [77], "newest": 5, "next": 20, "failed": False}])
         self.assertEqual(answer["games"], [77])                           # the read under way is taken, and ends there
@@ -695,10 +702,11 @@ class Work(ServerCase):
                          sorted((n for puuid, n in counts.items() if puuid != reader), reverse=True)[:len(handed) - 1])
         self.db.execute("UPDATE players SET leased_until = 0")
         self.db.commit()
-        deep = self.work(block=200)["players"]                            # a collector that reads in one request gets
-        self.assertEqual(deep[0]["puuid"], "overdue-000000000000000000")  # the overdue list, and with the rest
-        again = self.item({"players": deep}, reader)                      # the list just read as a page of 20:
-        self.assertEqual((again["count"], again["since"]), (min(200, 20 * counts[reader]), self.season))   # further back
+        deep = self.work(key=self.add_key("bob"), block=200)["players"]   # a collector that reads in one request gets
+        again = self.item({"players": deep}, reader)                      # the list just read as a page of 20 (its player
+        self.assertEqual((again["count"], again["since"]), (200, self.season))   # is in the most held matches), further
+        self.assertEqual([counts[item["puuid"]] for item in deep],        # back, with the others never read in one, the
+                         sorted(counts.values(), reverse=True)[:len(deep)])   # ones in the most held matches first
 
     def test_a_collector_that_is_stopping_is_handed_nothing(self):
         self.post(self.games)
@@ -753,36 +761,46 @@ class ListsInOneRequest(ServerCase):
     PLAYER = "22222222-3333-4444-5555-666666666666"
     DAY = 86400
 
-    def read(self, item, ids=(), listed=None, oldest_days=1.0, took=3.0, complete=True, following=0):
+    def setUp(self):
+        super().setUp()
+        self.days = (self.now - self.season / 1000) / self.DAY           # since the season began
+        self.addCleanup(setattr, ingest, "DEFAULT_RATE", ingest.DEFAULT_RATE)
+
+    @staticmethod
+    def pages(places, most=200):
+        """`places` as whole pages of 20, at most `most`."""
+        return min(most, 20 * -int(-places // 20))
+
+    def read(self, item, ids=(), listed=None, oldest_days=1.0, took=3.0, complete=True, following=0, key=None, block=200):
         """Report a read of the list handed out as `item`: `listed` matches going back `oldest_days`."""
         listed = item["count"] if listed is None else listed
         report = {"puuid": item["puuid"], "job": item["job"], "ids": list(ids), "failed": not complete, "next": following,
                   "begin": 0, "newest": int(self.now * 1000) - 5000, "asked": item["count"], "listed": listed,
                   "oldest": int((self.now - oldest_days * self.DAY) * 1000) if listed else 0, "took": took}
-        return self.work([report], more=False, block=200)
+        return self.work([report], more=False, block=block, key=key)
 
     def state(self, puuid=None):
         return self.db.execute("SELECT checked_at, back, depth, pace, fails FROM players WHERE puuid = ?",
                                (puuid or self.PLAYER,)).fetchone()
 
-    def first(self, puuid=None, games=10):
+    def first(self, puuid=None, games=10, block=200):
         """The hand-out of a first read to a collector that reads a list in one request, for a player in `games`
         held matches."""
         self.db.execute("INSERT INTO players(platform, puuid, games, due_at) VALUES('OC1', ?, ?, 0)",
                         (puuid or self.PLAYER, games))
         self.db.commit()
-        return self.handed(puuid or self.PLAYER, block=200)
+        return self.handed(puuid or self.PLAYER, block=block)
 
     def test_a_collector_is_told_how_many_matches_to_ask_for(self):
         self.post(self.games)                                             # 20 players never read
         again = lambda *reports, **said: (self.db.execute("UPDATE players SET leased_until = 0"), self.db.commit(),
                                           self.work(*reports, **said))[2]
         self.assertTrue(all("count" not in item and item["pages"] == 1 for item in again()["players"]))   # up to 0.3.7
-        counts = dict(self.db.execute("SELECT puuid, games FROM players"))             # (they are in 5 to 12 held matches)
-        new = again(block=200)["players"]
-        self.assertEqual([item["count"] for item in new], [min(200, 20 * counts[item["puuid"]]) for item in new])
-        self.assertIn(200, [item["count"] for item in new])               # a first read: 20 places a held match, up to 200
+        ingest.DEFAULT_RATE = 2.0                                         # (no list has told how fast lists fill yet)
+        new = again(block=200)["players"]                                 # a first read: what lists hold in the season
+        self.assertEqual({item["count"] for item in new}, {self.pages(2.0 * self.days)})    # (2 matches a day here)
         self.assertTrue(all((item["begin"], item["pages"], item["since"]) == (0, 1, self.season) for item in new))
+        ingest.DEFAULT_RATE = 1000.0
         many = again(block=200, lists=20)["players"]                      # an answer holds 20 lists at most, and of places
         self.assertLess(len(many), 20)                                    # no more than a collector gets through in time
         self.assertLessEqual(sum(item["count"] for item in many), ingest.PLACES_PER_ROUND)
@@ -797,6 +815,7 @@ class ListsInOneRequest(ServerCase):
         self.assertIn("Not understood", self.admin("policy", "--block", "5"))
 
     def test_only_a_read_that_got_there_counts_as_back_to_the_seasons_start(self):
+        ingest.DEFAULT_RATE = 1000.0                                      # (first reads ask for all they may here)
         cases = {"reached the season's start": (dict(listed=200, oldest_days=60), 1),
                  "fewer than asked (the list's end? all the client gives?)": (dict(listed=137, oldest_days=9), 2),
                  "all that may be asked for, and it goes on": (dict(listed=200, oldest_days=9), 2),
@@ -814,16 +833,114 @@ class ListsInOneRequest(ServerCase):
         failed = self.handed("p%035d" % 6, block=200)
         self.assertEqual(failed["count"], 200)                            # the failed one is asked for in full again
         self.assertIsNone(self.item(self.work(block=200), "p%035d" % 1))  # none of the others: read, and not due
-        seen_once = self.first("o" * 36, games=3)
-        self.assertEqual(seen_once["count"], 60)                          # somebody in 3 held matches: 60 places,
-        self.read(seen_once, ids=[5], listed=60, oldest_days=4)
-        self.assertEqual(self.state("o" * 36)[1:3], (2, 60))              # and that is as far as that list is read
-        # More allowed (or a client that now gives more): the ones cut short are read back again.
-        self.admin("policy", "--block", "150")
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM players WHERE back = 0 AND checked_at > 0").fetchone()[0], 4)
-        deeper = self.work(block=200)["players"]
-        self.assertEqual(sorted((item["puuid"][-1], item["count"]) for item in deeper),       # (and the one that
-                         [("1", 150), ("3", 150), ("4", 150), ("5", 150), ("o", 150)])        # listed nothing, at once)
+        # More allowed (or a client that now gives more): the ones that listed less than that are read further back,
+        # by a collector that can ask for all that is allowed now.
+        self.admin("policy", "--block", "300")
+        self.assertEqual(self.db.execute("SELECT puuid, back FROM players WHERE back = 3 ORDER BY puuid").fetchall(),
+                         [("p%035d" % number, 3) for number in (1, 2, 3, 4)])
+        self.db.execute("UPDATE players SET leased_until = 0")
+        self.db.commit()
+        self.assertFalse({item["puuid"] for item in self.work(block=200)["players"]} & {"p%035d" % n for n in range(1, 5)})
+        deeper = self.work(key=self.add_key("bob"), block=1000)["players"]
+        self.assertEqual(sorted((item["puuid"][-1], item["count"]) for item in deeper if item["puuid"] != "p%035d" % 6),
+                         [("1", 300), ("2", 300), ("3", 300), ("4", 300)])
+        self.admin("policy", "--block", "200")                            # less again: those 200 deep are left at that
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM players WHERE back = 3").fetchone()[0], 3)
+
+    def test_a_list_that_goes_on_is_read_further_back_by_another_install(self):
+        # A client answers from its saved copy, which goes no deeper: a deeper read handed back to the install that read
+        # the list would cost a request and learn nothing, and the list would wait as if it had failed.
+        ingest.DEFAULT_RATE = 1.0                                         # a first read here: what one match a day fills
+        item = self.first(games=12)
+        self.assertEqual(item["count"], self.pages(self.days))
+        self.read(item, ids=list(range(5, 30)), listed=item["count"], oldest_days=10)   # it goes back 10 days only
+        checked, back, depth, pace, _ = self.state()
+        self.assertEqual((back, depth, pace), (3, item["count"], 10 * self.DAY // item["count"]))
+        want = self.db.execute("SELECT want FROM players WHERE puuid = ?", (self.PLAYER,)).fetchone()[0]
+        self.assertAlmostEqual(want, 25 * (self.days - 10) / 10, delta=1)     # 25 Arena matches in 10 days: as many a day
+        self.assertIsNone(self.handed(self.PLAYER, block=200))            # not again for this install's client,
+        bob = self.add_key("bob")
+        deeper = self.handed(self.PLAYER, key=bob, block=200)             # another install's instead,
+        need = self.days * self.DAY / (10 * self.DAY // item["count"])
+        self.assertEqual((deeper["count"], deeper["since"]), (self.pages(need * ingest.SPARE_DEEP + 20), self.season))
+        self.now += ingest.LEASE_SECONDS + 1                              # (bob went away)
+        self.assertIsNone(self.handed(self.PLAYER, block=200))
+        self.now += ingest.COPY_SECONDS
+        again = self.handed(self.PLAYER, block=200)                       # or the same one a day later
+        self.read(again, ids=[31], listed=again["count"], oldest_days=self.days + 3)
+        self.assertEqual(self.state()[1:3], (1, again["count"]))          # and now it is seen back to the season's start
+
+    def test_a_database_from_the_version_of_25_nov_carries_on(self):
+        # The live database (370,000 players) is changed over when the service starts: the lists that version left cut
+        # short below what collectors may ask for must be read further back, and nothing else may change.
+        self.db.executescript("""
+            DROP INDEX players_top; DROP INDEX players_deeper; DROP INDEX players_paced;
+            ALTER TABLE players DROP COLUMN want; ALTER TABLE players DROP COLUMN reader;
+            ALTER TABLE players DROP COLUMN reader_at; ALTER TABLE size_days DROP COLUMN took_ms;""")
+        # As it left them: one read back to the season's start, one at the most a collector may ask for (200), one asked
+        # for 60 that went on 4 days back, and one never read.
+        checked = int(self.now) - 3600
+        self.db.executemany("INSERT INTO players(platform, puuid, back, depth, pace, games, checked_at, due_at) "
+                            "VALUES('OC1', ?, ?, ?, ?, ?, ?, ?)",
+                            [("a" * 36, 1, 200, 8640, 50, checked, checked), ("b" * 36, 2, 200, 4320, 80, checked, checked),
+                             ("c" * 36, 2, 60, 5760, 6, checked, checked + 86400), ("d" * 36, 0, 0, 0, 3, 0, 0)])
+        self.db.commit()
+        ingest.prepared.clear()
+        ingest.connect().close()
+        self.assertEqual(self.db.execute("SELECT puuid, back FROM players ORDER BY puuid").fetchall(),
+                         [("a" * 36, 1), ("b" * 36, 2), ("c" * 36, 3), ("d" * 36, 0)])
+        want = self.db.execute("SELECT want FROM players WHERE back = 3").fetchone()[0]
+        self.assertEqual(want, 6 * (checked - 60 * 5760 - self.season // 1000) // (60 * 5760))   # 6 held in its last 4 days
+        self.assertIn("took_ms", {row[1] for row in self.db.execute("PRAGMA table_info(size_days)")})
+        handed = {item["puuid"][0]: item for item in self.work(block=200)["players"]}
+        self.assertEqual(sorted(handed), ["a", "b", "c", "d"])             # due again at their top, and read back
+        self.assertEqual((handed["c"]["count"], handed["c"]["since"]), (200, self.season))
+        self.assertEqual(handed["a"]["since"], self.db.execute("SELECT read_to FROM players WHERE puuid = ?",
+                                                               ("a" * 36,)).fetchone()[0] or self.season)
+
+    def test_the_most_valuable_lists_are_read_back_first(self):
+        # Client time is the volunteers' own: the lists worth the most Arena matches not yet seen go first.
+        ingest.DEFAULT_RATE = 1000.0
+        for puuid, games in (("a" * 36, 40), ("b" * 36, 5), ("c" * 36, 1)):
+            self.db.execute("INSERT INTO players(platform, puuid, games, due_at) VALUES('OC1', ?, ?, 0)", (puuid, games))
+        # One read further back before: 30 Arena matches in its last 10 days, 41 days not read (about 120 expected) ...
+        self.db.execute("INSERT INTO players(platform, puuid, games, due_at, checked_at, back, depth, pace, want) "
+                        "VALUES('OC1', ?, 30, 0, 1, 3, 100, 8640, 123)", ("d" * 36,))
+        # ... one with no Arena match in what it listed, and one seen back to the season's start and not due again.
+        self.db.execute("INSERT INTO players(platform, puuid, games, due_at, checked_at, back, depth, pace, want) "
+                        "VALUES('OC1', ?, 3, 0, 1, 3, 100, 8640, 0)", ("e" * 36,))
+        self.db.execute("INSERT INTO players(platform, puuid, games, due_at, checked_at, back, depth, pace) "
+                        "VALUES('OC1', ?, 99, ?, 1, 1, 100, 8640)", ("f" * 36, int(self.now) + 3600))
+        self.db.commit()
+        self.assertEqual([item["puuid"][0] for item in self.work(block=200)["players"]], ["d", "a", "b", "c", "e"])
+        self.now += 7200                                                  # once the last one is due again, it comes first
+        self.db.execute("UPDATE players SET leased_until = 0")
+        self.db.commit()
+        self.assertEqual([item["puuid"][0] for item in self.work(block=200)["players"]][0], "f")
+
+    def test_lists_never_read_in_one_request_are_asked_for_what_similar_lists_held(self):
+        # A first read decides how far back that client can ever see the list: too few places and the list must be read
+        # again elsewhere, too many and the volunteer's client lists matches from before the season for nothing.
+        ingest.FIT_MIN = 3
+        self.addCleanup(setattr, ingest, "FIT_MIN", 30)
+        rows = [("OC1", "h%035d" % n, 100, 86400 // rate) for n, rate in enumerate((2, 4, 6, 8, 10))]   # 64-127 held
+        rows += [("OC1", "l%035d" % n, 5, 86400 // rate) for n, rate in enumerate((1, 2, 3))]            # 4-7 held
+        rows += [("KR", "k%035d" % n, 5, 86400 // rate) for n, rate in enumerate((20, 20, 20))]
+        self.db.executemany("INSERT INTO players(platform, puuid, games, pace, checked_at, back, depth, due_at) "
+                            "VALUES(?, ?, ?, ?, 1, 1, 200, ?)", [row + (int(self.now) + 86400,) for row in rows])
+        self.db.commit()
+        rates = ingest.list_rates(self.db, "OC1", int(self.now))
+        self.assertEqual((rates[7], rates[3]), (8, 2))                    # its band's (3 of 5 got there with 8 a day),
+        self.assertEqual(rates[1], 4)                                     # a band with too few: all of the server's,
+        self.assertEqual(ingest.list_rates(self.db, "NJ100", int(self.now))[7], 8)    # a server with none: all servers'
+        ingest.rate_fits.clear()
+        self.admin("policy", "--block", "1000")
+        self.assertEqual(self.first("x" * 36, games=100, block=1000)["count"], self.pages(8 * self.days, most=1000))
+        self.assertEqual(self.first("y" * 36, games=6, block=1000)["count"], self.pages(2 * self.days, most=1000))
+        ingest.FIT_MIN = 30
+        ingest.rate_fits.clear()
+        ingest.DEFAULT_RATE = 3.0
+        self.assertEqual(ingest.list_rates(self.db, "OC1", int(self.now))[7], 3.0)    # too few anywhere: DEFAULT_RATE
 
     def test_a_list_seen_back_to_the_start_is_read_again_only_for_what_is_new(self):
         self.read(self.first(), ids=[900, 901], listed=200, oldest_days=100)   # 200 matches in 100 days
@@ -838,12 +955,14 @@ class ListsInOneRequest(ServerCase):
         self.now += 10 * self.DAY
         late = self.handed(self.PLAYER, block=200)
         self.read(late, listed=late["count"], oldest_days=1, following=late["count"])   # every place newer than last time:
-        self.assertEqual(self.state()[1], 0)                              # matches were missed, so back it goes
-        back_again = self.handed(self.PLAYER, block=200)
+        self.assertEqual(self.state()[1], 0)                              # matches were missed, so back it goes,
+        self.assertIsNone(self.handed(self.PLAYER, block=200))            # by another install (this client has a copy)
+        back_again = self.handed(self.PLAYER, key=self.add_key("bob"), block=200)
         self.assertEqual(back_again["since"], self.season)                # everything since the season began,
         self.assertEqual(back_again["count"], 200)                        # which at one match in 36 minutes is over 200
 
     def test_a_saved_copy_is_not_a_read(self):
+        ingest.DEFAULT_RATE = 1000.0
         self.read(self.first(), ids=[900], listed=200, oldest_days=100)
         before = self.state()
         self.now += 3 * self.DAY
@@ -857,7 +976,7 @@ class ListsInOneRequest(ServerCase):
         self.read(self.first("q" * 36), listed=3, oldest_days=400, took=0.2)   # a list of three matches, quickly answered,
         self.assertEqual(self.state("q" * 36)[1], 1)                      # is no copy: it goes back before the season
         own = self.first("o" * 36, games=0)                               # A list nobody has read, from a client's copy
-        self.assertEqual(own["count"], 20)                                # (a collector looks at its own when it starts):
+        self.assertEqual(own["count"], 200)                               # (a collector looks at its own when it starts):
         self.read(own, ids=[903, 904], listed=20, oldest_days=3, took=0.02)
         self.assertEqual(self.state("o" * 36)[:3], (int(self.now), 2, 20))    # that is a read of what it shows
         self.assertEqual(self.db.execute("SELECT SUM(saved), SUM(lists) FROM read_days").fetchone(), (2, 5))
@@ -877,7 +996,7 @@ class ListsInOneRequest(ServerCase):
         self.assertEqual([counts[item["puuid"]] for item in new], sorted(counts.values(), reverse=True)[:len(new)])
         self.assertTrue(set(seen) <= {item["puuid"] for item in new})     # before anybody in fewer matches,
         self.assertTrue(all(item["since"] == self.season for item in new))   # and for everything since the season began
-        self.assertEqual([item["count"] for item in new], [min(200, 20 * counts[item["puuid"]]) for item in new])
+        self.assertEqual({item["count"] for item in new}, {self.pages(ingest.DEFAULT_RATE * self.days)})
 
     def test_reads_are_counted_by_the_number_of_matches_asked_for(self):
         # These counts are how we learn, on the first day, whether a server's clients give more than 20.
@@ -1217,8 +1336,9 @@ class WithServer(CollectorCase):
         # None: an endpoint that names no number, as before 0.3.8.
         self.blocks = 100
         self.admin("policy", "--block", "100")
-        self.addCleanup(setattr, ingest, "FIRST_PLACES", ingest.FIRST_PLACES)
-        ingest.FIRST_PLACES = 10 ** 6
+        for name, value in (("DEFAULT_RATE", 10 ** 6), ("FIT_MIN", 10 ** 9)):
+            self.addCleanup(setattr, ingest, name, getattr(ingest, name))
+            setattr(ingest, name, value)
         handed = ingest.app.view_functions["work"]
 
         def work():

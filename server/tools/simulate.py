@@ -575,7 +575,7 @@ def main():
     more = [("up to 100 in one request", (100, HOUR, None, None)),
             ("up to 60 in one request", (60, HOUR, None, None)),
             ("up to 1,000, if a client gave that many", (1000, HOUR, None, {"DEFAULT_BLOCK": 1000, "PLACES_PER_ROUND": 4000})),
-            ("up to 200, a first read always 200", (200, HOUR, None, {"FIRST_PLACES": 10 ** 6})),
+            ("up to 200, a first read always 200", (200, HOUR, None, {"DEFAULT_RATE": 10 ** 6, "FIT_MIN": 10 ** 9})),
             ("up to 200, due again after 5 more matches", (200, HOUR, None, {"TARGET_SEEN": 5}))]
     hn1 = [(NORMAL, 0.9)] * 4                                # four collectors at the normal pace, on 9 hours in 10
     print("\n   A client keeps its copy of a list for an hour, except in the lines marked *: there until it is restarted,"
