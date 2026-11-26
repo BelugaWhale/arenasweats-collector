@@ -1450,7 +1450,7 @@ class Policy(ServerCase):
     def test_policy_is_served_and_changeable(self):
         headers = {"Authorization": "Bearer " + self.key}
         self.assertEqual(self.client.get("/v1/policy", headers=headers).get_json(),
-                         {"enabled": True, "delay": 2.0, "fast": True, "fast_delay": 0.4, "fast_flight": 4,
+                         {"enabled": True, "delay": 2.0, "fast": True, "fast_delay": 0.2, "fast_flight": 4,
                           "message": "", "season_start": ingest.date_ms("2026-10-06")})
         self.admin("policy", "--off", "--delay", "5", "--message", "back soon", "--season-start", "2027-01-15",
                    "--fast", "off", "--fast-delay", "1.5", "--fast-flight", "2")
@@ -2470,7 +2470,7 @@ class Blocks(SlowAnswers):
 
     def test_a_long_list_is_not_taken_for_a_struggling_client(self):
         # A list of 100 takes a real client 25 s: if that looked like trouble, every collector would crawl or rest.
-        for count, seconds in ((20, 20), (100, 60), (200, 110), (10000, 120)):
+        for count, seconds in ((20, 20), (100, 48), (200, 83), (10000, 360)):
             self.assertEqual(collector.ListRead("p" * 36, 0, min(count, 1000)).timeout if count < 10000 else
                              collector.LCU_SECONDS_MAX, seconds)       # the time a list is given grows with its size
         with self.assertLogs(collector.log, "INFO") as logs:

@@ -44,8 +44,9 @@ MAX_GAME_BYTES = 300 * 1024      # one match record
 MAX_REPORTS = 20                 # match lists reported per work request
 MAX_REPORT_IDS = 3000            # matches named in one match-list report
 REQUESTS_PER_MINUTE = 60         # per key; a collector makes at most ~48 a minute in fast mode (measured on the fake client: up to 21)
-GAMES_PER_DAY = 220000           # per key; fast mode's floor (0.4 s between requests, at most a match a request) allows
-                                 # 216,000 a day, plus a held-back outbox (measured: ~100k in fast mode, ~30k normally)
+GAMES_PER_DAY = 440000           # per key; fast mode's floor (0.2 s between requests since 0.3.9, at most a match a
+                                 # request) allows 432,000 a day, plus a held-back outbox (measured with 0.3.7-0.3.8's
+                                 # 0.4 s: ~100k a day in fast mode, ~30k normally)
 SIGNUPS_PER_ADDRESS = 10         # new installs one internet address can sign up a day (many homes in China share one)
 SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close with: policy --signups off)
 MAX_PACE_BYTES = 800             # a collector's few numbers about its own pace (see note_pace)
@@ -60,7 +61,8 @@ COLLECTING_HOURS = 1             # newcomers: an install still collecting this l
 NEWCOMER_DAYS = 7                # ... of the installs that signed up in this many days (relay status; newcomers --days)
 ARENA_MODES = {"CHERRY"}
 DEFAULT_SEASON_START = "2026-10-06"   # UTC. Change with: ingest.py policy --season-start YYYY-MM-DD
-DEFAULT_FAST_DELAY = 0.4         # fast mode's shortest gap between requests, s. Change with: policy --fast-delay S
+DEFAULT_FAST_DELAY = 0.2         # fast mode's shortest gap between requests, s. Change with: policy --fast-delay S
+                                 # (collectors up to 0.3.8 never go under their own 0.4 s, 0.3.9 and later 0.2 s)
 DEFAULT_FAST_FLIGHT = 4          # fast mode's most requests on their way at once. Change with: policy --fast-flight N
 
 # ---- passing matches on to the rankings server (it pulls them over SSH: see `relay` below)
@@ -382,8 +384,8 @@ def date_ms(text):
 
 def get_policy(db):
     """What collectors are told: whether to collect, the slowest pace we ask for, whether fast mode is allowed,
-    its shortest gap (collectors whose user turned it on wait a fifth as long, never under fast_delay,
-    nor under their own 0.4 s floor) and how many requests it may have on their way at once (never more
+    its shortest gap (collectors whose user turned it on wait a fifth as long, a tenth since 0.3.9, never under
+    fast_delay, nor under their own floor: 0.4 s up to 0.3.8, 0.2 s since) and how many requests it may have on their way at once (never more
     than their own 4), a short message, the season."""
     values = dict(db.execute("SELECT name, value FROM settings"))
     return {"enabled": values.get("enabled", "1") == "1",
@@ -1819,7 +1821,7 @@ def main(argv=None):
                                help="whether collectors whose user turned fast mode on may use it (off: normal pace)")
     policy_parser.add_argument("--fast-delay", type=float, metavar="SECONDS",
                                help="fast mode's shortest gap between requests (default %g; collectors never go "
-                                    "under 0.4 s whatever this says)" % DEFAULT_FAST_DELAY)
+                                    "under their own floor whatever this says: 0.4 s up to 0.3.8, 0.2 s since)" % DEFAULT_FAST_DELAY)
     policy_parser.add_argument("--fast-flight", type=int, metavar="N",
                                help="how many requests fast mode may have on their way at once (default %d; "
                                     "collectors never go above 4 whatever this says)" % DEFAULT_FAST_FLIGHT)
