@@ -1006,7 +1006,8 @@ class ListsInOneRequest(ServerCase):
                       "go), 1 are to be read further back, 2 are not read back yet (1 of them of players in 20 or more "
                       "held matches)", stats)
         self.assertIn("client hours at 0.080 s a listed match, as first asked for;", stats)
-        self.assertIn("the season held: about 53%, judged by the list reads of the last 7 days", stats)
+        self.assertIn("the season held: about 53%, the days played averaged, judged by the list reads of the last 7 "
+                      "days", stats)
 
     def test_the_most_valuable_lists_are_read_back_first(self):
         # Client time is the volunteers' own: the lists worth the most Arena matches not yet seen go first.

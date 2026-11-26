@@ -110,6 +110,7 @@ UNKNOWN_SPAN = 86400             # with no held match to tell when a list's matc
 RETRY_SECONDS = 600              # first retry after a failed read; doubles each time
 MAX_INDEX = 1000                 # the furthest place in a list a report may name
 SETTLED_SECONDS = 2 * 86400      # a match this old that turns up in a list should be held by now (see seen_days)
+SEEN_MIN = 20                    # season_held leaves out the days played that lists showed fewer matches of than this
 
 # ---- event games the rankings server is waiting for (see relay `urgent`): handed out before anything else
 URGENT_GAME_SECONDS = 300        # such a match not held yet is handed out again this often (it may not have ended)
@@ -1276,12 +1277,16 @@ def sizes(db, platform, since):
 
 
 def season_held(db, platform, now):
-    """The share of the season's matches held, as judged by the list reads of the last 7 days: of the matches they
-    showed that were played at least SETTLED_SECONDS before, how many were held already (see seen_days). An
-    estimate, and it leans high: the lists read belong to players found through held matches. None: no such reads."""
-    seen, held = db.execute("SELECT SUM(seen), SUM(held) FROM seen_days WHERE platform = ? AND day > ?",
-                            (platform, utc_day(now - 7 * 86400))).fetchone()
-    return round(held / seen, 3) if seen else None
+    """The share of the season's matches held, as judged by the list reads of the last 7 days: for each day played that
+    they showed SEEN_MIN or more matches of (played at least SETTLED_SECONDS before the read), the share of those held
+    already (see seen_days), and the average of those days, each day counted alike. (Lists show the latest days most,
+    which are held most: on HN1 on 26 Nov the matches they showed were 79% held, the days 55% on average; HN1 plays
+    a similar number of Arena matches every day.) An estimate, and it leans high: the lists read belong to players
+    found through held matches. None: no such days."""
+    shares = [held / seen for seen, held in db.execute(
+        "SELECT SUM(seen), SUM(held) FROM seen_days WHERE platform = ? AND day > ? GROUP BY played",
+        (platform, utc_day(now - 7 * 86400))) if seen >= SEEN_MIN]
+    return round(sum(shares) / len(shares), 3) if shares else None
 
 
 def progress(db, platform, now):
@@ -1517,11 +1522,12 @@ def cmd_stats(db, _args):
                                                state["hours_left_regulars"], state["days_left_regulars"],
                                                state["list_hours_a_day"]))
         else:
-            print("  to read them back: %d listed matches as first asked for (no list read in the last 3 days to time "
-                  "them by)" % state["places_left"])
+            print("  to read them back: %d listed matches as first asked for, %d for those players and the ones to be "
+                  "read further back (no list read in the last 3 days was timed)" % (
+                      state["places_left"], state["places_left_regulars"]))
         held = state["season_held"]
-        print("  the season held: about %s, judged by the list reads of the last 7 days (it leans high)" % (
-            "%.0f%%" % (100 * held) if held is not None else "? (none)"))
+        print("  the season held: about %s, the days played averaged, judged by the list reads of the last 7 days "
+              "(it leans high)" % ("%.0f%%" % (100 * held) if held is not None else "? (none)"))
         for day, pages, places, lists, failed, saved, back, seen, held, new in db.execute(
                 "SELECT day, pages, places, lists, failed, saved, back, seen, held, new FROM read_days "
                 "WHERE platform = ? AND day >= ? ORDER BY day", (platform, utc_day(now - 2 * 86400))):

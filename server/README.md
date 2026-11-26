@@ -115,9 +115,11 @@ Live at `https://arenasweats.lol/collector/` on the website server.
     match took the clients in the last 3 days (`seconds_a_place`), so the client hours
     (`hours_left`, `hours_left_regulars`), the client hours a day lists took in those 3
     days (`list_hours_a_day`) and the days the regulars' lists take at that
-    (`days_left_regulars`). And `season_held`: of the matches this week's list reads showed
-    that were played 2 days or more before, the share held already (an estimate that leans
-    high, see `seen_days`). Where nothing was measured the value is null. Whether a server's clients give more than 20 is read off it at once:
+    (`days_left_regulars`). And `season_held`: for each day played, the share held of the
+    matches this week's list reads showed that were played 2 days or more before the read
+    (see `seen_days`), averaged over the days (each counted alike: lists show the latest days
+    most, and those are held most; on 26 Nov HN1's were 79% held, its days 55% on average).
+    An estimate that leans high. Where nothing was measured the value is null. Whether a server's clients give more than 20 is read off it at once:
     "lists of 200 places: ... 950 fetched afresh; those listed 196 matches each (40 fewer
     than asked), back 31 days" is a client that gives what it is asked for; "listed 20
     matches each (950 fewer than asked)" is one that does not, and then `policy --block 20`
@@ -309,7 +311,7 @@ Trust covers what a match says, not its size or shape:
 | `server` | The server it last asked for work on, a platform code such as `"HN1"`; `null` until it has asked. |
 | `season_start` | The season's first day, `"2026-10-06"`. |
 | `server_held` | Matches held of that server played since the season began, from every install. |
-| `server_held_share_estimate` | An estimate between 0 and 1 of the share of that server's season held: of the matches this week's list reads showed that were played at least 2 days before, the share held already (see `seen_days`; it leans high). `null` until lists there have been read. |
+| `server_held_share_estimate` | An estimate between 0 and 1 of the share of that server's season held: for each day played, the share held of the matches this week's list reads showed that were played at least 2 days before, averaged over the days (`season_held` in `relay status`; it leans high). `null` until lists there have been read. |
 | `server_helpers` | Installs that sent matches of that server in the last 24 hours (this one included). |
 | `servers` | China's eight servers, the fewest helpers first: `{"server": "GZ100", "helpers": 0}`, helpers as in `server_helpers`. Platform codes only; the collector names them. |
 
