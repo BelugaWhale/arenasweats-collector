@@ -277,15 +277,21 @@ class FastMode(CollectorCase):
         self.assertFalse(made.fast_on)
         self.assertGreaterEqual(min(self.gaps(self.fake.requests)), 2.0 * 0.8 - 0.001)
 
-    def test_a_fifth_of_the_gap_but_never_below_its_own_floor(self):
+    def test_a_tenth_of_the_gap_but_never_below_its_own_floor(self):
+        # Why: this floor is the fastest any volunteer's client is ever asked; admin approved 0.2 s and no lower.
         made = self.run_collector(minutes=10, fast=True)
         gaps = self.gaps(self.fake.requests)
         self.assertGreater(len(gaps), 400)
-        self.assertEqual(collector.DEFAULT_DELAY / collector.FAST_FACTOR, collector.FAST_MIN_DELAY)
-        self.assertGreaterEqual(min(gaps), collector.FAST_MIN_DELAY - 0.001)     # never above 2.5 a second
-        self.assertLess(sorted(gaps)[len(gaps) // 2], 0.5)
+        self.assertEqual((collector.FAST_MIN_DELAY, collector.DEFAULT_DELAY / collector.FAST_FACTOR), (0.2, 0.2))
+        self.assertGreaterEqual(min(gaps), collector.FAST_MIN_DELAY - 0.001)     # never above 5 a second
+        self.assertLess(sorted(gaps)[len(gaps) // 2], 0.25)
         self.assertEqual(made.delay, collector.FAST_MIN_DELAY)
-        self.assertIn("one request every 0.4 seconds", self.output.getvalue())
+        self.assertIn("one request every 0.2 seconds", self.output.getvalue())
+        made.apply_policy({"fast_delay": 0.4})                                # ArenaSweats can raise the floor,
+        self.assertEqual((made.floor, made.delay), (0.4, 0.4))
+        self.assertGreaterEqual(min(made.gap() for _ in range(100)), 0.4)
+        made.apply_policy({"fast_delay": 0.0})                                # but never lower it
+        self.assertEqual((made.floor, made.delay), (0.2, 0.2))
         self.fake.requests.clear()
         self.data_dir = os.path.join(self.tmp.name, "data-again")            # start again from nothing
         os.makedirs(self.data_dir)
@@ -350,6 +356,10 @@ class FastMode(CollectorCase):
     def test_rests_at_the_normal_pace_after_the_client_pushes_back(self):
         self.addCleanup(setattr, collector, "FAST_REST", collector.FAST_REST)
         collector.FAST_REST = 600
+        self.fake.close()
+        self.fake = FakeClient(players=150, arena=600, clock=self.clock)     # enough left to read after the rest
+        self.addCleanup(self.fake.close)
+        self.fake.write_lockfile(self.league_dir)
         start = self.clock.now()
         self.fake.fail = lambda path: 429 if "/v1/games/" in path and self.clock.now() < start + 60 else None
         self.run_collector(minutes=30, fast=True)
@@ -368,10 +378,10 @@ class FastMode(CollectorCase):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(collector.ask_fast_mode(lambda prompt: asked.append(prompt) or answer), expected)
             self.assertEqual(asked, ["Activate fast mode? 开启快速模式？ [y/N]  No answer = normal mode / 不回答即普通模式: "])
-        self.assertEqual(collector.FAST_SPEEDUP, "3")
+        self.assertEqual(collector.FAST_SPEEDUP, "2-3")
         self.assertEqual(output.getvalue(),
-                         "Fast mode collects about 3 times faster. BETA: Please only use with unimportant accounts "
-                         "for now.\n快速模式的采集速度约为正常速度的 3 倍。测试版：目前请只在不重要的账号上使用。\n")
+                         "Fast mode collects about 2-3 times faster. BETA: Please only use with unimportant accounts "
+                         "for now.\n快速模式的采集速度约为正常速度的 2-3 倍。测试版：目前请只在不重要的账号上使用。\n")
         for words in ("not sure", "throwaway", "小号", "不确定"):
             self.assertNotIn(words, output.getvalue())
             self.assertNotIn(words, collector.__doc__)
@@ -400,7 +410,7 @@ class FastMode(CollectorCase):
     def test_help_and_readmes_give_the_same_warning(self):
         with contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             collector.main(["--help"])
-        self.assertIn("BETA: collect about 3 times faster; please only use with unimportant accounts for now",
+        self.assertIn("BETA: collect about 2-3 times faster; please only use with unimportant accounts for now",
                       " ".join(output.getvalue().split()))
         texts = {}
         for path in ("README.md", os.path.join("server", "README.md")):
@@ -408,8 +418,8 @@ class FastMode(CollectorCase):
                 texts[path] = " ".join(handle.read().split())
             self.assertNotIn("throwaway", texts[path], path)
             self.assertNotIn("not sure", texts[path], path)
-        self.assertIn("Fast mode collects about 3 times faster: about two requests a second, sent without waiting for "
-                      "the last one's answer, so up to four can be on their way at once. "
+        self.assertIn("Fast mode collects about 2-3 times faster: up to five requests a second, each sent at least 0.2 "
+                      "seconds after the last one was sent, not after its answer. "
                       "**BETA: Please only use with unimportant accounts for now.**", texts["README.md"])
         self.assertEqual(collector.FAST_MAX_FLIGHT, 4)
 

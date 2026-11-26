@@ -10,9 +10,10 @@ WHAT IT DOES
      in one request, which the client can take a minute or more to answer), and the
      full record of Arena matches.
      Fast mode, which you can turn on at start, sends a request about every
-     0.4 seconds without waiting for the last one's answer, with at most 4 on
-     their way at once, and fewer whenever the client is slow to answer or
-     fails. BETA: please only use it with unimportant accounts for now.
+     0.2 seconds, counted from the last one's start, not its answer, with at
+     most 4 on their way at once (as many as ArenaSweats allows), and fewer
+     whenever the client is slow to answer or fails. BETA: please only use it
+     with unimportant accounts for now.
   3. Sends the matches to ArenaSweats (DEFAULT_SERVER below), which tells it which
      players and matches to read next, so no two collectors read the same thing.
      The first time, it asks ArenaSweats for this install's own upload key and
@@ -91,8 +92,8 @@ KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 # ---------------------------------------------------------------------------
 MIN_DELAY = 1.0        # hard floor at the normal pace: at most one match-history request per second
 DEFAULT_DELAY = 2.0    # normal gap between match-history requests, in seconds
-FAST_FACTOR = 5        # fast mode (beta, only when the user turns it on) divides the gap by this,
-FAST_MIN_DELAY = 0.4   # never below its own hard floor; ArenaSweats can raise it (policy "fast_delay"). In fast mode
+FAST_FACTOR = 10       # fast mode (beta, only when the user turns it on) divides the gap by this,
+FAST_MIN_DELAY = 0.2   # never below its own hard floor; ArenaSweats can raise it (policy "fast_delay"). In fast mode
                        # the gap runs from one request's start to the next one's: it does not wait for the answer first,
 FAST_MAX_FLIGHT = 4    # so several can be on their way at once, never more than this; ArenaSweats can lower it
                        # (policy "fast_flight"). It starts with one at a time and allows one more after
@@ -105,7 +106,8 @@ SLOW_SECONDS = {"match": 0.1, "list": 0.005}    # this much longer: a match by i
                        # for each match listed, as a list's answer takes the longer the more matches it holds
 FLIGHT_WINDOW = 20     # (the middle one of this many answers of the same kind, against that of the last ones sent alone;
 FLIGHT_ALONE = 5       # the first this many requests of each kind are always sent alone, to know how long that takes).
-FAST_SPEEDUP = "3"     # matches an hour in fast mode against the normal pace (fake client, real client's answer times)
+FAST_SPEEDUP = "2-3"   # matches an hour in fast mode against the normal pace: 2.2 measured on real clients (0.3.7),
+                       # about 3 estimated with the 0.2 s floor (0.3.9; the fake client with Chinese answer times: 3.3)
 FAST_REST = 3600       # in fast mode, a 429 or 3 failed requests in a row bring back the normal pace for this long
 FAST_AHEAD = 5         # fast mode asks ArenaSweats for more work when this few matches are left to fetch, or when it
 FAST_LISTS = 10        # holds fewer than half this many match lists, of fewer than half
