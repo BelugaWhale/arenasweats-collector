@@ -103,7 +103,8 @@ Live at `https://arenasweats.lol/collector/` on the website server.
     long the client took (answers of up to 1, 2, 5, 10, 20, 40, 80 seconds, and longer;
     and all of them together, `took_ms`). They also count the Arena matches those reads
     showed that no list had shown before. `stats` prints three days of it in one line a
-    size, `relay status` seven days under `reads`, `sizes`. Whether a server's clients give
+    size (sizes up to 20, 100, 200, 500 and 1,000 together, as "lists of 60-100 places"),
+    `relay status` seven days under `reads`, `sizes`, one entry a size. Whether a server's clients give
     more than 20 is read off it at once:
     "lists of 200 places: ... 950 fetched afresh; those listed 196 matches each (40 fewer
     than asked), back 31 days" is a client that gives what it is asked for; "listed 20

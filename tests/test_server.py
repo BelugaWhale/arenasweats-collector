@@ -1128,6 +1128,13 @@ class ListsInOneRequest(ServerCase):
         self.assertIn("lists of 200 places (3 days): 5 handed out, 1 failed, 1 from the client's saved copy, 3 fetched "
                       "afresh; those listed 140 matches each (1 fewer than asked), back 34 days (1 to the season's "
                       "start), with 0.3 new Arena matches each; the middle answer took up to 20 s", self.admin("stats"))
+        self.assertEqual(self.db.execute("SELECT SUM(took_ms) FROM size_days WHERE asked = 200").fetchone()[0], 33100)
+        self.admin("policy", "--block", "100")                            # lists are asked for by the page, so stats
+        self.read(self.first("t" * 36), listed=100, oldest_days=9, took=8.0)    # shows sizes together
+        self.assertIn("lists of 60-100 places (3 days): 2 handed out, 0 failed, 0 from the client's saved copy, 2 fetched "
+                      "afresh; those listed 80 matches each", self.admin("stats"))
+        self.assertEqual([size["asked"] for size in json.loads(self.relay("status"))["reads"]["OC1"]["sizes"]],
+                         [60, 100, 200])
 
     def test_a_collector_of_one_page_cannot_mark_a_list_read_with_nothing_new(self):
         job = self.handed(self.PLAYER)

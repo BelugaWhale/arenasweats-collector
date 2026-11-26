@@ -1256,18 +1256,28 @@ def wrong_method(_error):
 # ---------------------------------------------------------------------------
 # Admin commands (run on the server by the operator)
 # ---------------------------------------------------------------------------
-def sizes(db, platform, since):
+SIZE_BANDS = (20, 100, 200, 500, 1000)     # stats: lists asked for up to these many places are shown together
+
+
+def sizes(db, platform, since, banded=False):
     """The reads of collectors that ask for a list in one request, by places asked for, over the days after `since`:
     what they came back as, and for the ones fetched afresh the matches listed, how far back the oldest was and
-    how long the client took (the middle answer: up to that many seconds, None: longer than the last step)."""
+    how long the client took (the middle answer: up to that many seconds, None: longer than the last step).
+    `banded`: by SIZE_BANDS instead (lists are asked for by the page, up to 50 sizes), with the smallest and the
+    largest number asked for in each."""
     times = ["took_%s" % seconds for seconds in ANSWER_SECONDS] + ["took_more"]
     names = ["handed", "failed", "saved", "fresh", "new", "short", "listed", "reached", "days_back"]
+    size = ("CASE %s ELSE asked END" % " ".join("WHEN asked <= %d THEN %d" % (band, band) for band in SIZE_BANDS)
+            if banded else "asked")
     out = []
-    for row in db.execute("SELECT asked, %s FROM size_days WHERE platform = ? AND day > ? GROUP BY asked ORDER BY asked"
-                          % ", ".join("SUM(%s)" % name for name in names + times), (platform, since)):
-        entry = dict(zip(["asked"] + names, row))
+    for row in db.execute("SELECT %s AS size, MIN(asked), MAX(asked), %s FROM size_days WHERE platform = ? AND day > ? "
+                          "GROUP BY size ORDER BY size" % (size, ", ".join("SUM(%s)" % name for name in names + times)),
+                          (platform, since)):
+        entry = dict(zip(["asked", "smallest", "largest"] + names, row))
+        if not banded:
+            del entry["smallest"], entry["largest"]
         passed, entry["seconds"] = 0, None
-        for seconds, count in zip(ANSWER_SECONDS, row[1 + len(names):]):
+        for seconds, count in zip(ANSWER_SECONDS, row[3 + len(names):]):
             passed += count
             if entry["fresh"] and passed * 2 >= entry["fresh"]:
                 entry["seconds"] = seconds
@@ -1536,12 +1546,14 @@ def cmd_stats(db, _args):
             print("  lists read %s: %d (%d failed, %d answered from a saved copy) for %d asked with %d places; "
                   "%d reached the season's start; Arena matches they showed: %d, %d held already, %d not seen before"
                   % (day, lists, failed, saved, pages, places, back, seen, held, new))
-        for size in sizes(db, platform, utc_day(now - 3 * 86400)):
+        for size in sizes(db, platform, utc_day(now - 3 * 86400), banded=True):
             fresh = max(size["fresh"], 1)
-            print("  lists of %d places (3 days): %d handed out, %d failed, %d from the client's saved copy, %d fetched "
+            print("  lists of %s places (3 days): %d handed out, %d failed, %d from the client's saved copy, %d fetched "
                   "afresh; those listed %.0f matches each (%d fewer than asked), back %.0f days (%d to the season's "
                   "start), with %.1f new Arena matches each; the middle answer took %s" % (
-                      size["asked"], size["handed"], size["failed"], size["saved"], size["fresh"], size["listed"] / fresh,
+                      size["largest"] if size["smallest"] == size["largest"] else "%d-%d" % (
+                          size["smallest"], size["largest"]),
+                      size["handed"], size["failed"], size["saved"], size["fresh"], size["listed"] / fresh,
                       size["short"], size["days_back"] / fresh, size["reached"], size["new"] / fresh,
                       "up to %d s" % size["seconds"] if size["seconds"] else "over %d s" % ANSWER_SECONDS[-1]))
     if not platforms:
