@@ -1317,11 +1317,13 @@ def progress(db, platform, now):
         places["all"] += asked
         places["regulars"] += asked
         further += 1
-    since = utc_day(now - 2 * 86400)
-    took_ms, listed = db.execute("SELECT SUM(took_ms), SUM(listed) FROM size_days WHERE platform = ? AND day >= ?",
-                                 (platform, since)).fetchone()
+    # The days timed (reads are timed from this version on), today as far as it has gone.
+    timed = db.execute("SELECT day, SUM(took_ms), SUM(listed) FROM size_days WHERE platform = ? AND day >= ? "
+                       "GROUP BY day HAVING SUM(took_ms) > 0", (platform, utc_day(now - 2 * 86400))).fetchall()
+    took_ms, listed = sum(row[1] for row in timed), sum(row[2] for row in timed)
+    days = sum(min(1, (now - date_ms(day) // 1000) / 86400) for day, _, _ in timed)
     a_place = took_ms / 1000 / listed if took_ms and listed else None
-    a_day = took_ms / 3600 / ((now - date_ms(since) // 1000) / 86400) / 1000 if took_ms else None
+    a_day = took_ms / 3600 / 1000 / days if took_ms else None
     hours = {name: round(number * a_place / 3600, 1) if a_place else None for name, number in places.items()}
     return {"reached": counts.get(1, 0), "as_far": counts.get(2, 0), "further": further,
             "not_back": not_back, "not_back_regulars": regulars,

@@ -103,7 +103,15 @@ Live at `https://arenasweats.lol/collector/` on the website server.
     long the client took (answers of up to 1, 2, 5, 10, 20, 40, 80 seconds, and longer;
     and all of them together, `took_ms`). They also count the Arena matches those reads
     showed that no list had shown before. `stats` prints three days of it in one line a
-    size, `relay status` seven days under `reads`, `sizes`.
+    size, `relay status` seven days under `reads`, `sizes`. Whether a server's clients give
+    more than 20 is read off it at once:
+    "lists of 200 places: ... 950 fetched afresh; those listed 196 matches each (40 fewer
+    than asked), back 31 days" is a client that gives what it is asked for; "listed 20
+    matches each (950 fewer than asked)" is one that does not, and then `policy --block 20`
+    saves the asking. Many failed: it refuses or times out at that size. Many from the
+    saved copy: copies live long, and lists come back to collectors that read them before.
+    Once a server is caught up, long lists show few new matches each: then a smaller
+    block (60) spares the clients.
   - How far each server is from the season's start, in `stats` (three lines a server) and
     in `relay status` under `reads`, `progress`: lists that got there (`reached`), that are
     as far back as they go or as one request may go (`as_far`), that are to be read further
@@ -114,19 +122,13 @@ Live at `https://arenasweats.lol/collector/` on the website server.
     further back; reads that fall short and are read again come on top), what a listed
     match took the clients in the last 3 days (`seconds_a_place`), so the client hours
     (`hours_left`, `hours_left_regulars`), the client hours a day lists took in those 3
-    days (`list_hours_a_day`) and the days the regulars' lists take at that
-    (`days_left_regulars`). And `season_held`: for each day played, the share held of the
-    matches this week's list reads showed that were played 2 days or more before the read
-    (see `seen_days`), averaged over the days (each counted alike: lists show the latest days
-    most, and those are held most; on 26 Nov HN1's were 79% held, its days 55% on average).
-    An estimate that leans high. Where nothing was measured the value is null. Whether a server's clients give more than 20 is read off it at once:
-    "lists of 200 places: ... 950 fetched afresh; those listed 196 matches each (40 fewer
-    than asked), back 31 days" is a client that gives what it is asked for; "listed 20
-    matches each (950 fewer than asked)" is one that does not, and then `policy --block 20`
-    saves the asking. Many failed: it refuses or times out at that size. Many from the
-    saved copy: copies live long, and lists come back to collectors that read them before.
-    Once a server is caught up, long lists show few new matches each: then a smaller
-    block (60) spares the clients.
+    days (`list_hours_a_day`; reads are timed from this version on, so only the days with
+    timed reads count, today as far as it has gone) and the days the regulars' lists take
+    at that (`days_left_regulars`). And `season_held`: for each day played, the share held
+    of the matches this week's list reads showed that were played 2 days or more before the
+    read (see `seen_days`), averaged over the days (each counted alike: lists show the latest
+    days most, and those are held most; on 26 Nov HN1's were 79% held, its days 55% on
+    average). An estimate that leans high. Where nothing was measured the value is null.
   - `read_days`, per server and day: lists handed out and the places asked for in them,
     reads reported, failed and from a saved copy, matches listed, lists that reached the
     season's start, the Arena matches shown, and how many of those were held already or
