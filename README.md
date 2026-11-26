@@ -19,22 +19,27 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   any request that isn't on its short list of allowed reads.
 - **Never while you play.** It pauses the moment you queue up, and starts again only once
   you're back in the client and not in a match.
-- **Gentle.** It sends one request every couple of seconds, one at a time, and slows down
-  further if the client is busy. A request is for one match, or for one player's latest
-  matches: up to 200 of them at once, which the client can take many seconds to answer.
+- **Gentle.** It sends one request about two seconds after the client's last answer (never
+  more than one a second), one at a time, and slows down further if the client is busy. A
+  request is for one match, or for one player's latest matches: up to 1,000 of them at once,
+  which the client can take a minute or more to answer.
   ArenaSweats can tell it to slow down or stop, but can never make it go faster or do
   anything else. Only you can, with fast mode.
-- **Fast mode is off unless you turn it on.** Fast mode collects about 3 times faster:
-  about two requests a second, sent without waiting for the last one's answer, so up to four
-  can be on their way at once. **BETA: Please only use with unimportant accounts for now.**
-  At most three of the four are match lists, which take the client longest.
+- **Fast mode is off unless you turn it on.** Fast mode collects about 2-3 times faster:
+  up to five requests a second, each sent at least 0.2 seconds after the last one was sent,
+  not after its answer. **BETA: Please only use with unimportant accounts for now.**
+  On real clients it collected about 2.2 times as many matches an hour as the normal pace
+  (version 0.3.7, which kept 0.4 seconds between requests); with 0.2 seconds we estimate
+  about 3 times. Up to four requests can be on their way at once, as many as ArenaSweats
+  allows, and at most three of them match lists, which take the client longest. The Chinese
+  client answers one request at a time, so there that gains nothing.
   It starts with one request at a time and allows more only while the client keeps answering
   as quickly as before. Two failed requests within a hundred, or slower answers, mean fewer
   at once again. An answer of "too many requests", or three failures in a row, bring back
   the normal pace for an hour. It still never runs while you play: when you queue up it
   sends nothing more, and drops the requests that are still on their way. ArenaSweats can
   still slow it down, allow fewer requests at once or switch it off, but can never allow
-  more than four.
+  more than four at once, or less than 0.2 seconds between them.
 - **Your account stays private.** It never reads or sends your password or login. It sends
   Arena match results, your player ID, which is already in your match records, and a
   little about the collector itself: what it is doing and how fast.

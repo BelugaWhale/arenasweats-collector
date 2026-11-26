@@ -1,6 +1,7 @@
 """Tests for collector.py against the fake League client.  Run:  python -m unittest discover tests"""
 
 import argparse
+import collections
 import contextlib
 import io
 import json
@@ -18,7 +19,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import collector  # noqa: E402
-from fake_lcu import Clock, FakeClient  # noqa: E402
+from fake_lcu import Clock, FakeClient, PretendFlights  # noqa: E402
 
 
 def history(requests):
@@ -276,15 +277,21 @@ class FastMode(CollectorCase):
         self.assertFalse(made.fast_on)
         self.assertGreaterEqual(min(self.gaps(self.fake.requests)), 2.0 * 0.8 - 0.001)
 
-    def test_a_fifth_of_the_gap_but_never_below_its_own_floor(self):
+    def test_a_tenth_of_the_gap_but_never_below_its_own_floor(self):
+        # Why: this floor is the fastest any volunteer's client is ever asked; admin approved 0.2 s and no lower.
         made = self.run_collector(minutes=10, fast=True)
         gaps = self.gaps(self.fake.requests)
         self.assertGreater(len(gaps), 400)
-        self.assertEqual(collector.DEFAULT_DELAY / collector.FAST_FACTOR, collector.FAST_MIN_DELAY)
-        self.assertGreaterEqual(min(gaps), collector.FAST_MIN_DELAY - 0.001)     # never above 2.5 a second
-        self.assertLess(sorted(gaps)[len(gaps) // 2], 0.5)
+        self.assertEqual((collector.FAST_MIN_DELAY, collector.DEFAULT_DELAY / collector.FAST_FACTOR), (0.2, 0.2))
+        self.assertGreaterEqual(min(gaps), collector.FAST_MIN_DELAY - 0.001)     # never above 5 a second
+        self.assertLess(sorted(gaps)[len(gaps) // 2], 0.25)
         self.assertEqual(made.delay, collector.FAST_MIN_DELAY)
-        self.assertIn("one request every 0.4 seconds", self.output.getvalue())
+        self.assertIn("one request every 0.2 seconds", self.output.getvalue())
+        made.apply_policy({"fast_delay": 0.4})                                # ArenaSweats can raise the floor,
+        self.assertEqual((made.floor, made.delay), (0.4, 0.4))
+        self.assertGreaterEqual(min(made.gap() for _ in range(100)), 0.4)
+        made.apply_policy({"fast_delay": 0.0})                                # but never lower it
+        self.assertEqual((made.floor, made.delay), (0.2, 0.2))
         self.fake.requests.clear()
         self.data_dir = os.path.join(self.tmp.name, "data-again")            # start again from nothing
         os.makedirs(self.data_dir)
@@ -349,6 +356,10 @@ class FastMode(CollectorCase):
     def test_rests_at_the_normal_pace_after_the_client_pushes_back(self):
         self.addCleanup(setattr, collector, "FAST_REST", collector.FAST_REST)
         collector.FAST_REST = 600
+        self.fake.close()
+        self.fake = FakeClient(players=150, arena=600, clock=self.clock)     # enough left to read after the rest
+        self.addCleanup(self.fake.close)
+        self.fake.write_lockfile(self.league_dir)
         start = self.clock.now()
         self.fake.fail = lambda path: 429 if "/v1/games/" in path and self.clock.now() < start + 60 else None
         self.run_collector(minutes=30, fast=True)
@@ -367,10 +378,10 @@ class FastMode(CollectorCase):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(collector.ask_fast_mode(lambda prompt: asked.append(prompt) or answer), expected)
             self.assertEqual(asked, ["Activate fast mode? 开启快速模式？ [y/N]  No answer = normal mode / 不回答即普通模式: "])
-        self.assertEqual(collector.FAST_SPEEDUP, "3")
+        self.assertEqual(collector.FAST_SPEEDUP, "2-3")
         self.assertEqual(output.getvalue(),
-                         "Fast mode collects about 3 times faster. BETA: Please only use with unimportant accounts "
-                         "for now.\n快速模式的采集速度约为正常速度的 3 倍。测试版：目前请只在不重要的账号上使用。\n")
+                         "Fast mode collects about 2-3 times faster. BETA: Please only use with unimportant accounts "
+                         "for now.\n快速模式的采集速度约为正常速度的 2-3 倍。测试版：目前请只在不重要的账号上使用。\n")
         for words in ("not sure", "throwaway", "小号", "不确定"):
             self.assertNotIn(words, output.getvalue())
             self.assertNotIn(words, collector.__doc__)
@@ -399,7 +410,7 @@ class FastMode(CollectorCase):
     def test_help_and_readmes_give_the_same_warning(self):
         with contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             collector.main(["--help"])
-        self.assertIn("BETA: collect about 3 times faster; please only use with unimportant accounts for now",
+        self.assertIn("BETA: collect about 2-3 times faster; please only use with unimportant accounts for now",
                       " ".join(output.getvalue().split()))
         texts = {}
         for path in ("README.md", os.path.join("server", "README.md")):
@@ -407,8 +418,8 @@ class FastMode(CollectorCase):
                 texts[path] = " ".join(handle.read().split())
             self.assertNotIn("throwaway", texts[path], path)
             self.assertNotIn("not sure", texts[path], path)
-        self.assertIn("Fast mode collects about 3 times faster: about two requests a second, sent without waiting for "
-                      "the last one's answer, so up to four can be on their way at once. "
+        self.assertIn("Fast mode collects about 2-3 times faster: up to five requests a second, each sent at least 0.2 "
+                      "seconds after the last one was sent, not after its answer. "
                       "**BETA: Please only use with unimportant accounts for now.**", texts["README.md"])
         self.assertEqual(collector.FAST_MAX_FLIGHT, 4)
 
@@ -818,6 +829,102 @@ class StubServer:
         self.told = (self.state, self.detail)
         self.calls.append((path, self.state, self.detail))
         return 200, {"enabled": True} if path == "/v1/policy" else {"games": [], "players": [], "wait": 600}, 0
+
+
+class WorkStub(StubServer):
+    """Stands in for ArenaSweats handing out work: each request for more work gets the next of `rounds`, then
+    nothing. Keeps every match-list report sent back, with the pretend time it arrived."""
+
+    def __init__(self, rounds, now):
+        super().__init__()
+        self.rounds, self.now, self.reports = list(rounds), now, []
+
+    def call(self, method, path, payload=None, timeout=30):
+        if path != "/v1/work":
+            return super().call(method, path, payload, timeout)
+        self.reports += [(self.now(), report) for report in payload["reports"]]
+        work = self.rounds.pop(0) if self.rounds and payload["more"] else {}
+        return 200, dict({"games": [], "players": [], "wait": 600, "lease": 900, "policy": {"enabled": True}}, **work), 0
+
+
+class DeepLists(CollectorCase):
+    """A player's list read as one block of up to MAX_BLOCK matches, which a client can take minutes to answer.
+    The client's answers take pretend time here (PretendFlights)."""
+
+    def setUp(self):
+        super().setUp()
+        self.heavy = self.fake.players[5]
+        for n in range(1100):                       # a player with a long history: over 1,000 matches
+            self.fake.add_game("CLASSIC", 420, [self.heavy, self.fake.players[6]], age_seconds=600 + 60 * n)
+        self.fake.delay = lambda path: 0.08
+        self.fake.entry_seconds = 0.25              # the slowest client measured (OC1): a list of 1,000 takes 250 s
+
+    def run_with_work(self, minutes, fast=False):
+        """Run a collector that ArenaSweats hands the heavy player's whole list (it names more than MAX_BLOCK)."""
+        self.server = WorkStub([{"players": [{"puuid": self.heavy, "job": "deep", "since": 0, "count": 5000}]}],
+                               self.clock.now)
+        made = self.collector(minutes=minutes, server=self.server, fast=fast)
+        made.flights = PretendFlights(self.clock, self.fake)
+        self.output = io.StringIO()
+        with self.assertLogs(collector.log, "INFO") as self.logs, contextlib.redirect_stdout(self.output):
+            made.run()
+        return made
+
+    def heavy_lists(self):
+        return [path for _, path, _ in self.fake.requests if self.heavy in path]
+
+    def test_a_list_of_1000_that_takes_minutes_is_neither_cut_short_nor_taken_for_trouble(self):
+        # Why: a long list that timed out or looked like a struggling client would fail every deep read, or slow every
+        # collector down, without anyone seeing why.
+        self.assertEqual(collector.MAX_BLOCK, 1000)
+        timeout = collector.ListRead(self.heavy, 0, 1000).timeout
+        self.assertEqual((collector.ListRead(self.heavy, 0, 20).timeout, collector.ListRead(self.heavy, 0, 200).timeout,
+                          timeout), (20, 83, 360))
+        self.assertGreaterEqual(timeout, 1.4 * 1000 * self.fake.entry_seconds)     # room to spare on the slowest client
+        for fast in (False, True):
+            self.fake.forget()
+            self.fake.requests.clear()
+            self.data_dir = os.path.join(self.tmp.name, "data-%s" % fast)
+            os.makedirs(self.data_dir)
+            made = self.run_with_work(10, fast=fast)
+            self.assertEqual(self.heavy_lists(), ["/lol-match-history/v1/products/lol/%s/matches?begIndex=0&endIndex=999"
+                                                  % self.heavy])        # one request for all of it
+            (report,) = [report for _, report in self.server.reports if report["puuid"] == self.heavy]
+            self.assertEqual((report["asked"], report["listed"], report["failed"], report["took"]),
+                             (1000, 1000, False, 250.08))
+            self.assertEqual((made.stats["failed"], made.failures, made.fast_on), (0, 0, fast))
+            self.assertFalse([line for line in self.logs.output if "down to" in line or "rests for an hour" in line])
+            self.assertNotIn("struggling", self.output.getvalue())
+
+    def test_a_game_that_starts_while_a_long_list_is_on_its_way_stops_everything(self):
+        # Why: "never while you play" is the collector's first promise, and a list of 1,000 is on its way for minutes.
+        start = self.clock.now()
+        self.clock.at(start + 60, lambda: setattr(self.fake, "phase", "ChampSelect"))     # the list takes 250 s
+        self.clock.at(start + 600, lambda: setattr(self.fake, "phase", "None"))
+        self.run_with_work(15, fast=True)
+        times = [when - start for _, _, when in history(self.fake.requests)]
+        self.assertFalse([when for when in times if 60 + 5 <= when < 600 + collector.RESUME_GRACE - 5])
+        self.assertEqual(len(self.heavy_lists()), 2)            # dropped unanswered, then asked again after the game
+        reports = [(when - start, report) for when, report in self.server.reports if report["puuid"] == self.heavy]
+        self.assertEqual(len(reports), 1)                       # the first answer was not taken in:
+        self.assertGreater(reports[0][0], 600)
+        self.assertEqual((reports[0][1]["listed"], reports[0][1]["failed"]), (1000, False))
+
+    def test_fast_mode_holds_lists_by_the_matches_in_them_not_by_their_number(self):
+        # Why: work held longer than its time is handed to another collector as well, so deep lists must not be taken
+        # on faster than the client can read them.
+        made = self.collector(server=StubServer(), fast=True)
+        players, games = self.fake.players, sorted(self.fake.arena_ids())
+
+        def hold(lists, size, matches=0):
+            made.todo = collections.deque([collector.ListRead(p, 0, size) for p in players[:lists]]
+                                          + [collector.MatchFetch(g) for g in games[:matches]])
+            return made.list_room(), made.wants_work()
+        self.assertEqual(hold(2, 1000), (0, True))             # (few matches left: it asks for matches only)
+        self.assertEqual(hold(1, 1000, matches=10), (9, False))      # 80 s of reading or more: no need to ask ahead
+        self.assertEqual(hold(4, 200, matches=10), (6, True))        # lists of 200, as before
+        self.assertEqual(hold(10, 200), (0, True))
+        self.assertEqual(made.work_request()["lists"], 0)
 
 
 class AdminRights(CollectorCase):

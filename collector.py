@@ -6,13 +6,14 @@ WHAT IT DOES
      "lockfile" in its folder or, when that cannot be found, the command line
      the client was started with (what Task Manager shows for it).
   2. While you are not playing, slowly asks that client for this season's Arena
-     match history: match lists of players (a player's latest matches, up to 200
-     in one request, which the client can take many seconds to answer), and the
+     match history: match lists of players (a player's latest matches, up to 1,000
+     in one request, which the client can take a minute or more to answer), and the
      full record of Arena matches.
      Fast mode, which you can turn on at start, sends a request about every
-     0.4 seconds without waiting for the last one's answer, with at most 4 on
-     their way at once, and fewer whenever the client is slow to answer or
-     fails. BETA: please only use it with unimportant accounts for now.
+     0.2 seconds, counted from the last one's start, not its answer, with at
+     most 4 on their way at once (as many as ArenaSweats allows), and fewer
+     whenever the client is slow to answer or fails. BETA: please only use it
+     with unimportant accounts for now.
   3. Sends the matches to ArenaSweats (DEFAULT_SERVER below), which tells it which
      players and matches to read next, so no two collectors read the same thing.
      The first time, it asks ArenaSweats for this install's own upload key and
@@ -91,8 +92,8 @@ KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 # ---------------------------------------------------------------------------
 MIN_DELAY = 1.0        # hard floor at the normal pace: at most one match-history request per second
 DEFAULT_DELAY = 2.0    # normal gap between match-history requests, in seconds
-FAST_FACTOR = 5        # fast mode (beta, only when the user turns it on) divides the gap by this,
-FAST_MIN_DELAY = 0.4   # never below its own hard floor; ArenaSweats can raise it (policy "fast_delay"). In fast mode
+FAST_FACTOR = 10       # fast mode (beta, only when the user turns it on) divides the gap by this,
+FAST_MIN_DELAY = 0.2   # never below its own hard floor; ArenaSweats can raise it (policy "fast_delay"). In fast mode
                        # the gap runs from one request's start to the next one's: it does not wait for the answer first,
 FAST_MAX_FLIGHT = 4    # so several can be on their way at once, never more than this; ArenaSweats can lower it
                        # (policy "fast_flight"). It starts with one at a time and allows one more after
@@ -105,21 +106,26 @@ SLOW_SECONDS = {"match": 0.1, "list": 0.005}    # this much longer: a match by i
                        # for each match listed, as a list's answer takes the longer the more matches it holds
 FLIGHT_WINDOW = 20     # (the middle one of this many answers of the same kind, against that of the last ones sent alone;
 FLIGHT_ALONE = 5       # the first this many requests of each kind are always sent alone, to know how long that takes).
-FAST_SPEEDUP = "3"     # matches an hour in fast mode against the normal pace (fake client, real client's answer times)
+FAST_SPEEDUP = "2-3"   # matches an hour in fast mode against the normal pace: 2.2 measured on real clients (0.3.7),
+                       # about 3 estimated with the 0.2 s floor (0.3.9; the fake client with Chinese answer times: 3.3)
 FAST_REST = 3600       # in fast mode, a 429 or 3 failed requests in a row bring back the normal pace for this long
 FAST_AHEAD = 5         # fast mode asks ArenaSweats for more work when this few matches are left to fetch, or when it
-FAST_LISTS = 10        # holds fewer than half this many match lists; it says how many lists it has room for, up to this
-                       # many (ArenaSweats decides how many it hands out),
+FAST_LISTS = 10        # holds fewer than half this many match lists, of fewer than half
+FAST_PLACES = 2000     # this many matches in all (a list of 1,000 takes a Chinese client about 80 s, and what it holds
+                       # has to be read before its time runs out). It says how many lists it has room for: up to
+                       # FAST_LISTS, none while it holds lists of FAST_PLACES matches (ArenaSweats decides how many
+                       # it hands out),
 FAST_WORK_SECONDS = 3  # and asks at most this often (the normal pace: WORK_SECONDS)
 # A player's match list is read in ONE request, for their latest N matches. The client gives as many as its first
 # request for a player asks for, and answers every later request for that player from the copy it saved then,
 # whatever places are asked for (measured on a real client, 25 Nov 2026). So a list cannot be read page by page.
 LIST_SIZE = 20         # N when ArenaSweats names no number (an older ArenaSweats)
-MAX_BLOCK = 200        # the largest N this collector reads, whatever ArenaSweats asks for ("count")
+MAX_BLOCK = 1000       # the largest N this collector reads, whatever ArenaSweats asks for ("count")
 OWN_BLOCK = 100        # N when the collector decides for itself (a test run)
 LCU_SECONDS = 20       # longest wait for the client's answer. A list of more than LIST_SIZE matches gets
-LIST_ENTRY_SECONDS = 0.5    # this much longer for every further match (on that client each took 0.25 s),
-LCU_SECONDS_MAX = 120  # but never more than this
+LIST_ENTRY_SECONDS = 0.35   # this much longer for every further match (measured: about 0.08 s each on Chinese clients,
+                            # 0.17 s in the slowest tenth there, 0.25 s on one OC1 client),
+LCU_SECONDS_MAX = 360  # but never more than this (a list of 1,000: 6 minutes, about 80 s on a Chinese client)
 SAVED_SECONDS = 0.3    # a list answered quicker than this came from the client's saved copy, not from Riot's servers
 SEASON_START = "2026-10-06"   # UTC. Nothing older is read. The upload server's date replaces this one.
 MAX_WORK_GAMES = 50    # most matches to accept from the server in one round
@@ -135,7 +141,7 @@ POLICY_SECONDS = 600   # how often to ask the server whether collection should c
 PACE_SECONDS = 300     # how often ArenaSweats is told a few numbers about this collector's own pace (see pace_report)
 CHANGE_SECONDS = 10    # before collection starts, a change in why it has not is told at once, but not more often
 TEST_MINUTES = 15      # length of a test run (no upload address set)
-MAX_LCU_BYTES = 8 * 1024 * 1024
+MAX_LCU_BYTES = 16 * 1024 * 1024    # largest answer read from the client (a list of 1,000: about 4.5 MB)
 
 # Client states in which collection is allowed: the client is open and you are not in a match: on its home screen,
 # in a lobby, or on the post-game screen after a match (EndOfGame, where a client left after a game stays for
@@ -239,9 +245,9 @@ class Lcu:
         try:
             try:
                 with self.opener.open(request, timeout=timeout) as response:
-                    status, body = response.status, response.read(MAX_LCU_BYTES)
+                    status, body = response.status, response.read(MAX_LCU_BYTES + 1)
             except urllib.error.HTTPError as error:
-                status, body = error.code, error.read(MAX_LCU_BYTES)
+                status, body = error.code, error.read(MAX_LCU_BYTES + 1)
         except (TimeoutError, socket.timeout):
             return 0, None
         except urllib.error.URLError as error:
@@ -251,6 +257,10 @@ class Lcu:
         except (OSError, http.client.HTTPException) as error:
             raise ClientGone(str(error))
         self.last = (path, self.last[1], status)
+        if len(body) > MAX_LCU_BYTES:       # not read to the end: counts as a failed request
+            log.warning("the client's answer to %s is over %d MB, so it was not read", short_path(path),
+                        MAX_LCU_BYTES // 2 ** 20)
+            return status, None
         return status, parse_json(body)
 
 
@@ -2221,8 +2231,13 @@ class Collector:
             times.clear()
 
     def lists_held(self):
-        """How many match lists are waiting to be read or on their way."""
-        return sum(isinstance(job, ListRead) for job in list(self.todo) + list(self.flying.values()))
+        """The match lists waiting to be read or on their way."""
+        return [job for job in list(self.todo) + list(self.flying.values()) if isinstance(job, ListRead)]
+
+    def list_room(self):
+        """How many more match lists fast mode has room for (see FAST_PLACES)."""
+        held = self.lists_held()
+        return 0 if sum(read.count for read in held) >= FAST_PLACES else max(0, FAST_LISTS - len(held))
 
     def wants_work(self):
         """Whether to ask ArenaSweats for more work now: at the normal pace once everything handed out has
@@ -2231,8 +2246,10 @@ class Collector:
         if self.fast_on:
             lists = sum(isinstance(job, ListRead) for job in self.todo)
             matches = len(self.todo) - lists
+            held = self.lists_held()
             return lists <= 2 * FAST_LISTS and (matches <= FAST_AHEAD or (
-                matches <= MAX_WORK_GAMES and self.lists_held() < FAST_LISTS // 2))
+                matches <= MAX_WORK_GAMES and len(held) < FAST_LISTS // 2
+                and sum(read.count for read in held) < FAST_PLACES // 2))
         return not self.todo and not self.flying and self.sending is None
 
     def work_request(self, more=True):
@@ -2243,7 +2260,7 @@ class Collector:
         if not self.introduced:         # a server that knows no players yet starts from this account's list
             request["start"] = self.me
         if more and self.fast_on:
-            request["lists"] = max(0, FAST_LISTS - self.lists_held())
+            request["lists"] = self.list_room()
         self.asking, self.last_work = (len(request["reports"]), self.now()), self.now()
         return request
 
