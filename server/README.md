@@ -268,6 +268,19 @@ Trust covers what a match says, not its size or shape:
   so an install that is closed within a minute still shows why. After that, collectors check in
   every 10 minutes, also while paused. `ingest.py keys` shows the last state and detail
   (`why: ...`), and `relay status` reports installs seen in the last hour and day by state.
+- Each change of what an install says (state, detail or version) is also kept, with its time, in
+  `contributor_history`: the latest 100 changes an install, for 30 days (it was started from what
+  each install said last, at the time it was last seen). `ingest.py keys --history NAME` prints one
+  install's. `ingest.py newcomers [--days 7]` shows how far the installs that signed up in those
+  days got: whether they answered the administrator question (the last answer they told: `admin`,
+  `admin_no` or `admin_declined`), found the League client (`found_` and the step), sent a first
+  match, and were still collecting an hour after they began; and for the others what they said
+  last, or before they closed (`closed window` after `waiting_for_client no_client.admin_no`
+  is somebody who closed the collector while it waited for a League client it never found).
+  `relay status` gives the counts of the last 7 days under `newcomers`: `signed_up`, `admin`
+  (each answer), `found_client`, `first_match`, `collecting_an_hour` and `gave_up_at` (what the
+  others said last, or before closing, with how many said it; the 8 most common; `never seen`:
+  signed up and never got in touch again).
 - Every 5 minutes while it collects, a collector newer than 0.3.7 sends a few numbers about its own pace with
   one of its requests (`X-Collector-Pace`): how many requests it made to the League client, how many
   failed or were answered 429, how long the client took to answer (matches, and match lists by the
@@ -291,6 +304,8 @@ Trust covers what a match says, not its size or shape:
 ```
 python server/ingest.py add-key NAME          # prints the key once
 python server/ingest.py keys                  # contributors and how much each sent
+python server/ingest.py keys --history NAME   # each change of what one install said it was doing
+python server/ingest.py newcomers --days 7    # how far the installs that signed up in 7 days got, and where the others stopped
 python server/ingest.py disable-key NAME
 python server/ingest.py purge NAME
 python server/ingest.py policy --season-start 2026-10-06

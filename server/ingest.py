@@ -50,6 +50,10 @@ SIGNUPS_PER_ADDRESS = 10         # new installs one internet address can sign up
 SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close with: policy --signups off)
 MAX_PACE_BYTES = 800             # a collector's few numbers about its own pace (see note_pace)
 KEEP_PACE_DAYS = 14              # ... are kept this long
+HISTORY_PER_INSTALL = 100        # an install's latest changes of state kept (see note_seen) ...
+HISTORY_DAYS = 30                # ... for this long
+COLLECTING_HOURS = 1             # newcomers: an install still collecting this long after it began did not give up early
+NEWCOMER_DAYS = 7                # ... of the installs that signed up in this many days (relay status; newcomers --days)
 ARENA_MODES = {"CHERRY"}
 DEFAULT_SEASON_START = "2026-10-06"   # UTC. Change with: ingest.py policy --season-start YYYY-MM-DD
 DEFAULT_FAST_DELAY = 0.4         # fast mode's shortest gap between requests, s. Change with: policy --fast-delay S
@@ -121,6 +125,13 @@ CREATE TABLE IF NOT EXISTS signups(at INTEGER NOT NULL, address TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS contributor_seen(
     contributor_id INTEGER PRIMARY KEY, seen_at INTEGER NOT NULL, state TEXT NOT NULL, version TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '');
+-- Each install's changes of what it said it was doing (state, detail, version), from when they were first kept: where
+-- new installs get stuck (see note_seen; at most HISTORY_PER_INSTALL an install, for HISTORY_DAYS).
+CREATE TABLE IF NOT EXISTS contributor_history(
+    contributor_id INTEGER NOT NULL, at INTEGER NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL,
+    version TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS contributor_history_by_install ON contributor_history(contributor_id, at);
+CREATE INDEX IF NOT EXISTS contributor_history_by_time ON contributor_history(at);
 -- What installs say about their own pace, every few minutes while they collect (see note_pace).
 CREATE TABLE IF NOT EXISTS contributor_pace(
     contributor_id INTEGER NOT NULL, at INTEGER NOT NULL, version TEXT NOT NULL, report TEXT NOT NULL);
@@ -260,9 +271,20 @@ def connect():
         add_seen_detail(db)
         add_columns(db)
         add_outbox(db)
+        add_history(db)
         prepared.add(path)
     db.execute("PRAGMA synchronous=NORMAL")
     return db
+
+
+def add_history(db):
+    """Start an empty contributor_history (a database made before it existed) from what each install said last, at
+    the time it was last seen."""
+    db.execute("BEGIN IMMEDIATE")
+    with db:
+        if db.execute("SELECT 1 FROM contributor_history LIMIT 1").fetchone() is None:
+            db.execute("INSERT INTO contributor_history(contributor_id, at, state, detail, version) "
+                       "SELECT contributor_id, seen_at, state, detail, version FROM contributor_seen")
 
 
 def add_seen_detail(db):
@@ -452,13 +474,13 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_BODY     # larger bodies are refused before being read
 recent = defaultdict(deque)                     # contributor id -> times of recent requests
 recent_lock = threading.Lock()
-seen_written = {}                               # (contributor id, state, detail) -> when this worker last stored it
-SEEN_EVERY = 60                                 # store a contributor's "last seen" at most this often per state
+seen_written = {}                               # contributor id -> (state, detail, version, when this worker stored it)
+SEEN_EVERY = 60                                 # store an unchanged "last seen" at most this often
 
 
 def note_seen(db, contributor, now):
     """Remember when an install last got in touch, what it said it was doing and why (X-Collector-Detail, a short
-    fixed code; collectors after 0.3.7 send it), for health checks."""
+    fixed code; collectors after 0.3.7 send it), for health checks; and each change of that in contributor_history."""
     state = request.headers.get("X-Collector-State", "")
     state = state if re.fullmatch(r"[a-z_]{1,32}", state) else "unknown"     # "_fast" at the end: fast mode is on
     detail = request.headers.get("X-Collector-Detail", "")
@@ -466,13 +488,24 @@ def note_seen(db, contributor, now):
     agent = request.headers.get("User-Agent", "")
     version = agent.split("/", 1)[1] if agent.startswith("arenasweats-collector/") else ""
     version = version if re.fullmatch(r"[0-9A-Za-z.+-]{1,20}", version) else ""
+    said = (state, detail, version)
     with recent_lock:
-        if now - seen_written.get((contributor, state, detail), 0) < SEEN_EVERY:
+        last = seen_written.get(contributor)
+        if last and last[:3] == said and now - last[3] < SEEN_EVERY:
             return
-        seen_written[(contributor, state, detail)] = now
+        seen_written[contributor] = said + (now,)
+    db.execute("BEGIN IMMEDIATE")       # so two workers cannot both take the same change for new
     with db:
+        before = db.execute("SELECT state, detail, version FROM contributor_seen WHERE contributor_id = ?",
+                            (contributor,)).fetchone()
         db.execute("INSERT OR REPLACE INTO contributor_seen(contributor_id, seen_at, state, version, detail) "
                    "VALUES(?, ?, ?, ?, ?)", (contributor, int(now), state, version, detail))
+        if before != said:
+            db.execute("INSERT INTO contributor_history VALUES(?, ?, ?, ?, ?)", (contributor, int(now), state, detail, version))
+            db.execute("DELETE FROM contributor_history WHERE at < ?", (int(now) - HISTORY_DAYS * 86400,))
+            db.execute("DELETE FROM contributor_history WHERE contributor_id = ? AND at < (SELECT at FROM "
+                       "contributor_history WHERE contributor_id = ? ORDER BY at DESC LIMIT 1 OFFSET ?)",
+                       (contributor, contributor, HISTORY_PER_INSTALL - 1))
 
 
 def fail(status, message, **headers):
@@ -1219,7 +1252,102 @@ def cmd_set_key(db, args, disabled):
     print("%s: %s" % (args.name, ("switched off" if disabled else "switched on") if changed else "no such contributor"))
 
 
-def cmd_keys(db, _args):
+ADMIN_ANSWERS = ("admin", "admin_no", "admin_declined")    # the end of a detail: the administrator question's answer
+STOPS = ("closed", "stopped", "error")                       # states an install says as it stops
+
+
+def newcomer(db, contributor, created):
+    """How far one install got (see newcomers)."""
+    steps = db.execute("SELECT at, state, detail FROM contributor_history WHERE contributor_id = ? ORDER BY at, rowid",
+                       (contributor,)).fetchall()
+    seen = db.execute("SELECT seen_at, state, detail, version FROM contributor_seen WHERE contributor_id = ?",
+                      (contributor,)).fetchone()
+    first_match, matches = db.execute("SELECT MIN(received_at), COUNT(*) FROM games WHERE contributor_id = ?",
+                                      (contributor,)).fetchone()
+    said = [detail.split(".") for _, _, detail in steps]
+    answers = [word for words in said for word in words if word in ADMIN_ANSWERS]
+    found = next((word for words in said for word in words if word.startswith("found_")), None)
+    # When it began collecting, and whether it was still collecting COLLECTING_HOURS later: each time it said it was
+    # collecting lasts until it said something else, or, for the last thing it said, until it was last seen.
+    began, lasted = None, False
+    for number, (at, state, _) in enumerate(steps):
+        if state.startswith("collecting"):
+            began = at if began is None else began
+            until = steps[number + 1][0] if number + 1 < len(steps) else (seen[0] if seen else at)
+            lasted = lasted or until - began >= COLLECTING_HOURS * 3600
+    last = steps[-1] if steps else None
+    stopped = last is not None and last[1].replace("_fast", "") in STOPS
+    before = next((step for step in reversed(steps) if step[1].replace("_fast", "") not in STOPS), None)
+    return {"signed_up": created, "version": seen[3] if seen else "", "admin": answers[-1] if answers else None,
+            "found": found, "first_match": first_match, "matches": matches, "began": began, "lasted": lasted,
+            "last": last[1:] if last else None, "stopped": stopped, "before": before[1:] if before else None,
+            "last_seen": seen[0] if seen else None}
+
+
+def newcomers(db, now, days):
+    """How far the installs that signed up in the last `days` days got: whether they answered the administrator
+    question (the last answer they told), found the League client (and by which step), sent a first match, and were
+    still collecting COLLECTING_HOURS after they began; what they said last, and before they stopped. By name."""
+    return {name: newcomer(db, contributor, created) for contributor, name, created in db.execute(
+        "SELECT id, name, created_at FROM contributors WHERE created_at > ? ORDER BY created_at", (now - days * 86400,))}
+
+
+def funnel(installs):
+    """The counts of newcomers (see newcomers), for `relay status` and the top of `ingest.py newcomers`: and of the
+    ones that did not last, where they stopped (what they said before they stopped, or last), most common first."""
+    gave_up = defaultdict(int)
+    for install in installs.values():
+        if not install["lasted"]:
+            step = install["before"] if install["stopped"] and install["before"] else install["last"]
+            gave_up[" ".join(part for part in step if part) if step else "never seen"] += 1
+    count = lambda test: sum(1 for install in installs.values() if test(install))
+    return {"signed_up": len(installs),
+            "admin": {answer: count(lambda install, answer=answer: install["admin"] == answer) for answer in ADMIN_ANSWERS},
+            "found_client": count(lambda install: install["found"]),
+            "first_match": count(lambda install: install["first_match"]),
+            "collecting_an_hour": count(lambda install: install["lasted"]),
+            "gave_up_at": dict(sorted(gave_up.items(), key=lambda item: (-item[1], item[0]))[:8])}
+
+
+def cmd_newcomers(db, args):
+    now = int(clock())
+    installs = newcomers(db, now, args.days)
+    counts = funnel(installs)
+    when = lambda moment: time.strftime("%m-%d %H:%M", time.localtime(moment)) if moment else "-"
+    print("Installs that signed up in the last %d days: %d" % (args.days, counts["signed_up"]))
+    print("  answered the administrator question: yes %d, no or no answer %d, yes but the Windows box was declined %d; "
+          "no answer told %d" % (counts["admin"]["admin"], counts["admin"]["admin_no"], counts["admin"]["admin_declined"],
+                                 counts["signed_up"] - sum(counts["admin"].values())))
+    print("  found the League client: %d" % counts["found_client"])
+    print("  sent a first match: %d" % counts["first_match"])
+    print("  still collecting %d hour after they began: %d" % (COLLECTING_HOURS, counts["collecting_an_hour"]))
+    if counts["gave_up_at"]:
+        print("  the others, by what they said last (before closing):")
+        for step, number in counts["gave_up_at"].items():
+            print("    %3d  %s" % (number, step))
+    for name, install in installs.items():
+        print("%-16s signed up %s  %-6s admin: %-14s %-15s first match: %s (%d)  collecting from %s%s  last: %s%s, seen %s"
+              % (name, when(install["signed_up"]), install["version"] or "-", install["admin"] or "-",
+                 install["found"] or "not found", when(install["first_match"]), install["matches"], when(install["began"]),
+                 " (an hour and more)" if install["lasted"] else "",
+                 " ".join(part for part in install["last"] if part) if install["last"] else "-",
+                 " after " + " ".join(part for part in install["before"] if part)
+                 if install["stopped"] and install["before"] else "", when(install["last_seen"])))
+
+
+def cmd_keys(db, args):
+    if args.history:
+        who = db.execute("SELECT id FROM contributors WHERE name = ?", (args.history,)).fetchone()
+        if who is None:
+            print("%s: no such contributor" % args.history)
+            return
+        rows = db.execute("SELECT at, state, detail, version FROM contributor_history WHERE contributor_id = ? "
+                          "ORDER BY at, rowid", who).fetchall()
+        for at, state, detail, version in rows:
+            print("%s  %-24s %-8s %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)), state, version, detail))
+        if not rows:
+            print("%s: no changes kept" % args.history)
+        return
     rows = db.execute("""
         SELECT c.name, c.disabled, COUNT(m.game_id), MAX(m.received_at), s.seen_at, s.state, s.version, s.detail
         FROM contributors c LEFT JOIN games m ON m.contributor_id = c.id
@@ -1515,7 +1643,8 @@ def relay_status(db, now):
             "uploads_paused": backlog_full(db), "platforms": platforms, "reads": reads,
             "installs_seen": {label: dict(db.execute(
                 "SELECT state, COUNT(*) FROM contributor_seen WHERE seen_at > ? GROUP BY state", (now - seconds,)))
-                for label, seconds in (("last_hour", 3600), ("last_day", 86400))}}
+                for label, seconds in (("last_hour", 3600), ("last_day", 86400))},
+            "newcomers": dict(funnel(newcomers(db, now, NEWCOMER_DAYS)), days=NEWCOMER_DAYS)}
 
 
 def cmd_relay(db, args):
@@ -1562,7 +1691,11 @@ def main(argv=None):
                        ("enable-key", "accept a contributor's uploads again"),
                        ("purge", "delete every match a contributor sent")):
         commands.add_parser(name, help=text).add_argument("name")
-    commands.add_parser("keys", help="list contributors")
+    keys_parser = commands.add_parser("keys", help="list contributors")
+    keys_parser.add_argument("--history", metavar="NAME", help="what one install said it was doing, each change")
+    newcomers_parser = commands.add_parser("newcomers", help="how far the installs that signed up lately got")
+    newcomers_parser.add_argument("--days", type=int, default=NEWCOMER_DAYS, help="signed up in the last N days "
+                                  "(default %d)" % NEWCOMER_DAYS)
     commands.add_parser("stats", help="show what is held and what is waiting to be read")
     pace_parser = commands.add_parser("pace", help="show the numbers installs sent about their own pace")
     pace_parser.add_argument("name", nargs="?", help="only this contributor's")
@@ -1598,7 +1731,8 @@ def main(argv=None):
         app.run(host="127.0.0.1", port=args.port)
         return 0
     db = connect()
-    handlers = {"add-key": cmd_add_key, "keys": cmd_keys, "purge": cmd_purge, "stats": cmd_stats, "pace": cmd_pace,
+    handlers = {"add-key": cmd_add_key, "keys": cmd_keys, "newcomers": cmd_newcomers, "purge": cmd_purge,
+                "stats": cmd_stats, "pace": cmd_pace,
                 "policy": cmd_policy, "export": cmd_export, "relay": cmd_relay,
                 "disable-key": lambda d, a: cmd_set_key(d, a, 1), "enable-key": lambda d, a: cmd_set_key(d, a, 0)}
     try:

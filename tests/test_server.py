@@ -212,6 +212,82 @@ class Keys(ServerCase):
         self.client.get("/v1/policy", headers=headers)
         self.assertEqual(self.db.execute("SELECT detail FROM contributor_seen").fetchone()[0], "")
 
+    def say(self, key, state, detail="", version="0.3.8"):
+        """A check-in by the install holding `key`, saying what it is doing."""
+        headers = {"Authorization": "Bearer " + key, "X-Collector-State": state, "X-Collector-Detail": detail,
+                   "User-Agent": "arenasweats-collector/" + version}
+        self.assertEqual(self.client.get("/v1/policy", headers=headers).status_code, 200)
+
+    def history(self, name="alice"):
+        return self.db.execute("SELECT h.state, h.detail, h.version FROM contributor_history h JOIN contributors c "
+                               "ON c.id = h.contributor_id WHERE c.name = ? ORDER BY h.at, h.rowid", (name,)).fetchall()
+
+    def test_each_change_of_what_an_install_says_is_kept_and_stays_small(self):
+        # Why: only the latest state was kept, so nobody could tell where new installs gave up; and kept without a limit,
+        # a collector flapping between two states could fill the website's disk.
+        self.say(self.key, "starting", "admin_no")
+        self.say(self.key, "waiting_for_client", "no_client.launcher.admin_no")
+        self.now += 5
+        self.say(self.key, "waiting_for_client", "no_client.launcher.admin_no")        # the same again: no new row
+        self.now += 300
+        self.say(self.key, "waiting_for_client", "no_client.launcher.admin_no")
+        self.say(self.key, "starting", "admin_no")                                      # back and forth: each kept
+        self.say(self.key, "collecting", "found_cmdline")
+        self.say(self.key, "collecting", "found_cmdline", version="0.3.9")              # a new version too
+        self.assertEqual(self.history(), [("starting", "admin_no", "0.3.8"),
+                                          ("waiting_for_client", "no_client.launcher.admin_no", "0.3.8"),
+                                          ("starting", "admin_no", "0.3.8"), ("collecting", "found_cmdline", "0.3.8"),
+                                          ("collecting", "found_cmdline", "0.3.9")])
+        shown = self.admin("keys", "--history", "alice")
+        self.assertRegex(shown.splitlines()[1], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d  waiting_for_client +0\.3\.8 +"
+                                                r"no_client\.launcher\.admin_no$")
+        self.assertIn("nobody: no such contributor", self.admin("keys", "--history", "nobody"))
+        self.addCleanup(setattr, ingest, "HISTORY_PER_INSTALL", ingest.HISTORY_PER_INSTALL)
+        ingest.HISTORY_PER_INSTALL = 3
+        for number in range(6):
+            self.now += 1
+            self.say(self.key, "paused", "phase_%d" % number)
+        self.assertEqual([detail for _, detail, _ in self.history()], ["phase_3", "phase_4", "phase_5"])
+        bob = self.add_key("bob")
+        self.now += ingest.HISTORY_DAYS * 86400 + 1                                     # old changes go
+        self.say(bob, "collecting", "found_running")
+        self.assertEqual((self.history(), self.history("bob")), ([], [("collecting", "found_running", "0.3.8")]))
+        self.assertEqual(self.db.execute("SELECT state FROM contributor_seen WHERE contributor_id = 1").fetchone()[0],
+                         "paused")                                                      # (the latest stays in keys)
+
+    def test_how_far_new_installs_got_is_shown(self):
+        # Why: volunteers who give up say nothing; this is where admin sees which step loses them, to fix that step.
+        keys = {name: self.add_key(name) for name in ("gave-up", "collects", "declined", "old-one")}
+        self.db.execute("UPDATE contributors SET created_at = ? WHERE name = 'old-one'", (int(self.now) - 9 * 86400,))
+        self.db.commit()
+        self.say(keys["gave-up"], "starting", "admin_no")
+        self.say(keys["gave-up"], "waiting_for_client", "no_client.launcher.admin_no")
+        self.say(keys["gave-up"], "closed", "window")
+        self.say(keys["collects"], "starting", "admin")
+        self.say(keys["collects"], "collecting_fast", "found_cmdline")
+        self.post(self.games[:2], key=keys["collects"])
+        self.now += 2 * 3600
+        self.say(keys["collects"], "collecting_fast", "found_cmdline")                  # two hours on, still at it
+        self.say(keys["declined"], "starting", "admin_declined")
+        self.say(keys["declined"], "client_unreachable", "path_hidden.lock_none.cmd_none.admin_declined")
+        self.say(keys["declined"], "collecting", "found_usual")                         # found it, but went quiet
+        self.say(keys["old-one"], "collecting", "found_running")
+        counts = json.loads(self.relay("status"))["newcomers"]
+        self.assertEqual(counts, {"days": 7, "signed_up": 4, "admin": {"admin": 1, "admin_no": 1, "admin_declined": 1},
+                                  "found_client": 2, "first_match": 1, "collecting_an_hour": 1,
+                                  "gave_up_at": {"collecting found_usual": 1, "never seen": 1,
+                                                 "waiting_for_client no_client.launcher.admin_no": 1}})
+        shown = self.admin("newcomers")
+        self.assertIn("Installs that signed up in the last 7 days: 4", shown)
+        self.assertIn("answered the administrator question: yes 1, no or no answer 1, yes but the Windows box was "
+                      "declined 1; no answer told 1", shown)
+        self.assertIn("still collecting 1 hour after they began: 1", shown)
+        self.assertIn("  1  waiting_for_client no_client.launcher.admin_no", shown)
+        self.assertRegex(shown, r"collects +signed up .* admin: admin +found_cmdline +first match: \S+ \S+ \(2\) +"
+                                r"collecting from .* \(an hour and more\)")
+        self.assertRegex(shown, r"gave-up .* last: closed window after waiting_for_client no_client\.launcher\.admin_no")
+        self.assertIn("Installs that signed up in the last 10 days: 5", self.admin("newcomers", "--days", "10"))
+
     def test_a_database_from_before_the_detail_column_still_takes_check_ins(self):
         # Why: every collector request records a check-in first; if that write failed, every collector would stop.
         path = os.path.join(self.tmp.name, "old.db")
