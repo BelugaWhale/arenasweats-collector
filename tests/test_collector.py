@@ -1,6 +1,7 @@
 """Tests for collector.py against the fake League client.  Run:  python -m unittest discover tests"""
 
 import argparse
+import collections
 import contextlib
 import io
 import json
@@ -18,7 +19,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 import collector  # noqa: E402
-from fake_lcu import Clock, FakeClient  # noqa: E402
+from fake_lcu import Clock, FakeClient, PretendFlights  # noqa: E402
 
 
 def history(requests):
@@ -818,6 +819,102 @@ class StubServer:
         self.told = (self.state, self.detail)
         self.calls.append((path, self.state, self.detail))
         return 200, {"enabled": True} if path == "/v1/policy" else {"games": [], "players": [], "wait": 600}, 0
+
+
+class WorkStub(StubServer):
+    """Stands in for ArenaSweats handing out work: each request for more work gets the next of `rounds`, then
+    nothing. Keeps every match-list report sent back, with the pretend time it arrived."""
+
+    def __init__(self, rounds, now):
+        super().__init__()
+        self.rounds, self.now, self.reports = list(rounds), now, []
+
+    def call(self, method, path, payload=None, timeout=30):
+        if path != "/v1/work":
+            return super().call(method, path, payload, timeout)
+        self.reports += [(self.now(), report) for report in payload["reports"]]
+        work = self.rounds.pop(0) if self.rounds and payload["more"] else {}
+        return 200, dict({"games": [], "players": [], "wait": 600, "lease": 900, "policy": {"enabled": True}}, **work), 0
+
+
+class DeepLists(CollectorCase):
+    """A player's list read as one block of up to MAX_BLOCK matches, which a client can take minutes to answer.
+    The client's answers take pretend time here (PretendFlights)."""
+
+    def setUp(self):
+        super().setUp()
+        self.heavy = self.fake.players[5]
+        for n in range(1100):                       # a player with a long history: over 1,000 matches
+            self.fake.add_game("CLASSIC", 420, [self.heavy, self.fake.players[6]], age_seconds=600 + 60 * n)
+        self.fake.delay = lambda path: 0.08
+        self.fake.entry_seconds = 0.25              # the slowest client measured (OC1): a list of 1,000 takes 250 s
+
+    def run_with_work(self, minutes, fast=False):
+        """Run a collector that ArenaSweats hands the heavy player's whole list (it names more than MAX_BLOCK)."""
+        self.server = WorkStub([{"players": [{"puuid": self.heavy, "job": "deep", "since": 0, "count": 5000}]}],
+                               self.clock.now)
+        made = self.collector(minutes=minutes, server=self.server, fast=fast)
+        made.flights = PretendFlights(self.clock, self.fake)
+        self.output = io.StringIO()
+        with self.assertLogs(collector.log, "INFO") as self.logs, contextlib.redirect_stdout(self.output):
+            made.run()
+        return made
+
+    def heavy_lists(self):
+        return [path for _, path, _ in self.fake.requests if self.heavy in path]
+
+    def test_a_list_of_1000_that_takes_minutes_is_neither_cut_short_nor_taken_for_trouble(self):
+        # Why: a long list that timed out or looked like a struggling client would fail every deep read, or slow every
+        # collector down, without anyone seeing why.
+        self.assertEqual(collector.MAX_BLOCK, 1000)
+        timeout = collector.ListRead(self.heavy, 0, 1000).timeout
+        self.assertEqual((collector.ListRead(self.heavy, 0, 20).timeout, collector.ListRead(self.heavy, 0, 200).timeout,
+                          timeout), (20, 83, 360))
+        self.assertGreaterEqual(timeout, 1.4 * 1000 * self.fake.entry_seconds)     # room to spare on the slowest client
+        for fast in (False, True):
+            self.fake.forget()
+            self.fake.requests.clear()
+            self.data_dir = os.path.join(self.tmp.name, "data-%s" % fast)
+            os.makedirs(self.data_dir)
+            made = self.run_with_work(10, fast=fast)
+            self.assertEqual(self.heavy_lists(), ["/lol-match-history/v1/products/lol/%s/matches?begIndex=0&endIndex=999"
+                                                  % self.heavy])        # one request for all of it
+            (report,) = [report for _, report in self.server.reports if report["puuid"] == self.heavy]
+            self.assertEqual((report["asked"], report["listed"], report["failed"], report["took"]),
+                             (1000, 1000, False, 250.08))
+            self.assertEqual((made.stats["failed"], made.failures, made.fast_on), (0, 0, fast))
+            self.assertFalse([line for line in self.logs.output if "down to" in line or "rests for an hour" in line])
+            self.assertNotIn("struggling", self.output.getvalue())
+
+    def test_a_game_that_starts_while_a_long_list_is_on_its_way_stops_everything(self):
+        # Why: "never while you play" is the collector's first promise, and a list of 1,000 is on its way for minutes.
+        start = self.clock.now()
+        self.clock.at(start + 60, lambda: setattr(self.fake, "phase", "ChampSelect"))     # the list takes 250 s
+        self.clock.at(start + 600, lambda: setattr(self.fake, "phase", "None"))
+        self.run_with_work(15, fast=True)
+        times = [when - start for _, _, when in history(self.fake.requests)]
+        self.assertFalse([when for when in times if 60 + 5 <= when < 600 + collector.RESUME_GRACE - 5])
+        self.assertEqual(len(self.heavy_lists()), 2)            # dropped unanswered, then asked again after the game
+        reports = [(when - start, report) for when, report in self.server.reports if report["puuid"] == self.heavy]
+        self.assertEqual(len(reports), 1)                       # the first answer was not taken in:
+        self.assertGreater(reports[0][0], 600)
+        self.assertEqual((reports[0][1]["listed"], reports[0][1]["failed"]), (1000, False))
+
+    def test_fast_mode_holds_lists_by_the_matches_in_them_not_by_their_number(self):
+        # Why: work held longer than its time is handed to another collector as well, so deep lists must not be taken
+        # on faster than the client can read them.
+        made = self.collector(server=StubServer(), fast=True)
+        players, games = self.fake.players, sorted(self.fake.arena_ids())
+
+        def hold(lists, size, matches=0):
+            made.todo = collections.deque([collector.ListRead(p, 0, size) for p in players[:lists]]
+                                          + [collector.MatchFetch(g) for g in games[:matches]])
+            return made.list_room(), made.wants_work()
+        self.assertEqual(hold(2, 1000), (0, True))             # (few matches left: it asks for matches only)
+        self.assertEqual(hold(1, 1000, matches=10), (9, False))      # 80 s of reading or more: no need to ask ahead
+        self.assertEqual(hold(4, 200, matches=10), (6, True))        # lists of 200, as before
+        self.assertEqual(hold(10, 200), (0, True))
+        self.assertEqual(made.work_request()["lists"], 0)
 
 
 class AdminRights(CollectorCase):

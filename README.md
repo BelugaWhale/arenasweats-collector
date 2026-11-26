@@ -21,7 +21,7 @@ Windows may warn that the program is from an unknown publisher. Choose "More inf
   you're back in the client and not in a match.
 - **Gentle.** It sends one request every couple of seconds, one at a time, and slows down
   further if the client is busy. A request is for one match, or for one player's latest
-  matches: up to 200 of them at once, which the client can take many seconds to answer.
+  matches: up to 1,000 of them at once, which the client can take a minute or more to answer.
   ArenaSweats can tell it to slow down or stop, but can never make it go faster or do
   anything else. Only you can, with fast mode.
 - **Fast mode is off unless you turn it on.** Fast mode collects about 3 times faster:
