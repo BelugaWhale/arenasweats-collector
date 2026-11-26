@@ -150,8 +150,55 @@ and takes as long as the list is long. Before that it replays the rules until 25
 requests HN1's collectors really made on 13-24 Nov and prints the result beside what was
 measured, which is how the world was fitted. A small run of it is one of the tests.
 
+#### How many places a read asks for, since 26 Nov
+
+`python server/tools/sizing.py [--grid]` (with `INGEST_DB` set; it only reads) plays the
+sizes on the lists a server has really read: each read of 150 matches or more tells how many
+places its player's list holds back to the season's start. On the 2,350 such lists of HN1 and
+HN10 (26 Nov, 458 places back to 6 Oct on average; players in 22 to 856 held matches):
+
+| | places a list | reads a list | back to the season's start |
+| --- | --- | --- | --- |
+| up to 200, rules until 26 Nov (20 a held match) or now | 200 | 1.00 | 11% |
+| up to 1,000, rules until 26 Nov | 995 | 1.00 | 96% |
+| up to 1,000, now (75% of similar lists, then 1.25 times the pace) | 762 | 1.27 | 96% (75% at the first read) |
+| the same, asking for the middle of similar lists first | 793 | 1.51 | 96% (52%) |
+
+So up to 200 nothing changes for these players (all are cut short), and with up to 1,000
+the rules now list 23% fewer matches for as many lists back to the season's start. How far
+off a pace measured on part of a list is for the rest was not measured; the tool takes it to
+be off by sqrt(4 / listed + 0.15^2) (about 21% after 200). Lighter players (fewer held
+matches) have not been read deep enough to tell what their lists hold; their first reads are
+judged by all of the server's lists until 30 of their own band have been.
+
+In the made-up world (below; `server/tools/compare.py`, which also plays an older ingest.py:
+14 days from 25 Nov, two collectors in fast mode, one request at a time, 0.08 s a match), the
+rules until 26 Nov (ingest.py at 6f146eb) against the rules now. Two worlds: the one
+fitted on 25 Nov, and one whose regulars play more other modes (15% play only Arena, not 40%),
+so that its lists of players in 100 or more Arena matches hold 150, 212, 338, 572 and 936
+places back to the season's start (10th to 90th percentile; HN1's measured: 148, 235, 338,
+498, 700):
+
+| | client s a new match | season held after 3, 7, 14 days | a new match held after: half, 9 in 10 |
+| --- | --- | --- | --- |
+| up to 200, until 26 Nov | 4.43 / 4.34 | 55, 72, 97% / 53, 69, 96% | 16 h, 52 h / 18 h, 53 h |
+| up to 200, now | 4.29 / 4.15 | 88, 99, 99% / 80, 98, 99% | 6 h, 19 h / 5 h, 20 h |
+| up to 1,000, until 26 Nov | 8.79 / 8.79 | 48, 55, 65% / 45, 52, 63% | 39 h, 116 h / 36 h, 117 h |
+| up to 1,000, now | 4.34 / 4.19 | 85, 97, 99% / 85, 96, 99% | 12 h, 45 h / 11 h, 38 h |
+
+What it says: the order (the most valuable lists first, lists not read back yet only in step
+3) is most of the gain at 200. Raising the policy to 1,000 under the rules until 26 Nov would
+have asked nearly every regular for 1,000 places, most of them from before the season. Under
+the rules now 1,000 costs about what 200 does per new match and fills the season about as fast;
+in this world matches of early October are also in enough shorter lists that reach that far.
+Whether the real servers are like that is not known: on HN1, early October was 7-16% held on
+26 Nov after 1,400 reads of 200.
+
+#### The tables until 26 Nov
+
 At HN1's size, from 25 Nov, when 42% of the season was held. Four collectors at the normal
-pace unless said; a client keeps its copies for an hour unless said:
+pace unless said; a client keeps its copies for an hour unless said (these were played with the
+rules until 26 Nov):
 
 | | days until 50%, 80%, 95% of the season is held | held after 30 days | a new match is held after: half of them, 9 in 10 |
 | --- | --- | --- | --- |
