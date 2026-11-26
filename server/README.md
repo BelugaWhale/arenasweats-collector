@@ -297,7 +297,24 @@ Trust covers what a match says, not its size or shape:
 | `GET /v1/policy` | Whether to collect, the pace, whether fast mode is allowed, its shortest gap and how many requests it may have on their way at once, a short message, the season's start. |
 | `POST /v1/work` | Takes match-list reports; answers with matches to fetch and lists to read. |
 | `POST /v1/games` | `{"games": [...]}`, gzip allowed. Answers with accepted / duplicates / skipped / rejected. |
+| `GET /v1/me` | What this install has done, for the collector's own window (below). |
 | `GET /healthz` | No key needed. |
+
+`GET /v1/me` answers, about the install whose key it carries and nobody else's:
+
+| field | |
+| --- | --- |
+| `days` | 30 entries, oldest first, the last one today (UTC days): `{"day": "2026-11-26", "matches": 412}`, the matches this install sent that day (each counted once, on the day it arrived). |
+| `total` | All the matches this install has sent. |
+| `server` | The server it last asked for work on, a platform code such as `"HN1"`; `null` until it has asked. |
+| `season_start` | The season's first day, `"2026-10-06"`. |
+| `server_held` | Matches held of that server played since the season began, from every install. |
+| `server_held_share_estimate` | An estimate between 0 and 1 of the share of that server's season held: of the matches this week's list reads showed that were played at least 2 days before, the share held already (see `seen_days`; it leans high). `null` until lists there have been read. |
+| `server_helpers` | Installs that sent matches of that server in the last 24 hours (this one included). |
+| `servers` | China's eight servers, the fewest helpers first: `{"server": "GZ100", "helpers": 0}`, helpers as in `server_helpers`. Platform codes only; the collector names them. |
+
+The install's own numbers come from a count kept as matches arrive (`contributor_days`); the server's
+are worked out again every 5 minutes. It may be asked once a minute.
 
 ## Commands
 

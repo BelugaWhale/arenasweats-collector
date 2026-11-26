@@ -1296,6 +1296,83 @@ class Urgent(ServerCase):
         self.assertIn("Event games asked for first: 1 not received yet", self.admin("stats"))
 
 
+class Me(ServerCase):
+    """GET /v1/me: what one install has done, for the collector's own window."""
+
+    def setUp(self):
+        super().setUp()
+        ingest.server_numbers.clear()
+
+    def me(self, key=None):
+        answer = self.client.get("/v1/me", headers={"Authorization": "Bearer " + (key or self.key)})
+        self.assertEqual(answer.status_code, 200)
+        return answer.get_json()
+
+    def on(self, platform, *ids):
+        """Matches with these ids on another server, played an hour before now."""
+        return [dict(self.played(game_id, 3600), platformId=platform) for game_id in ids]
+
+    def test_an_install_sees_its_own_matches_and_its_servers_progress(self):
+        # Why: this is what volunteers see of their own help; a wrong count or another install's data in it would be
+        # worse than no window at all.
+        bob = self.add_key("bob")
+        self.now -= 40 * 86400                                            # matches sent 40 days ago: in the total only
+        self.post(self.on("HN1", 1, 2))
+        self.now += 38 * 86400
+        self.post(self.on("HN1", 3, 4, 5))                        # 3 the day before yesterday
+        self.now += 2 * 86400
+        self.post(self.on("HN1", 6))                        # 1 today
+        self.post(self.on("HN1", 7, 8), key=bob)
+        self.post(self.on("HN10", 9), key=bob)
+        self.send("/v1/work", {"platform": "HN1", "more": False, "reports": []})   # (its server: where it asks for work)
+        self.db.execute("INSERT INTO seen_days(day, platform, played, seen, held) VALUES(?, 'HN1', '2026-10-10', 200, 120)",
+                        (utc_date(self.now),))
+        self.db.commit()
+        mine = self.me()
+        self.assertEqual(len(mine["days"]), ingest.ME_DAYS)
+        self.assertEqual(mine["days"][-1], {"day": utc_date(self.now), "matches": 1})
+        self.assertEqual(mine["days"][-3], {"day": utc_date(self.now - 2 * 86400), "matches": 3})
+        self.assertEqual(mine["days"][0]["day"], utc_date(self.now - (ingest.ME_DAYS - 1) * 86400))
+        self.assertEqual(sum(day["matches"] for day in mine["days"]), 4)
+        self.assertEqual({name: mine[name] for name in ("total", "server", "server_held", "server_held_share_estimate",
+                                                        "server_helpers", "season_start")},
+                         {"total": 6, "server": "HN1", "server_held": 8, "server_held_share_estimate": 0.6,
+                          "server_helpers": 2, "season_start": ingest.DEFAULT_SEASON_START})
+        self.assertEqual(mine["servers"][-2:], [{"server": "HN10", "helpers": 1}, {"server": "HN1", "helpers": 2}])
+        self.assertEqual(mine["servers"][0], {"server": "NJ100", "helpers": 0})   # the fewest helpers first
+        self.assertEqual({entry["server"] for entry in mine["servers"]}, set(ingest.CHINA_SERVERS))
+        self.assertNotIn("bob", json.dumps(mine))                         # nobody else's identity
+        self.assertEqual(self.me(bob)["total"], 3)
+        self.assertIsNone(self.me(self.add_key("carol"))["server"])      # (not asked for work yet: no server)
+        self.assertEqual(self.client.get("/v1/me").status_code, 401)
+        self.admin("purge", "alice")
+        self.assertEqual(self.me()["total"], 0)
+
+    def test_matches_from_before_the_season_are_not_counted_for_the_server(self):
+        # Why: when a new season begins, the old one's matches stay held; counting them would tell volunteers their
+        # server is further along than it is.
+        later = self.season + 30 * 86400 * 1000
+        rows = [("OC1", 100 + n, later - (5 - n) * 3600000, int(self.now), 1, b"") for n in range(5)]
+        rows += [("OC1", 200 + n, later + n * 3600000, int(self.now), 1, b"") for n in range(3)]
+        self.db.executemany("INSERT INTO games VALUES(?, ?, ?, ?, ?, ?)", rows)
+        self.db.commit()
+        self.assertEqual([ingest.held_since(self.db, "OC1", season) for season in (self.season, later, later + 86400000)],
+                         [8, 3, 0])
+        self.assertEqual(ingest.held_since(self.db, "HN1", self.season), 0)
+
+    def test_counts_held_before_this_version_are_carried_over(self):
+        # Why: the live database holds 360,000 matches from before these counts existed; volunteers' totals must not
+        # start from nothing.
+        self.post(self.games[:3])
+        self.db.executescript("DROP TRIGGER games_to_contributor_days; DROP TABLE contributor_days;")
+        self.post(self.games[3:5])                                        # (sent while this version was not running)
+        ingest.prepared.clear()
+        ingest.connect().close()
+        self.assertEqual(self.me()["total"], 5)
+        self.post(self.games[5:6])
+        self.assertEqual(self.me()["total"], 6)
+
+
 class Limits(ServerCase):
     def test_oversized_body_is_refused(self):
         big = os.urandom(ingest.MAX_BODY + 1000)

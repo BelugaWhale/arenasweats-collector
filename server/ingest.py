@@ -50,6 +50,10 @@ SIGNUPS_PER_ADDRESS = 10         # new installs one internet address can sign up
 SIGNUPS_PER_DAY = 500            # new installs signed up a day in all (close with: policy --signups off)
 MAX_PACE_BYTES = 800             # a collector's few numbers about its own pace (see note_pace)
 KEEP_PACE_DAYS = 14              # ... are kept this long
+ME_DAYS = 30                     # /v1/me: an install's matches a day for this many days
+ME_CACHE_SECONDS = 300           # ... and its server's numbers, worked out again this often (per worker)
+CHINA_SERVERS = ("HN1", "HN10", "NJ100", "GZ100", "CQ100", "TJ100", "TJ101", "BGP2")   # every current Tencent server, as
+                                 # the website lists them (ArenaSweats-webapp backend/china_regions.py, 22 Nov 2026)
 HISTORY_PER_INSTALL = 100        # an install's latest changes of state kept (see note_seen) ...
 HISTORY_DAYS = 30                # ... for this long
 COLLECTING_HOURS = 1             # newcomers: an install still collecting this long after it began did not give up early
@@ -138,7 +142,8 @@ CREATE TABLE IF NOT EXISTS contributor_pace(
 CREATE INDEX IF NOT EXISTS contributor_pace_by_time ON contributor_pace(at);
 CREATE TABLE IF NOT EXISTS contributors(
     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, key_hash TEXT NOT NULL UNIQUE,
-    created_at INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0);
+    created_at INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0,
+    platform TEXT NOT NULL DEFAULT '');         -- the server it last asked for work on
 -- Every match held. The first copy received is the one kept.
 CREATE TABLE IF NOT EXISTS games(
     platform TEXT NOT NULL, game_id INTEGER NOT NULL, created_ms INTEGER NOT NULL,
@@ -272,9 +277,27 @@ def connect():
         add_columns(db)
         add_outbox(db)
         add_history(db)
+        add_contributor_days(db)
         prepared.add(path)
     db.execute("PRAGMA synchronous=NORMAL")
     return db
+
+
+def add_contributor_days(db):
+    """Count each install's matches by the day (UTC) they arrived, for /v1/me: the ones held already (once), and from
+    now on each new one, by a trigger on games, so every match is counted whatever version of this program received
+    it. Done in one transaction with the trigger, like add_outbox. (From the index on games alone: no record is read.)"""
+    db.execute("BEGIN IMMEDIATE")
+    with db:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'games_to_contributor_days'").fetchone():
+            return
+        db.execute("CREATE TABLE IF NOT EXISTS contributor_days(contributor_id INTEGER NOT NULL, day TEXT NOT NULL, "
+                   "matches INTEGER NOT NULL, PRIMARY KEY(contributor_id, day))")
+        db.execute("INSERT INTO contributor_days SELECT contributor_id, date(received_at, 'unixepoch'), COUNT(*) "
+                   "FROM games INDEXED BY games_by_contributor GROUP BY 1, 2")
+        db.execute("CREATE TRIGGER games_to_contributor_days AFTER INSERT ON games BEGIN "
+                   "INSERT INTO contributor_days VALUES(NEW.contributor_id, date(NEW.received_at, 'unixepoch'), 1) "
+                   "ON CONFLICT(contributor_id, day) DO UPDATE SET matches = matches + 1; END")
 
 
 def add_history(db):
@@ -315,6 +338,8 @@ def add_columns(db):
             move_further(db, back_from=2, depth_below=block_limit(db), season=get_policy(db)["season_start"])
         if "took_ms" not in {row[1] for row in db.execute("PRAGMA table_info(size_days)")}:
             db.execute("ALTER TABLE size_days ADD COLUMN took_ms INTEGER NOT NULL DEFAULT 0")
+        if "platform" not in {row[1] for row in db.execute("PRAGMA table_info(contributors)")}:
+            db.execute("ALTER TABLE contributors ADD COLUMN platform TEXT NOT NULL DEFAULT ''")
         db.execute("CREATE INDEX IF NOT EXISTS players_back ON players(platform, games) WHERE back = 0")
         db.execute("CREATE INDEX IF NOT EXISTS players_top ON players(platform, due_at) WHERE back IN (1, 2)")
         db.execute("CREATE INDEX IF NOT EXISTS players_deeper ON players(platform, want) WHERE back = 3")
@@ -705,6 +730,70 @@ def policy():
     return jsonify(get_policy(g.db))
 
 
+def held_since(db, platform, season):
+    """Matches held of a server that were played since `season` (ms). Ids go up with time on a server (see played_at),
+    so the first held match of the season is found by halving the range of ids, and the rest are counted from the
+    index alone, without reading a record."""
+    low, high = db.execute("SELECT MIN(game_id), MAX(game_id) FROM games WHERE platform = ?", (platform,)).fetchone()
+    if low is None:
+        return 0
+
+    def from_season(game_id):           # whether the first held match from this id on was played in the season
+        return db.execute("SELECT created_ms FROM games WHERE platform = ? AND game_id >= ? ORDER BY game_id LIMIT 1",
+                          (platform, game_id)).fetchone()[0] >= season
+    if not from_season(high):
+        return 0
+    first = low
+    if not from_season(low):
+        while high - low > 1:
+            middle = (low + high) // 2
+            low, high = (low, middle) if from_season(middle) else (middle, high)
+        first = high
+    return db.execute("SELECT COUNT(*) FROM games WHERE platform = ? AND game_id >= ?", (platform, first)).fetchone()[0]
+
+
+server_numbers = {}     # (database, server or None) -> (when worked out, what server_now gives)
+
+
+def server_now(db, platform, now, season):
+    """A server's matches held of this season and the share of the season held there as this week's list reads judge
+    it (see season_held); with no server, how many installs sent matches of each server in the last day. Worked out
+    again every ME_CACHE_SECONDS (on the live database about 25 ms and 300 ms)."""
+    key = (os.path.abspath(db_path()), platform)
+    if key not in server_numbers or now - server_numbers[key][0] >= ME_CACHE_SECONDS:
+        server_numbers[key] = (now, dict(db.execute(
+            "SELECT platform, COUNT(DISTINCT contributor_id) FROM games INDEXED BY games_by_arrival WHERE received_at > ? "
+            "GROUP BY platform", (now - 86400,))) if platform is None else
+            (held_since(db, platform, season), season_held(db, platform, now)))
+    return server_numbers[key][1]
+
+
+@app.get("/v1/me")
+def me():
+    """What this install has done, for the collector's own window: its matches a day (UTC) for the last ME_DAYS days,
+    oldest first, and in all; its server (the last it asked for work on), that server's matches held of this season,
+    the share of the season held there (an estimate: see season_held), and how many installs sent matches of it in the
+    last day; and China's servers by how many installs sent matches of each in the last day, the fewest first. Nothing
+    about any other install. Cheap enough to be asked once a minute by every install."""
+    db, now = g.db, int(clock())
+    rules = get_policy(db)
+    first = utc_day(now - (ME_DAYS - 1) * 86400)
+    days = dict(db.execute("SELECT day, matches FROM contributor_days WHERE contributor_id = ? AND day >= ?",
+                           (g.contributor, first)))
+    total = db.execute("SELECT COALESCE(SUM(matches), 0) FROM contributor_days WHERE contributor_id = ?",
+                       (g.contributor,)).fetchone()[0]
+    server = db.execute("SELECT platform FROM contributors WHERE id = ?", (g.contributor,)).fetchone()[0] or None
+    helpers = server_now(db, None, now, rules["season_start"])
+    held, share = server_now(db, server, now, rules["season_start"]) if server else (0, None)
+    return jsonify({
+        "days": [{"day": day, "matches": days.get(day, 0)}
+                 for day in (utc_day(now - back * 86400) for back in range(ME_DAYS - 1, -1, -1))],
+        "total": total, "server": server, "season_start": time.strftime("%Y-%m-%d", time.gmtime(rules["season_start"] / 1000)),
+        "server_held": held, "server_held_share_estimate": share, "server_helpers": helpers.get(server, 0),
+        "servers": sorted(({"server": platform, "helpers": helpers.get(platform, 0)} for platform in CHINA_SERVERS),
+                          key=lambda entry: entry["helpers"])})
+
+
 def backlog_full(db):
     """Why uploads must wait, or None. Matches pile up here only while the rankings server is not taking
     them; this keeps that pile (and the disk it shares with the website) bounded. Collectors keep what
@@ -858,6 +947,7 @@ def work():
             cleaned = clean_report(report, now)
             if cleaned:
                 take_report(db, platform, now, season, cleaned, g.contributor, ceiling)
+        db.execute("UPDATE contributors SET platform = ? WHERE id = ? AND platform != ?", (platform, g.contributor, platform))
         # A collector names its own account once, so that a server with no players yet has one to start from.
         start = body.get("start")
         if isinstance(start, str) and PUUID_RE.fullmatch(start) and start.strip("0-"):
@@ -1392,6 +1482,7 @@ def cmd_purge(db, args):
         db.execute("INSERT OR IGNORE INTO wanted(platform, game_id) SELECT platform, game_id FROM games "
                    "WHERE contributor_id = ?", who)
         removed = db.execute("DELETE FROM games WHERE contributor_id = ?", who).rowcount
+        db.execute("DELETE FROM contributor_days WHERE contributor_id = ?", who)
     print("Removed %d matches that %s sent. They will be fetched again by other collectors." % (removed, args.name))
 
 
