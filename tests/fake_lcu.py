@@ -3,9 +3,9 @@
 It answers the same addresses the real client does, in the same shapes, over plain
 HTTP on 127.0.0.1. Tests point the collector at it with a lockfile.
 
-Like the real client (measured on one, 25 Nov 2026), it gives as many of a player's matches as its first
-match-list request for them asks for, saves that answer, and gives the saved copy to every later request
-for that player whatever places are asked for: see FakeClient.listed.
+Like the real client (measured on one, 25-27 Nov 2026), it gives the places of a player's list that its first
+match-list request for them asks for, from any place on and LIST_MAX at most, saves that answer, and gives the
+saved copy to every later request for that player whatever places are asked for: see FakeClient.listed.
 """
 
 import base64
@@ -19,6 +19,10 @@ import uuid
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+
+LIST_MAX = 200      # the most matches a client lists in one answer, whatever is asked for (measured on Tencent clients
+                    # and on OC1, 27 Nov 2026)
 
 
 class Clock:
@@ -114,9 +118,10 @@ class FakeClient:
         self.list_hook = None                 # tests set this to change a match-list page: hook(player, page)
         self.delay = lambda path: 0.0         # tests set this: seconds a match-history answer takes. Without a
         self.took = 0.0                       # pretend clock it is really waited; with one, PretendFlights reads it here
-        self.saved = {}                       # player -> the match list saved for them: (first place, match ids, when)
+        self.saved = {}                       # player -> the match list saved for them: (first and last place asked for,
+                                              # match ids, when)
         self.saved_for = 6 * 3600             # seconds a saved list is kept (the real client: 7 minutes at least)
-        self.pages = False                    # True: give any stretch of a list that is asked for, as no real client does
+        self.pages = False                    # True: answer every match-list request afresh, as no real client does
         self.entry_seconds = 0.0              # a match list fetched afresh takes this much longer for every match in it;
         self.saved_seconds = 0.0              # one from the saved copy takes this long
         self.flying = self.most_at_once = 0   # match-history requests being answered right now, and the most there were
@@ -173,8 +178,7 @@ class FakeClient:
         return {game_id for game_id, game in self.games.items() if game["gameMode"] == "CHERRY"}
 
     def listed_arena_ids(self):
-        """The Arena matches among some player's latest 20 matches: all that the real client's lists ever show
-        (asked for older places it answers with the same 20, which this stand-in does not copy)."""
+        """The Arena matches among some player's latest 20 matches."""
         listed = set()
         for ids in self.history.values():
             listed.update(sorted(ids, key=lambda i: -self.games[i]["gameCreation"])[:20])
@@ -190,16 +194,19 @@ class FakeClient:
 
     # -- match lists as the real client gives them -------------------------------
     def listed(self, puuid, begin, end):
-        """What a match-list request is answered with: (the place of the first match, the match ids, whether
-        they come from the saved copy). The first request for a player decides what the client holds for
-        them: it fetches the places asked for, saves them, and answers every later request for that player
-        with that copy, whatever places are asked for."""
+        """What a match-list request is answered with: (the first and the last place the answer says it holds, the
+        match ids, whether they come from the saved copy). The first request for a player decides what the client
+        holds for them, and it may start at any place: it fetches the places asked for, LIST_MAX at most, saves them,
+        and answers every later request for that player with that copy, whatever places are asked for. The answer
+        names the places of the request that made the copy, also when it lists fewer (measured on OC1, 27 Nov 2026:
+        asked for 0-399, it listed 200 and said 0-399; asked for 0-19 and then 20-39, it said 0-19 both times)."""
         now = self.clock.now() if self.clock else time.monotonic()
-        if puuid in self.saved and now - self.saved[puuid][2] < self.saved_for and not self.pages:
-            return self.saved[puuid][:2] + (True,)
-        ids = sorted(self.history.get(puuid, []), key=lambda i: -self.games[i]["gameCreation"])[begin:end + 1]
-        self.saved[puuid] = (begin, ids, now)
-        return begin, ids, False
+        if puuid in self.saved and now - self.saved[puuid][3] < self.saved_for and not self.pages:
+            return self.saved[puuid][:3] + (True,)
+        newest_first = sorted(self.history.get(puuid, []), key=lambda i: -self.games[i]["gameCreation"])
+        ids = newest_first[begin:min(end + 1, begin + LIST_MAX)]
+        self.saved[puuid] = (begin, end, ids, now)
+        return begin, end, ids, False
 
     def forget(self):
         """Drop the saved match lists, as a restart of the client does. (How long the real client keeps
@@ -252,14 +259,13 @@ class FakeClient:
             return self.reply(handler, 200, {"locale": "en_AU", "region": self.platform, "webRegion": "oce"})
         if parts[:4] == ["lol-match-history", "v1", "products", "lol"] and parts[-1] == "matches":
             query = parse_qs(url.query)
-            begin, ids, saved = self.listed(parts[4], int(query["begIndex"][0]), int(query["endIndex"][0]))
+            first, last, ids, saved = self.listed(parts[4], int(query["begIndex"][0]), int(query["endIndex"][0]))
             page = [self.summary(i, parts[4]) for i in ids]
             if self.list_hook:
                 page = self.list_hook(parts[4], page)
             self.wait(self.saved_seconds if saved else self.delay(handler.path) + self.entry_seconds * len(ids))
             return self.reply(handler, 200, {"accountId": 1, "platformId": self.platform, "games": {
-                "gameCount": len(page), "gameIndexBegin": begin, "gameIndexEnd": begin + max(len(ids), 1) - 1,
-                "games": page}})
+                "gameCount": len(page), "gameIndexBegin": first, "gameIndexEnd": last, "games": page}})
         if history:
             self.wait(self.delay(handler.path))
         if parts[:3] == ["lol-match-history", "v1", "games"] and int(parts[3]) in self.games:

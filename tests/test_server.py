@@ -2480,11 +2480,13 @@ class Blocks(SlowAnswers):
         self.assertEqual((list(made.todo), len(self.fake.requests)), ([], before))
         self.assertEqual(made.reports, [{"puuid": self.fake.players[3], "job": "abc", "begin": 20, "asked": 0, "listed": 0,
                                          "ids": [], "newest": 0, "oldest": 0, "took": 0.0, "next": 0, "failed": False}])
-        made.take_work({"games": [], "lease": 900, "players": [          # with a number, the block is read whatever the place
+        made.take_work({"games": [], "lease": 900, "players": [          # with a number, the block is read from the place
             {"puuid": self.fake.players[4], "job": "def", "since": 0, "begin": 20, "pages": 3, "count": 50},
-            {"puuid": self.fake.players[5], "job": "ghi", "since": 0, "begin": 0, "pages": 1, "count": 5000}]})
-        self.assertEqual([read.path.split("?")[1] for read in made.todo],
-                         ["begIndex=0&endIndex=49", "begIndex=0&endIndex=%d" % (collector.MAX_BLOCK - 1)])
+            {"puuid": self.fake.players[5], "job": "ghi", "since": 0, "begin": 0, "pages": 1, "count": 5000},
+            {"puuid": self.fake.players[6], "job": "jkl", "since": 0, "begin": 9500, "pages": 1, "count": 200}]})
+        self.assertEqual([read.path.split("?")[1] for read in made.todo],         # (from 0.3.11; up to 0.3.10 from the top)
+                         ["begIndex=20&endIndex=69", "begIndex=0&endIndex=%d" % (collector.MAX_BLOCK - 1),
+                          "begIndex=0&endIndex=199"])                     # (a place the client cannot be asked for: the top)
 
     def test_an_endpoint_that_names_no_number_gets_twenty_and_no_following_page(self):
         # Collectors and the endpoint are updated at different times: with today's endpoint the new collector must

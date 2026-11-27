@@ -857,8 +857,8 @@ class WorkStub(StubServer):
 
 
 class DeepLists(CollectorCase):
-    """A player's list read as one block of up to MAX_BLOCK matches, which a client can take minutes to answer.
-    The client's answers take pretend time here (PretendFlights)."""
+    """A player's list read as one block of up to MAX_BLOCK matches, which a client can take a minute to answer (it
+    lists 200 at most: fake_lcu.LIST_MAX). The client's answers take pretend time here (PretendFlights)."""
 
     def setUp(self):
         super().setUp()
@@ -866,7 +866,7 @@ class DeepLists(CollectorCase):
         for n in range(1100):                       # a player with a long history: over 1,000 matches
             self.fake.add_game("CLASSIC", 420, [self.heavy, self.fake.players[6]], age_seconds=600 + 60 * n)
         self.fake.delay = lambda path: 0.08
-        self.fake.entry_seconds = 0.25              # the slowest client measured (OC1): a list of 1,000 takes 250 s
+        self.fake.entry_seconds = 0.25              # the slowest client measured (OC1): a list of 200 takes 50 s
 
     def run_with_work(self, minutes, fast=False):
         """Run a collector that ArenaSweats hands the heavy player's whole list (it names more than MAX_BLOCK)."""
@@ -890,6 +890,7 @@ class DeepLists(CollectorCase):
         self.assertEqual((collector.ListRead(self.heavy, 0, 20).timeout, collector.ListRead(self.heavy, 0, 200).timeout,
                           timeout), (20, 83, 360))
         self.assertGreaterEqual(timeout, 1.4 * 1000 * self.fake.entry_seconds)     # room to spare on the slowest client
+        self.assertGreaterEqual(collector.ListRead(self.heavy, 0, 200).timeout, 1.4 * 200 * self.fake.entry_seconds)
         for fast in (False, True):
             self.fake.forget()
             self.fake.requests.clear()
@@ -900,7 +901,7 @@ class DeepLists(CollectorCase):
                                                   % self.heavy])        # one request for all of it
             (report,) = [report for _, report in self.server.reports if report["puuid"] == self.heavy]
             self.assertEqual((report["asked"], report["listed"], report["failed"], report["took"]),
-                             (1000, 1000, False, 250.08))
+                             (1000, 200, False, 50.08))                 # (no client lists more than 200)
             self.assertEqual((made.stats["failed"], made.failures, made.fast_on), (0, 0, fast))
             self.assertFalse([line for line in self.logs.output if "down to" in line or "rests for an hour" in line])
             self.assertNotIn("struggling", self.output.getvalue())
@@ -908,16 +909,16 @@ class DeepLists(CollectorCase):
     def test_a_game_that_starts_while_a_long_list_is_on_its_way_stops_everything(self):
         # Why: "never while you play" is the collector's first promise, and a list of 1,000 is on its way for minutes.
         start = self.clock.now()
-        self.clock.at(start + 60, lambda: setattr(self.fake, "phase", "ChampSelect"))     # the list takes 250 s
+        self.clock.at(start + 30, lambda: setattr(self.fake, "phase", "ChampSelect"))     # the list takes 50 s
         self.clock.at(start + 600, lambda: setattr(self.fake, "phase", "None"))
         self.run_with_work(15, fast=True)
         times = [when - start for _, _, when in history(self.fake.requests)]
-        self.assertFalse([when for when in times if 60 + 5 <= when < 600 + collector.RESUME_GRACE - 5])
+        self.assertFalse([when for when in times if 30 + 5 <= when < 600 + collector.RESUME_GRACE - 5])
         self.assertEqual(len(self.heavy_lists()), 2)            # dropped unanswered, then asked again after the game
         reports = [(when - start, report) for when, report in self.server.reports if report["puuid"] == self.heavy]
         self.assertEqual(len(reports), 1)                       # the first answer was not taken in:
         self.assertGreater(reports[0][0], 600)
-        self.assertEqual((reports[0][1]["listed"], reports[0][1]["failed"]), (1000, False))
+        self.assertEqual((reports[0][1]["listed"], reports[0][1]["failed"]), (200, False))
 
     def test_fast_mode_holds_lists_by_the_matches_in_them_not_by_their_number(self):
         # Why: work held longer than its time is handed to another collector as well, so deep lists must not be taken
@@ -934,6 +935,88 @@ class DeepLists(CollectorCase):
         self.assertEqual(hold(4, 200, matches=10), (6, True))        # lists of 200, as before
         self.assertEqual(hold(10, 200), (0, True))
         self.assertEqual(made.work_request()["lists"], 0)
+
+
+class Windows(CollectorCase):
+    """From 0.3.11 a list is read from the place ArenaSweats names ("begin"), so that places further down a list than
+    its latest 200 can be read. A client's first request for a player may start at any place and lists 200 at most;
+    every later request for that player gets the copy that request made, and the answer says which places it holds
+    (measured on OC1, 27 Nov 2026; fake_lcu copies it)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.close()
+        self.fake = FakeClient(players=30, arena=400, other=5, clock=self.clock)    # lists of about 260 matches
+        self.fake.write_lockfile(self.league_dir)
+        self.made = self.collector(server=StubServer())
+        self.made.lcu = collector.read_lockfile(os.path.join(self.league_dir, "lockfile"))
+
+    def places(self, puuid, first, last):
+        """The match ids at those places of a player's list (0: the latest)."""
+        return sorted(self.fake.history[puuid], key=lambda i: -self.fake.games[i]["gameCreation"])[first:last + 1]
+
+    def read(self, puuid, begin, count, data=None):
+        """Hand the collector one list to read, from `begin`, as ArenaSweats does; read it and return (the address
+        asked for, the report). `data`: the client's answer instead of asking it."""
+        self.made.take_work({"games": [], "lease": 900, "players": [
+            {"puuid": puuid, "job": "j%d" % begin, "since": 0, "begin": begin, "pages": 1, "count": count}]})
+        read = self.made.todo.pop()
+        self.made.take_list(read, data if data is not None else self.made.lcu.get(read.path, read.timeout)[1])
+        self.made.report_list(read)
+        return read.path.split("?")[1], self.made.reports[-1]
+
+    def test_the_fake_client_answers_as_a_real_one_was_measured(self):
+        # Why: every test of reading from a place relies on this stand-in giving what a real client gave, copy and all.
+        a, b, c = self.fake.players[1:4]
+        get = lambda puuid, first, last: self.made.lcu.get(
+            "/lol-match-history/v1/products/lol/%s/matches?begIndex=%d&endIndex=%d" % (puuid, first, last))[1]["games"]
+        answer = get(a, 0, 399)                                           # asked for 400: lists 200, says 0-399
+        self.assertEqual((answer["gameIndexBegin"], answer["gameIndexEnd"], answer["gameCount"]), (0, 399, 200))
+        answer = get(b, 200, 399)                                         # a first request may start anywhere
+        self.assertEqual([game["gameId"] for game in answer["games"]], self.places(b, 200, 399))
+        again = get(b, 0, 199)                                            # later ones get the copy, as it was
+        self.assertEqual((again["gameIndexBegin"], again["gameIndexEnd"], again["games"]),
+                         (200, 399, answer["games"]))
+        self.assertEqual(get(c, 0, 19)["games"], get(c, 20, 39)["games"])
+
+    def test_a_list_is_read_from_the_place_named_and_its_places_are_reported(self):
+        # Why: ArenaSweats moves a list's next window on by these reports; places misread or misreported would skip
+        # matches for good, or read the same ones again for nothing.
+        puuid = self.fake.players[4]
+        length = len(self.fake.history[puuid])
+        self.assertTrue(220 < length < 400, length)
+        path, report = self.read(puuid, 200, 200)
+        self.assertEqual(path, "begIndex=200&endIndex=399")
+        listed = [self.fake.games[i] for i in self.places(puuid, 200, 399)]
+        self.assertEqual((report["begin"], report["asked"], report["listed"], report["window"], report["cached"]),
+                         (200, 200, length - 200, [200, 399], False))
+        self.assertEqual(report["oldest"], listed[-1]["gameCreation"])
+        self.assertEqual(sorted(report["ids"]), sorted(g["gameId"] for g in listed if g["gameMode"] == "CHERRY"))
+        self.assertEqual(report["next"], 0)                               # fewer than asked: the list's end
+        path, report = self.read(self.fake.players[5], 0, 200)            # from the top, as before
+        self.assertEqual((path, report["window"], report["cached"], report["listed"]),
+                         ("begIndex=0&endIndex=199", [0, 199], False, 200))
+        self.assertEqual(self.made.work_request()["windows"], 1)          # and ArenaSweats is told it reads from a place
+
+    def test_an_answer_from_the_clients_copy_of_other_places_is_reported_as_such(self):
+        # Why: the client answers every request after the first for a player with that first one's copy; taken for the
+        # places asked for, a window would be marked read that never was, and its matches never collected.
+        puuid = self.fake.players[6]
+        self.read(puuid, 0, 200)                                          # this client now holds places 0-199
+        top = self.places(puuid, 0, 199)
+        _, report = self.read(puuid, 200, 200)
+        self.assertEqual((report["window"], report["cached"], report["listed"], report["next"]), ([0, 199], True, 200, 0))
+        self.assertEqual(sorted(report["ids"]), sorted(i for i in top if self.fake.games[i]["gameMode"] == "CHERRY"))
+        self.assertEqual(self.read(puuid, 0, 40)[1]["cached"], True)      # more places than asked for: the copy too
+        other = self.fake.players[7]
+        self.read(other, 0, 20)
+        self.assertEqual(self.read(other, 0, 200)[1]["cached"], False)    # fewer, from the same place: maybe the list's
+        # end, as before (that copy is told by how fast it came)
+        games = [self.fake.summary(i, puuid) for i in top[:3]]            # an answer that does not say its places:
+        self.assertEqual(self.read(puuid, 0, 200, {"games": {"games": games}})[1]["window"], [0, -1])
+        self.assertEqual(self.read(puuid, 0, 200, {"games": {"games": games}})[1]["cached"], False)   # from the top, as
+        self.assertEqual(self.read(puuid, 200, 200, {"games": {"games": games}})[1]["cached"], True)  # before; further
+        # down, nobody can tell it holds those places, so it is not taken for them
 
 
 class AdminRights(CollectorCase):

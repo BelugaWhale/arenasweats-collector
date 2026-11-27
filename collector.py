@@ -116,11 +116,14 @@ FAST_PLACES = 2000     # this many matches in all (a list of 1,000 takes a Chine
                        # FAST_LISTS, none while it holds lists of FAST_PLACES matches (ArenaSweats decides how many
                        # it hands out),
 FAST_WORK_SECONDS = 3  # and asks at most this often (the normal pace: WORK_SECONDS)
-# A player's match list is read in ONE request, for their latest N matches. The client gives as many as its first
-# request for a player asks for, and answers every later request for that player from the copy it saved then,
-# whatever places are asked for (measured on a real client, 25 Nov 2026). So a list cannot be read page by page.
+# A player's match list is read in ONE request, for N of their matches from a place ArenaSweats names ("begin": 0 is
+# the latest). The client gives the places its first request for a player asks for (200 at most), and answers every
+# later request for that player from the copy it saved then, whatever places are asked for, saying which places its
+# copy holds (measured on a real client, 25-27 Nov 2026). So a list cannot be read page by page, and an answer whose
+# places are not the ones asked for is that copy (see take_list).
 LIST_SIZE = 20         # N when ArenaSweats names no number (an older ArenaSweats)
 MAX_BLOCK = 1000       # the largest N this collector reads, whatever ArenaSweats asks for ("count")
+MAX_BEGIN = 9000       # the furthest place a read may start at (the client's addresses take places up to 9999)
 OWN_BLOCK = 100        # N when the collector decides for itself (a test run)
 LCU_SECONDS = 20       # longest wait for the client's answer. A list of more than LIST_SIZE matches gets
 LIST_ENTRY_SECONDS = 0.35   # this much longer for every further match (measured: about 0.08 s each on Chinese clients,
@@ -1105,14 +1108,15 @@ def request_kind(path):
 
 
 class ListRead:
-    """One read of a player's match list: their latest `count` matches, asked for in one request (see
-    LIST_SIZE). The Arena matches among them that are newer than `since` (ms) are what it is for.
+    """One read of a player's match list: `count` matches from place `begin` on (0: their latest), asked for in one
+    request (see LIST_SIZE). The Arena matches among them that are newer than `since` (ms) are what it is for.
     Collector.take_list takes in the client's answer."""
     kind = "list"
 
-    def __init__(self, puuid, since, count=LIST_SIZE):
-        self.puuid, self.since, self.count = puuid, since, count
-        self.path = "/lol-match-history/v1/products/lol/%s/matches?begIndex=0&endIndex=%d" % (puuid, count - 1)
+    def __init__(self, puuid, since, count=LIST_SIZE, begin=0):
+        self.puuid, self.since, self.count, self.begin = puuid, since, count, begin
+        self.path = "/lol-match-history/v1/products/lol/%s/matches?begIndex=%d&endIndex=%d" % (
+            puuid, begin, begin + count - 1)
         self.timeout = min(LCU_SECONDS_MAX, LCU_SECONDS + LIST_ENTRY_SECONDS * max(0, count - LIST_SIZE))
         self.took = 0.0                 # seconds the client took to answer
         self.complete = True            # the request worked
@@ -1120,10 +1124,13 @@ class ListRead:
         self.arena, self.newest, self.oldest = [], 0, 0     # the Arena matches newer than `since`; the newest match
                                         # newer than `since` and the oldest match listed (when they began, ms)
         self.more = False               # the list may go on beyond what was asked for
+        self.window = (0, -1)           # the first and last place the client says its answer holds (0, -1: it does not say)
+        self.cached = False             # the answer was the client's copy of other places, saved by an earlier request
 
     def fail(self):
         """The read did not work: nothing it found counts, and it is tried again another time."""
         self.complete, self.listed, self.arena, self.newest, self.oldest, self.more = False, 0, [], 0, 0, False
+        self.window, self.cached = (0, -1), False
 
 
 class MatchFetch:
@@ -2204,12 +2211,16 @@ class Collector:
         matches newer than `since` it showed and the newest of those matches, how many matches were asked
         for and how many the client listed, when the oldest of them began, how long the client took, and
         the place the list may go on from (only when ArenaSweats said how many to ask for: otherwise it
-        would hand out a following page, which the client cannot give)."""
+        would hand out a following page, which the client cannot give). When ArenaSweats said how many, also
+        the places the client said its answer holds, and whether that was its copy of other places than the
+        ones asked for: then what it listed is not those places (its Arena matches are real all the same)."""
         self.stats["players"] += 1
         self.reports.append({"puuid": read.puuid, "ids": [match_id(game) for game in read.arena], "newest": read.newest,
                              "begin": read.begin, "next": read.count if read.more and read.named else 0,
                              "failed": not read.complete, "job": read.token, "asked": read.count,
                              "listed": read.listed, "oldest": read.oldest, "took": round(read.took, 2)})
+        if read.named:
+            self.reports[-1].update(window=list(read.window), cached=read.cached)
 
     def adjust_flight(self, kind, awaited):
         """After a good answer: one fewer at once when answers of its kind have become slower with others
@@ -2267,9 +2278,10 @@ class Collector:
 
     def work_request(self, more=True):
         """What a request for work says: the match-list reports that are waiting, whether more work is wanted,
-        the largest list this collector reads in one request and, in fast mode, how many lists it has room for."""
+        the largest list this collector reads in one request, that it reads a list from the place it is told
+        ("windows"; up to 0.3.10 from the top whatever the place) and, in fast mode, how many lists it has room for."""
         request = {"version": VERSION, "platform": self.platform, "reports": self.reports[:MAX_WORK_PLAYERS],
-                   "more": more, "block": MAX_BLOCK}
+                   "more": more, "block": MAX_BLOCK, "windows": 1}
         if not self.introduced:         # a server that knows no players yet starts from this account's list
             request["start"] = self.me
         if more and self.fast_on:
@@ -2325,14 +2337,14 @@ class Collector:
                 good = isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
                 return value if good else default
             if isinstance(item.get("puuid"), str) and PUUID_RE.fullmatch(item["puuid"]):
-                # "count": how many of the player's latest matches to ask for, in one request. An older
-                # ArenaSweats names a place and pages instead: its first page is read as LIST_SIZE matches.
-                count = number("count", 1, 10000, None)
+                # "count": how many of the player's matches to ask for, in one request, from place "begin" on. An
+                # older ArenaSweats names a place and pages instead: its first page is read as LIST_SIZE matches.
+                count, begin = number("count", 1, 10000, None), number("begin", 0, MAX_BEGIN, 0)
                 read = ListRead(item["puuid"], max(number("since", 0, 2 ** 53, 0), self.season_start),
-                                min(count or LIST_SIZE, MAX_BLOCK))
+                                min(count or LIST_SIZE, MAX_BLOCK), begin if count else 0)
                 job = item.get("job")
                 read.token = job[:64] if isinstance(job, str) else None
-                read.begin, read.named = number("begin", 0, 10000, 0), bool(count)
+                read.begin, read.named = begin, bool(count)
                 if read.begin and not read.named:
                     # An older ArenaSweats asking for a following page. The client would only give its saved
                     # first page again, so nothing is asked of it: the report says that the list ends here.
@@ -2481,7 +2493,17 @@ class Collector:
         fresh = [game for game in games if created_ms(game) is None or created_ms(game) > read.since]
         read.arena = [game for game in fresh if is_arena(game) and match_id(game)]
         saved = bool(games) and read.took < SAVED_SECONDS
+        # Which places the answer holds, as the client says: those its first request for the player asked for. Other
+        # places than the ones asked for (another first place, or more of them) are its copy from an earlier request.
+        # (Fewer from the same first place may be the list's end.) One that does not say counts as places 0 on.
+        said = as_dict(as_dict(data).get("games"))
+        first, last = said.get("gameIndexBegin"), said.get("gameIndexEnd")
+        if all(isinstance(value, int) and not isinstance(value, bool) for value in (first, last)):
+            read.window = (first, last)
+        read.cached = read.window[0] != read.begin or read.window[1] > read.begin + read.count - 1
         log.info("  %d of %d matches listed%s, %d newer than %s, %d of those Arena", len(games), read.count,
+                 " (the client's copy of places %d-%d, asked for %d-%d)" % (
+                     read.window + (read.begin, read.begin + read.count - 1)) if read.cached and read.named else
                  " (from the client's saved copy)" if saved else "", len(fresh),
                  time.strftime("%Y-%m-%d %H:%M", time.gmtime(read.since / 1000)), len(read.arena))
         for game in fresh:
@@ -2490,7 +2512,7 @@ class Collector:
         read.listed = len(games)
         read.oldest = min((created_ms(game) for game in games if created_ms(game)), default=0)
         # Fewer than asked for: the end of the list (or a smaller saved copy). One too old: `since` is reached.
-        read.more = len(games) >= read.count and len(fresh) == len(games)
+        read.more = len(games) >= read.count and len(fresh) == len(games) and not read.cached
         times = self.pace_lists.setdefault(read.count, [[], 0, 0])      # for pace_report
         if saved:
             times[2] += 1
