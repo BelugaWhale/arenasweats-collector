@@ -81,7 +81,7 @@ import zipfile
 import zlib
 from collections import Counter, deque, namedtuple
 
-VERSION = "0.3.10"
+VERSION = "0.3.11"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
 KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
