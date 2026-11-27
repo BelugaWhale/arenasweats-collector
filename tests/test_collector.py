@@ -684,6 +684,15 @@ class PlainLcu(collector.Lcu):
         super().__init__(port, token, "http")
 
 
+class ProgramList(unittest.TestCase):
+    def test_a_size_far_beyond_the_real_list_is_not_asked_for(self):
+        # Why: on some PCs Windows answered with a size the collector could not reserve, and it crashed with MemoryError.
+        self.assertEqual(collector.next_table_size(1 << 20, 3 << 20), (3 << 20) + (1 << 16))
+        self.assertEqual(collector.next_table_size(1 << 20, 100), 2 << 20)
+        self.assertIsNone(collector.next_table_size(1 << 20, 0xFFFFFFF0))
+        self.assertIsNone(collector.next_table_size(collector.TABLE_MAX_BYTES, 100))
+
+
 class ClientPrograms(CollectorCase):
     """The Tencent client: its lockfile is empty, so the port and password come from
     LeagueClientUx's command line. Windows' list of running programs is pretend here."""

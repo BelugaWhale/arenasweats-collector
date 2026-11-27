@@ -81,7 +81,7 @@ import zipfile
 import zlib
 from collections import Counter, deque, namedtuple
 
-VERSION = "0.3.9"
+VERSION = "0.3.10"
 DEFAULT_SERVER = "https://arenasweats.lol/collector"   # where matches go unless told otherwise
 KEY_RE = re.compile(r"as_[A-Za-z0-9_-]{20,100}")
 
@@ -395,6 +395,16 @@ def query_program(pid, command_line=False):
 
 Running = namedtuple("Running", "pid name started memory private handles")
 _table_api = None
+TABLE_MAX_BYTES = 64 << 20      # the list of running programs is a few hundred KB to a few MB; never ask for more than this
+
+
+def next_table_size(size, needed):
+    """The buffer to try next for Windows' list of running programs, after `size` bytes did not fit and Windows said
+    it needs `needed`; None when that is more than TABLE_MAX_BYTES. Some PCs answer with a size far beyond the real
+    list (collectors crashed with MemoryError asking for it, 26-27 Nov 2026): the list is then left out, as when
+    Windows will not give it, and the client is still found in the other ways."""
+    wanted = max(size * 2, needed + (1 << 16))
+    return wanted if wanted <= TABLE_MAX_BYTES else None
 
 
 def process_table():
@@ -437,8 +447,11 @@ def process_table():
         status = nt.NtQuerySystemInformation(5, buffer, size, ctypes.byref(needed)) & 0xFFFFFFFF  # 5 = programs
         if status != 0xC0000004:            # 0xC0000004 = the list did not fit: try a bigger buffer
             break
-        size = max(size * 2, needed.value + (1 << 16))
+        size = next_table_size(size, needed.value)
+        if size is None:
+            break
     if status != 0:
+        note("program list", "Windows did not give it (status %#x, asked for %d bytes)" % (status, needed.value))
         return {}
     table, offset, start = {}, 0, ctypes.addressof(buffer)
     while offset + ctypes.sizeof(Info) <= size:
