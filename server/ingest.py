@@ -1120,9 +1120,10 @@ def worths(db, platform, now):
     matches, with the matches a day (all modes) of their band (see list_rates), the read reaches back LIST_CAP / that
     many days (to the season's start at most); their Arena matches a day are judged as `games` spread over the season
     as it is held (see held_shares), but at most ARENA_SHARE of all their matches; and of the days it reaches back, each
-    counts for the share of it not held. Checked on the reads of 25-27 Nov 2026 (HN1, HN10), whose players' paces are
-    known: that judges their new Arena matches at 6-41 a read where 5-39 were found (and the share of the day not held
-    is what moves it: a heavy player's 200 matches reach back 12-18 days, which were 91-100% held on 27 Nov).
+    counts for the share of it not held. Checked on the reads of 25-27 Nov 2026 (HN1, HN10), from each read player's
+    own pace: 6-41 new Arena matches a read where 5-39 were found; from their held matches alone, up to twice that.
+    (How far back a read reaches is what moves it: a heavy player's 200 matches reached back 12-18 days, which were
+    91-100% held on 27 Nov.)
     Returns {"order": [(worth, games, players)], the most worth first; "held_days": the season's days as held}, judged
     again every FIT_SECONDS: one pass over the index of these players (about 0.1 s for 350,000)."""
     def judge():
