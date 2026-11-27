@@ -735,10 +735,19 @@ class Work(ServerCase):
             "EXPLAIN QUERY PLAN " + ingest.FIRST_READS_OF, ("OC1",) + (0,) * 6)))     # (one number of held matches)
         for sql in ("SELECT platform, games, pace FROM players INDEXED BY players_paced WHERE pace > 0",
                     "SELECT games, COUNT(*) FROM players INDEXED BY players_back WHERE platform = 'OC1' AND back = 0 "
-                    "GROUP BY games"):
+                    "GROUP BY games",
+                    "SELECT deep_key, COUNT(*), AVG(deep_pace), AVG(games) FROM players INDEXED BY players_deep "
+                    "WHERE platform = 'OC1' AND deep > 0 GROUP BY deep_key"):
             plan = " ".join(row[3] for row in self.db.execute("EXPLAIN QUERY PLAN " + sql))
-            self.assertRegex(plan, "COVERING INDEX players_(paced|back)")  # (judging which lists are worth most reads
-            self.assertNotIn("B-TREE", plan)                              # only an index, outside the write lock)
+            self.assertRegex(plan, "COVERING INDEX players_(paced|back|deep)")    # (judging which lists are worth most
+            self.assertNotIn("B-TREE", plan)                              # reads only an index, outside the write lock)
+        # A deeper window: one window key's players, each checked against the installs holding a copy of its list.
+        plan = " | ".join(row[3] for row in self.db.execute("EXPLAIN QUERY PLAN " + ingest.DEEPER_OF,
+                                                             ("OC1",) + (0,) * (ingest.DEEPER_OF.count("?") - 1)))
+        self.assertRegex(plan, r"^SEARCH players USING INDEX players_deep \(platform=\? AND deep_key=\?\)")
+        self.assertIn("SEARCH c USING INDEX sqlite_autoindex_copies_1 (platform=? AND puuid=? AND contributor_id=?)", plan)
+        self.assertNotIn("SCAN", plan)
+        self.assertNotIn("B-TREE", plan)
 
     def test_a_database_from_the_version_before_carries_on(self):
         # The live database holds 300,000 players and 200,000 lists waiting: the change-over must lose none of that
@@ -1179,6 +1188,283 @@ class ListsInOneRequest(ServerCase):
         again = self.handed(self.PLAYER)
         self.work([self.report(again, [], read_to=int(self.now * 1000) - 5)], more=False)   # a newer match: afresh
         self.assertEqual(self.player(self.PLAYER)[2], int(self.now))
+
+
+class DeeperWindows(ServerCase):
+    """Deeper windows (collectors from 0.3.11 on): the places of a list after what its first read in one request
+    listed. A client lists 200 at most, but its first request for a player may start at any place, and every later
+    request for that player gets the copy it made (measured on OC1, 27 Nov 2026). So another install than the ones that
+    read the list is asked for places 200-399, then 400-599 ..., until a window reaches the season's start."""
+
+    PLAYER = "33333333-4444-5555-6666-777777777777"
+    DAY = 86400
+
+    def setUp(self):
+        super().setUp()
+        self.keys = {"alice": self.key, "bob": self.add_key("bob"), "carol": self.add_key("carol")}
+        self.days = (self.now - self.season / 1000) / self.DAY           # since the season began
+
+    def ms(self, days_ago):
+        return int((self.now - days_ago * self.DAY) * 1000)
+
+    def ask(self, who, puuid=None, windows=1):
+        """Hand `who` (from 0.3.11 on, unless `windows` is None) work with only this player's list waiting (the others
+        are held back for this one request); return the hand-out of it or None. (Which windows are worth most is
+        judged again first.)"""
+        ingest.fits.clear()
+        others = self.db.execute("SELECT puuid FROM players WHERE puuid != ? AND leased_until < ?",
+                                 (puuid or self.PLAYER, int(self.now))).fetchall()
+        self.db.executemany("UPDATE players SET leased_until = ? WHERE puuid = ?", [(int(self.now) + 5, p) for p, in others])
+        self.db.commit()
+        extra = {"windows": windows} if windows else {}
+        answer = self.work(key=self.keys[who], block=1000, **extra)
+        self.db.executemany("UPDATE players SET leased_until = 0 WHERE puuid = ?", others)
+        self.db.commit()
+        return self.item(answer, puuid or self.PLAYER)
+
+    def read(self, who, item, ids=(), listed=None, oldest_days=1.0, took=17.0, cached=False, complete=True, window=None):
+        """`who` reports the read of `item`: `listed` matches going back `oldest_days`; `cached`: the client's copy of
+        other places (`window`; by default 0-199)."""
+        listed = item["count"] if listed is None else listed
+        asked = [item["begin"], item["begin"] + item["count"] - 1]
+        report = {"puuid": item["puuid"], "job": item["job"], "ids": list(ids), "failed": not complete, "next": 0,
+                  "begin": item["begin"], "newest": self.ms(1), "asked": item["count"], "listed": listed,
+                  "oldest": self.ms(oldest_days) if listed else 0, "took": took, "cached": cached,
+                  "window": window or ([0, 199] if cached else asked)}
+        return self.work([report], more=False, key=self.keys[who], block=1000, windows=1)
+
+    def first(self, who="alice", puuid=None, games=10, **answer):
+        """A first read in one request of a player's list by `who`, reported with `answer`."""
+        self.db.execute("INSERT INTO players(platform, puuid, games, due_at) VALUES('OC1', ?, ?, 0)",
+                        (puuid or self.PLAYER, games))
+        self.db.commit()
+        item = self.ask(who, puuid)
+        self.assertEqual((item["begin"], item["count"]), (0, 200))
+        self.read(who, item, **answer)
+        return item
+
+    def deep(self, puuid=None):
+        return self.db.execute("SELECT deep, deep_to, deep_pace, deep_fails, deep_due, back FROM players WHERE puuid = ?",
+                               (puuid or self.PLAYER,)).fetchone()
+
+    def counts(self, begin=200):
+        return self.db.execute("SELECT handed, failed, copied, ignored, fresh, new, short, listed, reached FROM deep_days "
+                               "WHERE begin = ?", (begin,)).fetchone()
+
+    def test_a_list_is_read_down_window_by_window_to_the_seasons_start(self):
+        # Why: the matches of early October are mostly in places 200 and further down heavy players' lists; a window
+        # handed to the wrong install, or moved on wrongly, would skip them for good or cost volunteers reads for nothing.
+        self.first(listed=200, oldest_days=10)                            # 200 matches in 10 days, not to the start
+        self.assertEqual(self.deep(), (200, self.ms(10), 10 * self.DAY // 200, 0, int(self.now), 2))
+        self.assertIsNone(self.ask("bob", windows=None))                  # not to a collector up to 0.3.10,
+        self.assertIsNone(self.ask("alice"))                              # nor to the install that read it
+        window = self.ask("bob")
+        self.assertEqual({name: window[name] for name in ("begin", "count", "since")},
+                         {"begin": 200, "count": 200, "since": self.season})
+        self.read("bob", window, ids=[801, 802], oldest_days=25)          # places 200-399: 15 days further back
+        self.assertEqual(self.deep(), (400, self.ms(25), 15 * self.DAY // 200, 0, int(self.now), 2))
+        self.assertEqual(self.count("wanted"), 2)
+        self.assertIsNone(self.ask("bob"))                                # both clients hold a copy now: the next one
+        self.assertIsNone(self.ask("alice"))                              # goes to a third
+        window = self.ask("carol")
+        self.assertEqual((window["begin"], window["count"]), (400, 200))
+        self.read("carol", window, ids=[803], oldest_days=self.days + 2)  # it reaches the season's start
+        self.assertEqual(self.deep()[0::5], (0, 1))                       # seen back to it: no more windows
+        self.assertEqual(self.counts(200), (1, 0, 0, 0, 1, 2, 0, 200, 0))
+        self.assertEqual(self.counts(400), (1, 0, 0, 0, 1, 1, 0, 200, 1))
+        self.assertEqual(self.db.execute("SELECT SUM(pages) FROM read_days").fetchone()[0], 1)   # (only the first read
+        self.assertEqual(self.db.execute("SELECT SUM(handed) FROM size_days").fetchone()[0], 1)  # counts as a list)
+
+    def test_windows_follow_only_full_first_reads_and_end_at_the_lists_end(self):
+        # Why: a window after a list's end or past the season's start costs a volunteer's client a read for nothing.
+        self.first(puuid="a" * 36, listed=137, oldest_days=10)            # fewer than asked: the list ends there
+        self.first(puuid="b" * 36, listed=200, oldest_days=self.days + 1)   # to the season's start already
+        self.first(puuid="c" * 36, listed=200, oldest_days=8)
+        self.first(puuid="d" * 36, listed=200, oldest_days=8)
+        self.assertEqual([self.deep(p * 36)[0] for p in "abcd"], [0, 0, 200, 200])
+        self.read("bob", self.ask("bob", "c" * 36), listed=80, oldest_days=20)    # 80 of 200: the end
+        self.read("bob", self.ask("bob", "d" * 36), listed=0)            # nothing there at all: the end too
+        self.assertEqual([self.deep(p * 36)[0::5] for p in "cd"], [(0, 2), (0, 2)])
+        self.assertEqual(self.counts(200)[4:7], (2, 0, 2))                # both read; both short of what was asked
+        self.first(puuid="e" * 36, listed=200, oldest_days=8)
+        self.db.execute("UPDATE players SET deep = ? WHERE puuid = ?", (ingest.MAX_DEPTH, "e" * 36))
+        self.db.commit()
+        self.read("bob", self.ask("bob", "e" * 36), listed=200, oldest_days=30)   # as deep as windows go
+        self.assertEqual(self.deep("e" * 36)[0], 0)
+        self.assertIsNone(self.ask("carol", "e" * 36))
+
+    def test_a_window_answered_from_a_copy_goes_to_another_install_and_costs_the_list_nothing(self):
+        # Why: the client answers from its copy whenever it read the player before (how long it keeps one is not
+        # known); taken for a read, that window would be skipped, and held against the list it would wait for days.
+        self.first(listed=200, oldest_days=10)
+        window = self.ask("bob")
+        self.read("bob", window, ids=[811, 812], listed=200, oldest_days=10, took=0.05, cached=True)   # places 0-199
+        self.assertEqual(self.deep()[0], 200)                             # no read,
+        self.assertEqual(self.deep()[3:5], (0, int(self.now)))            # nothing held against it,
+        self.assertEqual(self.count("wanted"), 2)                         # what it showed is wanted all the same,
+        self.assertIsNone(self.ask("bob"))                                # not to bob again,
+        again = self.ask("carol")                                         # to another at once
+        self.assertEqual(again["begin"], 200)
+        self.assertEqual(self.counts(200)[:5], (2, 0, 1, 0, 0))
+        # A copy of other places than those asked for is no read of a list's top either (0.3.11 says so).
+        self.db.execute("UPDATE players SET due_at = 0, leased_until = 0")
+        self.db.commit()
+        before = self.db.execute("SELECT checked_at, read_to FROM players WHERE puuid = ?", (self.PLAYER,)).fetchone()
+        top = self.handed(self.PLAYER, key=self.keys["alice"], block=1000, windows=1)
+        self.assertEqual(top["begin"], 0)
+        self.read("alice", top, listed=200, oldest_days=20, took=0.04, cached=True, window=[200, 399])
+        self.assertEqual(self.db.execute("SELECT checked_at, read_to FROM players WHERE puuid = ?", (self.PLAYER,))
+                         .fetchone(), before)
+        self.assertEqual(self.db.execute("SELECT SUM(saved) FROM read_days").fetchone()[0], 1)
+        # A slow answer is fetched afresh whatever places it names (how a Tencent client names them is not measured).
+        self.now += ingest.RETRY_SECONDS + 1
+        self.db.execute("UPDATE players SET due_at = 0, leased_until = 0")
+        self.db.commit()
+        top = self.handed(self.PLAYER, key=self.keys["alice"], block=1000, windows=1)
+        self.read("alice", top, listed=top["count"], oldest_days=2, took=4.0, cached=True, window=[0, 199])
+        self.assertEqual(self.db.execute("SELECT checked_at FROM players WHERE puuid = ?", (self.PLAYER,)).fetchone(),
+                         (int(self.now),))
+
+    def test_a_window_the_client_did_not_start_where_asked_waits_like_a_failure(self):
+        # Why: whether Tencent's client starts where it is asked is not measured; if it does not, each such answer cost
+        # a full read, so it must not come straight back, and must never be taken for the places asked for.
+        self.first(listed=200, oldest_days=10)
+        reached = self.deep()[1]
+        self.read("bob", self.ask("bob"), ids=[821], listed=200, oldest_days=10, took=17.0, cached=True)  # fetched,
+        self.assertEqual(self.deep()[0], 200)                             # but places 0-199
+        self.assertEqual(self.deep()[3:5], (1, int(self.now) + ingest.RETRY_SECONDS))
+        self.assertIsNone(self.ask("carol"))                              # not before its wait
+        self.now += ingest.RETRY_SECONDS + 1
+        window = self.ask("carol")
+        self.read("carol", window, listed=200, oldest_days=6)             # the places asked for, but newer than the
+        self.assertEqual(self.deep()[:4], (200, reached, 10 * self.DAY // 200, 2))      # first read reached
+        self.assertEqual(self.deep()[4], int(self.now) + 2 * ingest.RETRY_SECONDS)
+        self.assertEqual(self.counts(200)[1:5], (0, 0, 2, 0))
+        self.assertEqual(self.db.execute("SELECT same_first FROM deep_days").fetchone()[0], 0)
+        self.now += 2 * ingest.RETRY_SECONDS + 1
+        self.keys["dave"] = self.add_key("dave")                          # (the other three hold copies now)
+        self.read("dave", self.ask("dave"), complete=False)               # a failure waits the same way
+        self.assertEqual(self.deep()[3:5], (3, int(self.now) + 4 * ingest.RETRY_SECONDS))
+        self.now += 4 * ingest.RETRY_SECONDS + 1
+        self.read("dave", self.ask("dave"), cached=True, window=[200, 400])   # its first place right, its last not:
+        self.assertEqual(self.deep()[3], 4)                               # counted apart, as that may be how a client
+        self.assertEqual(self.db.execute("SELECT same_first FROM deep_days").fetchone()[0], 1)    # names its places
+        self.db.execute("DELETE FROM copies")
+        self.now += 8 * ingest.RETRY_SECONDS + 1
+        self.read("dave", self.ask("dave"), listed=200, oldest_days=20)   # (a failed read leaves no copy); a good read
+        self.assertEqual(self.deep()[0::3], (400, 0))                     # starts the count afresh
+
+    def test_windows_stop_on_a_server_where_most_answers_are_not_the_places_asked_for(self):
+        # Why: if Tencent's client does not start where it is asked, or keeps copies long, every window would cost
+        # volunteers' clients a read for nothing until someone noticed; this stops it by itself and says so.
+        self.first(listed=200, oldest_days=10)
+        today = utc_date(self.now)
+        for platform, fresh, copied, ignored in (("OC1", 9, 6, 6), ("HN1", 1, 10, 8)):
+            self.db.execute("INSERT INTO deep_days(day, platform, begin, fresh, copied, ignored) VALUES(?, ?, 200, ?, ?, ?)",
+                            (today, platform, fresh, copied, ignored))
+        self.db.commit()
+        self.assertEqual(ingest.deeper_state(self.db, "OC1", int(self.now)), "stopped")    # 12 of 21: more than half
+        self.assertEqual(ingest.deeper_state(self.db, "HN1", int(self.now)), "on")         # 18 of 19: too few to tell
+        self.assertIsNone(self.ask("bob"))
+        self.assertIn("deeper windows (the places of a list after what its first read listed): STOPPED on this server",
+                      self.admin("stats"))
+        self.assertEqual(json.loads(self.relay("status"))["reads"]["OC1"]["deeper"]["state"], "stopped")
+        self.now += 2 * self.DAY                                          # once those days have passed, they go out
+        self.assertEqual(self.ask("bob")["begin"], 200)                   # again
+        self.db.execute("UPDATE players SET leased_until = 0")
+        self.db.commit()
+        self.assertIn("deeper windows off", self.admin("policy", "--deeper", "off"))     # or off for every server,
+        self.assertIsNone(self.ask("bob"))                                # with no release
+        self.assertIn("off for every server (policy --deeper off)", self.admin("stats"))
+        self.admin("policy", "--deeper", "on")
+        self.assertEqual(self.ask("bob")["begin"], 200)
+
+    def test_windows_go_out_by_what_they_should_show_among_first_reads(self):
+        # Why: client time is the volunteers' own; a window into days held already must not go before a first read
+        # into days not held, nor the other way round.
+        self.addCleanup(setattr, ingest, "FIT_MIN", ingest.FIT_MIN)
+        ingest.FIT_MIN = 3
+        today = utc_date(self.now)
+        self.db.executemany("INSERT INTO seen_days(day, platform, played, seen, held) VALUES(?, 'OC1', ?, 100, ?)",
+                            [(today, utc_date(self.now - back * self.DAY), 100 if back <= 20 else 10)
+                             for back in range(2, int(self.days))])         # the last 20 days held, the ones before 10%
+        # Lists read before (not due): of players in 256-511 held matches 20 matches a day, in 32-63 4 a day.
+        self.db.executemany("INSERT INTO players(platform, puuid, games, pace, checked_at, back, depth, due_at) "
+                            "VALUES('OC1', ?, ?, ?, 1, 2, 200, ?)",
+                            [("%s%035d" % (name, n), games, 86400 // rate, int(self.now) + self.DAY)
+                             for name, games, rate in (("x", 300, 20), ("y", 40, 4)) for n in range(3)])
+        for puuid, games in (("h" * 36, 300), ("m" * 36, 40)):          # first reads: 10 days back (held); 50 days
+            self.db.execute("INSERT INTO players(platform, puuid, games, due_at) VALUES('OC1', ?, ?, 0)", (puuid, games))
+        # Windows of players in 300 held matches, 20 matches a day: from 25 days back (days not held), and from 12
+        # days back (mostly held).
+        for puuid, days_ago in (("d" * 36, 25), ("e" * 36, 12)):
+            self.db.execute("INSERT INTO players(platform, puuid, games, pace, checked_at, back, depth, due_at, deep, "
+                            "deep_to, deep_pace, deep_key) VALUES('OC1', ?, 300, 4320, 1, 2, 200, ?, 200, ?, 4320, ?)",
+                            (puuid, int(self.now) + self.DAY, self.ms(days_ago), ingest.deep_key(self.ms(days_ago), 4320, 300)))
+        self.db.commit()
+        judged = ingest.worths(self.db, "OC1", int(self.now))
+        held = 20 + self.days % 1 + 0.1 * (int(self.days) - 21)           # the days held, as the model counts them
+        self.assertAlmostEqual(judged["deeper"][0][0], min(300 / held, 16) * 0.9 * 10, delta=0.5)   # 10 days not held
+        handed = self.work(key=self.keys["bob"], block=1000, windows=1, lists=4)["players"]
+        self.assertEqual([(item["puuid"][0], item["begin"]) for item in handed], [("d", 200), ("m", 0), ("e", 200), ("h", 0)])
+        self.db.execute("UPDATE players SET leased_until = 0")
+        self.db.commit()
+        older = self.work(key=self.keys["carol"], block=1000, lists=4)["players"]     # (no windows up to 0.3.10)
+        self.assertEqual([item["puuid"][0] for item in older], ["m", "h"])
+
+    def test_a_database_from_the_version_of_27_nov_carries_on(self):
+        # Why: the live database (550,000 players) is changed over when the service starts; the lists read in full
+        # so far must get their next window, and nothing else may change.
+        self.db.executescript("""
+            DROP INDEX players_deep; DROP TABLE deep_days; DROP TABLE copies;
+            ALTER TABLE players DROP COLUMN deep; ALTER TABLE players DROP COLUMN deep_to;
+            ALTER TABLE players DROP COLUMN deep_pace; ALTER TABLE players DROP COLUMN deep_key;
+            ALTER TABLE players DROP COLUMN deep_due; ALTER TABLE players DROP COLUMN deep_fails;""")
+        checked = int(self.now) - 3600
+        alice = self.db.execute("SELECT id FROM contributors WHERE name = 'alice'").fetchone()[0]
+        self.db.executemany("INSERT INTO players(platform, puuid, back, depth, pace, games, checked_at, due_at, reader, "
+                            "reader_at) VALUES('OC1', ?, ?, ?, ?, 80, ?, ?, ?, ?)",
+                            [(p * 36, back, depth, pace, checked, checked + self.DAY, alice, checked)
+                             for p, back, depth, pace in (("a", 2, 200, 4320), ("b", 2, 137, 4320), ("c", 1, 200, 4320),
+                                                          ("d", 0, 0, 0), ("e", 2, 200, 86400))])
+        self.db.commit()
+        ingest.prepared.clear()
+        ingest.connect().close()
+        rows = self.db.execute("SELECT puuid, back, deep, deep_to, deep_pace, deep_key / 256 FROM players "
+                               "ORDER BY puuid").fetchall()
+        season_day = self.season // 86400000
+        self.assertEqual([row[:5] for row in rows], [("a" * 36, 2, 200, 0, 4320), ("b" * 36, 2, 0, 0, 0),
+                                                     ("c" * 36, 1, 0, 0, 0), ("d" * 36, 0, 0, 0, 0),
+                                                     ("e" * 36, 2, 200, 0, 86400)])
+        self.assertEqual(rows[0][5], (checked - 4320 * 200) // 86400)     # judged from its pace,
+        self.assertEqual(rows[4][5], season_day)                          # never before the season's start
+        self.assertIsNone(self.ask("alice", "a" * 36))                    # (alice read it)
+        window = self.ask("bob", "a" * 36)
+        self.assertEqual(window["begin"], 200)
+        self.read("bob", window, listed=200, oldest_days=30)              # how far back the read before went is not
+        self.assertEqual(self.deep("a" * 36)[:2], (400, self.ms(30)))     # known: its pace is judged over all 400
+        self.assertAlmostEqual(self.deep("a" * 36)[2], 30 * self.DAY / 400, delta=1)
+
+    def test_stats_and_status_show_how_deeper_windows_did(self):
+        # Why: whether Tencent's clients start where they are asked is first seen here; admin turns windows off or
+        # leaves them on by these numbers.
+        self.first(listed=200, oldest_days=10)
+        self.read("bob", self.ask("bob"), took=0.05, cached=True)
+        self.read("carol", self.ask("carol"), ids=[831, 832], listed=200, oldest_days=25, took=17.5)
+        stats = self.admin("stats")
+        self.assertRegex(stats, r"deeper windows \(the places of a list after what its first read listed\): on; 1 "
+                                r"waiting; what they should show \(an estimate\): about [0-9.]+ Arena matches not held "
+                                r"yet a window for the next 1000 handed out")
+        self.assertIn("windows from place 200 (3 days): 2 handed out, 0 failed, 1 the client's copy of other places, 0 "
+                      "not the places asked for (0 of those two said they began there), 1 read; those listed 200 matches "
+                      "each (0 fewer than asked: the list's end), back 25 days (0 to the season's start), with 2.0 new "
+                      "Arena matches each, 17.5 s each", stats)
+        deeper = json.loads(self.relay("status"))["reads"]["OC1"]["deeper"]
+        self.assertEqual((deeper["state"], deeper["waiting"]), ("on", 1))
+        self.assertEqual(deeper["windows"], [{"begin": 200, "handed": 2, "failed": 0, "copied": 1, "ignored": 0,
+                                              "same_first": 0, "fresh": 1, "new": 2, "short": 0, "listed": 200,
+                                              "reached": 0, "days_back": 25, "took_ms": 17500}])
+        self.assertIn("deeper windows are on (policy --deeper)", stats)
 
 
 sys.path.insert(0, os.path.join(ROOT, "server", "tools"))
@@ -1794,6 +2080,49 @@ class EndToEnd(WithServer):
         fetched = self.fetched(self.fake, other)
         self.assertEqual(len(fetched), len(set(fetched)))                 # not one match was fetched by both
         self.assertTrue(self.fetched(self.fake) and self.fetched(other))  # and both did part of the job
+
+    def test_three_installs_read_long_lists_down_to_their_end(self):
+        # Why: this is the whole of deeper windows as volunteers' collectors will run them, each with its own client and
+        # its copies: a slip anywhere (a window to an install whose client holds a copy, places misreported, a window
+        # moved on wrongly) leaves the older matches uncollected or reads lists for nothing.
+        self.fake.close()
+        worlds = [FakeClient(players=30, arena=400, other=5, clock=self.clock) for _ in range(3)]   # lists of about 260:
+        self.fake = worlds[0]                                             # the first 100, then places 100-199, 200-
+        for number, fake in enumerate(worlds):                            # (the same world, seen from three accounts)
+            self.addCleanup(fake.close)
+            fake.me = fake.players[number]
+        folders = [(fake.write_lockfile(os.path.join(self.tmp.name, "League%d" % n)), os.path.join(self.tmp.name, "data%d" % n))
+                   for n, fake in enumerate(worlds)]
+        keys = [self.key] + [self.admin("add-key", name).split()[-1] for name in ("bob", "carol")]
+        top = {i for ids in worlds[0].history.values() for i in sorted(ids, key=lambda i: -worlds[0].games[i]["gameCreation"])[:100]}
+        self.assertTrue(worlds[0].arena_ids() - top)                      # (some matches are in nobody's first 100)
+        for number in (0, 1, 2, "a day later", 0, 1, 2):
+            if number == "a day later":                                   # each install's client holds a copy of some
+                self.assertTrue(self.db.execute("SELECT COUNT(*) FROM players WHERE deep > 0").fetchone()[0])   # lists
+                before = [path for _, path, _ in worlds[0].requests if "/matches?" in path]    # (alice's first run)
+                self.clock.sleep(ingest.COPY_SECONDS + 60)                # waiting: a day later (League restarted)
+                for fake in worlds:
+                    fake.forget()
+                continue
+            self.league_dir, self.data_dir = folders[number]
+            os.makedirs(self.data_dir, exist_ok=True)
+            self.run_collector(minutes=60, server=self.server(keys[number]))
+        self.assertEqual(self.server_ids(), worlds[0].arena_ids())        # every match, the deepest too,
+        fetched = self.fetched(*worlds)
+        self.assertEqual(len(fetched), len(set(fetched)))                 # each fetched once
+        lists = [[path.split("?")[1] for _, path, _ in fake.requests if "/matches?" in path] for fake in worlds]
+        self.assertIn("begIndex=100&endIndex=199", lists[1])              # bob read places 100-199 of the lists alice
+        self.assertIn("begIndex=200&endIndex=299", lists[2])              # read, carol 200-299
+        self.assertFalse([path for path in before if "begIndex=0&" not in path])     # (never a window to the reader)
+        self.assertIn("begIndex=200&endIndex=299", lists[0])              # and the rest a day later
+        self.assertTrue(all(200 < len(ids) < 300 for ids in worlds[0].history.values()))
+        windows = self.db.execute("SELECT begin, SUM(fresh), SUM(short), SUM(ignored), SUM(failed) FROM deep_days "
+                                  "GROUP BY begin").fetchall()
+        self.assertEqual(windows, [(100, 29, 0, 0, 0), (200, 29, 29, 0, 0)])    # each read once, to the list's end
+        self.assertEqual(self.db.execute("SELECT puuid, depth FROM players WHERE depth < 100").fetchall(),
+                         [(worlds[0].me, 20)])            # (all but alice's own: her client's copy from her first look at
+        # it, its latest 20, was taken for all of it, as since 0.3.8)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM players WHERE deep > 0").fetchone()[0], 0)
 
     def test_a_second_pass_fetches_nothing_again(self):
         self.run_collector(server=self.server())

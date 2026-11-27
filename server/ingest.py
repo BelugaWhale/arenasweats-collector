@@ -19,6 +19,7 @@ import base64
 import calendar
 import gzip
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -87,8 +88,10 @@ DEFAULT_BLOCK = 200              # client will give for that player: the client 
                                  # which is DEFAULT_BLOCK until changed with: policy --block N (20: one page for all).
 LIST_CAP = 200                   # A Tencent client never lists more than this many of a player's latest matches, whatever
                                  # is asked for (measured 27 Nov 2026: asked 540-1000, every read fetched afresh listed 200
-                                 # at most), and its first request fixes its copy. So no list can be read further back than
-                                 # its latest 200 matches (all modes), and nobody is asked for more (policy --block too).
+                                 # at most), and its first request fixes its copy. So one request reads no further back than
+                                 # 200 matches (all modes), and nobody is asked for more (policy --block too). A first
+                                 # request may start further down the list, though (measured on OC1, 27 Nov 2026: a first
+                                 # request for places 200-399 gave them): see the deeper windows below.
 TARGET_SEEN = 10                 # read a list again when about this many more Arena matches are expected in it
 MIN_INTERVAL = 3600              # ...but not more often than this
 MAX_INTERVAL = 30 * 86400        # ...and not less often than this (a list that showed no Arena match)
@@ -114,6 +117,13 @@ RETRY_SECONDS = 600              # first retry after a failed read; doubles each
 MAX_INDEX = 1000                 # the furthest place in a list a report may name
 SETTLED_SECONDS = 2 * 86400      # a match this old that turns up in a list should be held by now (see seen_days)
 SEEN_MIN = 20                    # season_held leaves out the days played that lists showed fewer matches of than this
+
+# ---- deeper windows: the places of a list beyond what its first read listed (see take_window)
+MAX_DEPTH = 2000                 # no window starts further down a list than this (ten windows of 200 past the first read)
+DEEPER_STOP_SHARE = 0.5          # deeper windows stop going out on a server when more than this share of the ones answered
+DEEPER_STOP_MIN = 20             # (and at least this many) in the last DEEPER_JUDGE_DAYS days (UTC, today too) did not give
+DEEPER_JUDGE_DAYS = 2            # the places asked for: their clients answer from copies, or do not start where asked. Once
+                                 # those days have passed with none answered, windows go out again, and the next ones tell.
 
 # ---- event games the rankings server is waiting for (see relay `urgent`): handed out before anything else
 URGENT_GAME_SECONDS = 300        # such a match not held yet is handed out again this often (it may not have ended)
@@ -188,6 +198,7 @@ CREATE TABLE IF NOT EXISTS players(
     want INTEGER NOT NULL DEFAULT 0,           -- no longer used (it was for back 3)
     reader INTEGER NOT NULL DEFAULT 0,         -- the install whose League client read the list last (it may keep a copy) ...
     reader_at INTEGER NOT NULL DEFAULT 0,      -- ... and when
+    -- (the columns deep ... deep_fails, for the deeper windows, are made in add_columns)
     PRIMARY KEY(platform, puuid));
 -- The orders lists are handed out in (see `work`): lists read before, by when they are due again; and players
 -- never read, by the held matches they are in. (The others, for lists not read in one request yet and for what has
@@ -237,6 +248,30 @@ CREATE TABLE IF NOT EXISTS seen_days(
     day TEXT NOT NULL, platform TEXT NOT NULL, played TEXT NOT NULL,     -- day: when the lists were read
     seen INTEGER NOT NULL DEFAULT 0, held INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(day, platform, played));
+-- The deeper windows of each day (UTC), per server and place the window began at (see take_window).
+CREATE TABLE IF NOT EXISTS deep_days(
+    day TEXT NOT NULL, platform TEXT NOT NULL, begin INTEGER NOT NULL,
+    handed INTEGER NOT NULL DEFAULT 0,         -- windows handed out to be read
+    failed INTEGER NOT NULL DEFAULT 0,         -- reads reported back as failed,
+    copied INTEGER NOT NULL DEFAULT 0,         -- as the client's copy of other places (from an earlier request, at once),
+    ignored INTEGER NOT NULL DEFAULT 0,        -- as other places fetched afresh, or the places asked for but no further back
+                                               -- than the read before (the client did not start where it was asked to);
+    same_first INTEGER NOT NULL DEFAULT 0,     -- (of those two, how many the client said were other places that began at
+                                               -- the place asked for: only their last place differed)
+    fresh INTEGER NOT NULL DEFAULT 0,          -- and as the places asked for, further back. Of those:
+    new INTEGER NOT NULL DEFAULT 0,            --   the Arena matches they showed that no list had shown before
+    short INTEGER NOT NULL DEFAULT 0,          --   how many listed fewer than asked for (the list's end)
+    listed INTEGER NOT NULL DEFAULT 0,         --   the matches they listed, added up (all modes)
+    reached INTEGER NOT NULL DEFAULT 0,        --   how many reached back to the season's start
+    days_back INTEGER NOT NULL DEFAULT 0,      --   how many days back their oldest match was, added up
+    took_ms INTEGER NOT NULL DEFAULT 0,        --   and how long the client took for them all (ms)
+    PRIMARY KEY(day, platform, begin));
+-- Which installs' League clients hold a copy of which player's list (they read it, or answered from a copy, in the
+-- last COPY_SECONDS): a deeper window is never handed to one of them (it would get that copy back).
+CREATE TABLE IF NOT EXISTS copies(
+    platform TEXT NOT NULL, puuid TEXT NOT NULL, contributor_id INTEGER NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY(platform, puuid, contributor_id));
+CREATE INDEX IF NOT EXISTS copies_by_time ON copies(at);
 CREATE INDEX IF NOT EXISTS games_by_time ON games(created_ms);
 CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS games_by_arrival ON games(received_at, platform, contributor_id);
@@ -333,7 +368,7 @@ def add_columns(db):
     db.execute("BEGIN IMMEDIATE")       # so two workers starting together do not both add them
     with db:
         have = {row[1] for row in db.execute("PRAGMA table_info(players)")}
-        for name in ("back", "depth", "pace", "want", "reader", "reader_at"):
+        for name in ("back", "depth", "pace", "want", "reader", "reader_at") + DEEP_COLUMNS:
             if name not in have:
                 db.execute("ALTER TABLE players ADD COLUMN %s INTEGER NOT NULL DEFAULT 0" % name)
         if "want" not in have:
@@ -354,6 +389,34 @@ def add_columns(db):
         # as far back as one request goes. (Found through their own index: no pass over every player.)
         db.execute("UPDATE players INDEXED BY players_deeper SET back = CASE WHEN depth < ? THEN 0 ELSE 2 END "
                    "WHERE back = 3", (LIST_CAP,))
+        db.execute("CREATE INDEX IF NOT EXISTS players_deep ON players(platform, deep_key, deep_pace, games, deep) "
+                   "WHERE deep > 0")
+        if "deep" not in have:
+            # Lists read in one request as far as it went (2) whose read listed all a client gives: their next window
+            # starts where that read ended. When its oldest match was played is not kept, so it is judged from the
+            # list's pace, after the season's start (deep_to stays 0: not known). (Found through their own index: no
+            # pass over every player.)
+            season = get_policy(db)["season_start"]
+            start = [(depth, pace, deep_key(max(season, (checked_at - pace * depth) * 1000), pace, games), rowid)
+                     for rowid, checked_at, pace, depth, games in db.execute(
+                         "SELECT rowid, checked_at, pace, depth, games FROM players INDEXED BY players_top "
+                         "WHERE back IN (1, 2) AND back = 2 AND depth >= ? AND pace > 0", (LIST_CAP,))]
+            db.executemany("UPDATE players SET deep = ?, deep_pace = ?, deep_key = ? WHERE rowid = ?", start)
+
+
+DEEP_COLUMNS = ("deep", "deep_to", "deep_pace", "deep_key", "deep_due", "deep_fails")
+# deep: the place the list's next deeper window starts at (0: none to read); deep_to: when the oldest match seen in the
+# list so far was played (ms; 0: not known); deep_pace: seconds between two matches (all modes) in the deepest part read;
+# deep_key: what the next window is judged by (see deep_key); deep_due: from when on it may be handed out; deep_fails:
+# its reads that failed, or did not give the places asked for, in a row.
+
+
+def deep_key(deep_to, pace, games):
+    """What a deeper window is judged by (see worths): the day its places end at (that of the oldest match seen so far,
+    `deep_to` ms), how many matches a day the list holds there (from `pace`, seconds between two: 1, 2-3, 4-7, ...) and
+    the band of held matches its player is in (see band). One number, so windows alike are found in one look-up."""
+    rate = max(1, int(86400 / max(pace, 1)))
+    return max(0, deep_to // 86400000) * 256 + min(15, rate.bit_length()) * 16 + band(games)
 
 
 def read_again(db, depth_below):
@@ -487,16 +550,23 @@ def clean_report(report, now):
         return None
     newest, following = report.get("newest"), report.get("next")
     newest = min(newest, now * 1000) if is_int(newest, 0, 2 ** 53) else 0        # never beyond the present
+    begin, window = report.get("begin"), report.get("window")
     cleaned = {"puuid": puuid, "ids": sorted(set(ids)), "job": job if isinstance(job, str) else None,
                "newest": newest, "next": following if is_int(following, 0, MAX_INDEX) else 0,
-               "failed": report.get("failed") is True, "block": False}
+               "failed": report.get("failed") is True, "block": False, "cached": False,
+               "begin": begin if is_int(begin, 0, MAX_DEPTH) else 0,
+               "window": tuple(window) if isinstance(window, list) and len(window) == 2 and all(
+                   is_int(place, -1, 10 ** 6) for place in window) else None}
     # A collector that reads a list as one block also says how many places it asked for, how many matches the client
-    # listed (all modes), when the oldest of them was played, and how long the client took to answer.
+    # listed (all modes), when the oldest of them was played, and how long the client took to answer. From 0.3.11 on,
+    # also whether the client's answer was its copy of other places than the ones asked for ("cached": the places it
+    # said it holds, "window", were not those): then what it listed is not those places.
     asked, listed, oldest, took = (report.get(name) for name in ("asked", "listed", "oldest", "took"))
     timed = isinstance(took, (int, float)) and not isinstance(took, bool) and 0 <= took < 3600
     if is_int(asked, 1, MAX_INDEX) and is_int(listed, 0, MAX_INDEX) and timed:
         oldest = min(oldest, now * 1000) if is_int(oldest, 1, 2 ** 53) and listed else 0
-        cleaned.update(block=True, asked=asked, listed=listed, oldest=oldest, took=float(took))
+        cleaned.update(block=True, asked=asked, listed=listed, oldest=oldest, took=float(took),
+                       cached=report.get("cached") is True)
     return cleaned
 
 
@@ -904,8 +974,15 @@ def work():
     block = min(block, block_limit(db)) if is_int(block, PAGE, 10 ** 6) else None
     lists = min(lists, MAX_LISTS) if is_int(lists, 0, 10 ** 6) else PLAYERS_PER_ROUND
     deep = bool(block and block > PAGE)         # it can read a list further back than a page
-    # Which lists never read in one request on this server are worth reading first (judged outside the write lock).
-    order = worths(db, platform, now)["order"] if deep else None
+    # Which lists never read in one request on this server are worth reading first, and which deeper windows (judged
+    # outside the write lock). A deeper window goes only to a collector that reads a list from the place it is told
+    # ("windows", from 0.3.11 on; earlier ones read from the top whatever the place), while they are on for the server.
+    judged = worths(db, platform, now) if deep else None
+    windows = deep and is_int(body.get("windows"), 1, 10 ** 6) and deeper_state(db, platform, now) == "on"
+    order = list(heapq.merge(((worth, FIRST, games, players) for worth, games, players in judged["order"]),
+                             ((worth, DEEPER, key, players) for worth, key, players in
+                              (judged["deeper"] if windows else [])),
+                             key=lambda entry: -entry[0])) if deep else None
     fetch, handed = [], []
 
     def pick(sql, *values):
@@ -913,11 +990,14 @@ def work():
 
     def hand(rows, top=False):
         """Give this collector these lists, each with a token its report must carry, for as long as their places fit in
-        one answer. `top`: only what is new at the top of each list is wanted. Returns the lists handed out."""
+        one answer. `top`: only what is new at the top of each list is wanted. A row with a place to begin at is a
+        deeper window: all one request gives from there. Returns the lists handed out."""
         given = []
-        for puuid, read_to, checked_at, back, pace, games in rows:
-            count, since = PAGE, max(read_to, season)
-            if block and not top and back in (1, 2):
+        for puuid, read_to, checked_at, back, pace, games, *window in rows:
+            count, since, begin = PAGE, max(read_to, season), window[0] if window else 0
+            if begin:
+                count, since = block, season
+            elif block and not top and back in (1, 2):
                 # Seen back to the season's start before (or as far as it goes): what came since, with places to spare.
                 count = (now - checked_at) / pace * SPARE + 5 if pace else PAGE
             elif block and not top:
@@ -929,28 +1009,35 @@ def work():
             job = secrets.token_hex(8)
             db.execute("UPDATE players SET leased_until = ?, job = ? WHERE platform = ? AND puuid = ?",
                        (now + LEASE_SECONDS, job, platform, puuid))
-            handed.append({"puuid": puuid, "job": job, "since": since, "begin": 0, "pages": 1})
+            handed.append({"puuid": puuid, "job": job, "since": since, "begin": begin, "pages": 1})
             if block:
                 handed[-1]["count"] = count
             given.append(puuid)
         return given
 
     def back_fill(limit):
-        """Hand out up to `limit` lists never read in one request, the most valuable first: the ones whose latest
-        LIST_CAP matches should show the most Arena matches not held yet. That is judged by the held matches their
-        player is in (see worths), so they are looked up by that number, in the order of worth (one indexed look-up
-        each); players in a number not judged yet (it is judged again every FIT_SECONDS) come after, the ones in the
-        most held matches first. Never to the install that read the list last within COPY_SECONDS: its client may
-        answer from its saved copy."""
+        """Hand out up to `limit` lists never read in one request, and deeper windows, the most valuable first: the
+        ones that should show the most Arena matches not held yet (see worths). Lists never read in one request are
+        judged by the held matches their player is in, so they are looked up by that number; deeper windows by their
+        key (see deep_key); both in the order of worth, one indexed look-up each. Players in a number not judged yet
+        (it is judged again every FIT_SECONDS) come after, the ones in the most held matches first. Never to the
+        install that read the list last within COPY_SECONDS: its client may answer from its saved copy; and a deeper
+        window never to any install whose client holds a copy of that list (see `copies`)."""
         copied, enough = now - COPY_SECONDS, len(handed) + limit
-        for _, games, _ in order:
+        for _, kind, value, _ in order:
             if len(handed) >= enough or sum(item["count"] for item in handed) + block > PLACES_PER_ROUND:
                 return
-            hand(pick(FIRST_READS_OF, platform, games, now, now, g.contributor, copied, enough - len(handed)))
+            if kind == FIRST:
+                hand(pick(FIRST_READS_OF, platform, value, now, now, g.contributor, copied, enough - len(handed)))
+            else:
+                hand(pick(DEEPER_OF, platform, value, now, now, g.contributor, copied, g.contributor, copied,
+                          enough - len(handed)))
         hand(pick(FIRST_READS, platform, now, now, g.contributor, copied, enough - len(handed)))
 
     db.execute("BEGIN IMMEDIATE")       # so two collectors are never handed the same work
     with db:
+        if reports:
+            db.execute("DELETE FROM copies WHERE at < ?", (now - COPY_SECONDS,))
         for report in reports:
             cleaned = clean_report(report, now)
             if cleaned:
@@ -1020,10 +1107,14 @@ def work():
                 hand(pick(NEVER_READ, platform, now, now, room - len(handed)))
             # 4. With places left: more of the lists that are due again.
             hand(pick(due, platform, now, now, room - len(handed)))
-            if handed:
-                count_reads(db, platform, now, pages=len(handed), places=sum(item.get("count", PAGE) for item in handed))
+            lists_handed = [item for item in handed if not item["begin"]]
+            if lists_handed:
+                count_reads(db, platform, now, pages=len(lists_handed),
+                            places=sum(item.get("count", PAGE) for item in lists_handed))
             for item in handed:
-                if "count" in item:
+                if item["begin"]:
+                    count_deep(db, platform, now, item["begin"], handed=1)
+                elif "count" in item:
                     count_size(db, platform, now, item["count"], handed=1)
     return jsonify({"games": fetch, "players": handed, "wait": 0 if fetch or handed else 60,
                     "lease": LEASE_SECONDS, "policy": rules})
@@ -1043,6 +1134,11 @@ FIRST_READS = ("SELECT " + COLUMNS + " FROM players INDEXED BY players_back WHER
                "ORDER BY games DESC, rowid DESC LIMIT ?")
 NEVER_READ = ("SELECT " + COLUMNS + " FROM players INDEXED BY players_never WHERE platform = ? AND checked_at = 0 "
               "AND due_at <= ? AND leased_until < ? ORDER BY games DESC, rowid DESC LIMIT ?")
+DEEPER_OF = ("SELECT " + COLUMNS + ", deep FROM players INDEXED BY players_deep WHERE platform = ? AND deep > 0 "
+             "AND deep_key = ? AND deep_due <= ? AND leased_until < ? AND NOT (reader = ? AND reader_at > ?) "
+             "AND NOT EXISTS (SELECT 1 FROM copies c WHERE c.platform = players.platform AND c.puuid = players.puuid "
+             "AND c.contributor_id = ? AND c.at > ?) LIMIT ?")
+FIRST, DEEPER = 0, 1     # what an entry of the order of worth (see worths) is: lists never read in one request, or windows
 
 
 def band(games):
@@ -1124,8 +1220,13 @@ def worths(db, platform, now):
     own pace: 6-41 new Arena matches a read where 5-39 were found; from their held matches alone, up to twice that.
     (How far back a read reaches is what moves it: a heavy player's 200 matches reached back 12-18 days, which were
     91-100% held on 27 Nov.)
-    Returns {"order": [(worth, games, players)], the most worth first; "held_days": the season's days as held}, judged
-    again every FIT_SECONDS: one pass over the index of these players (about 0.1 s for 350,000)."""
+    Deeper windows (see take_window) are judged the same way, by their key (see deep_key): a window reaches back
+    LIST_CAP matches from the oldest match seen in the list so far, at the pace the list's deepest part read had, and
+    each day in it counts for the share of it not held; times the player's Arena matches a day as above. (Judged
+    from the middle of the windows alike: their average pace and held matches.)
+    Returns {"order": [(worth, games, players)], the most worth first; "deeper": [(worth, key, windows)], the same;
+    "held_days": the season's days as held}, judged again every FIT_SECONDS: one pass over the index of these players
+    (about 0.1 s for 350,000) and one over that of the deeper windows."""
     def judge():
         season = get_policy(db)["season_start"]
         shares, rates = held_shares(db, platform, now, season), list_rates(db, platform, now)
@@ -1137,8 +1238,37 @@ def worths(db, platform, now):
             rate = rates[band(games)]
             arena = min(games / max(held_days, 1.0), ARENA_SHARE * rate)
             order.append((arena * latest_days(missing, LIST_CAP / rate, now), games, players))
-        return {"order": sorted(order, reverse=True), "held_days": held_days}
+        deeper = []
+        for key, windows, pace, games in db.execute(
+                "SELECT deep_key, COUNT(*), AVG(deep_pace), AVG(games) FROM players INDEXED BY players_deep "
+                "WHERE platform = ? AND deep > 0 GROUP BY deep_key", (platform,)):
+            rate = 86400 / max(pace, 1)
+            arena = min(games / max(held_days, 1.0), ARENA_SHARE * rate)
+            deeper.append((arena * days_before(missing, key // 256 - season // 86400000, LIST_CAP / rate), key, windows))
+        return {"order": sorted(order, reverse=True), "deeper": sorted(deeper, reverse=True), "held_days": held_days}
     return fitted("worths", platform, now, judge)
+
+
+def days_before(values, last, days):
+    """The sum of `values` (one a day, the season's first day first) over `days` days back from day `last` (counted
+    whole; a day of the season not reached yet counts as today), none before the season."""
+    total, day, left = 0.0, min(last, len(values) - 1), days
+    while left > 0 and day >= 0:
+        total, day, left = total + min(left, 1.0) * values[day], day - 1, left - 1
+    return total
+
+
+def deeper_state(db, platform, now):
+    """Whether deeper windows go out on this server: "off" (policy --deeper off, for every server), "stopped" (more
+    than DEEPER_STOP_SHARE of the ones answered in the last DEEPER_JUDGE_DAYS days, and at least DEEPER_STOP_MIN, did
+    not give the places asked for: see take_window), or "on"."""
+    if deeper_off(db):
+        return "off"
+    fresh, missed = db.execute("SELECT COALESCE(SUM(fresh), 0), COALESCE(SUM(copied + ignored), 0) FROM deep_days "
+                               "WHERE platform = ? AND day > ?",
+                               (platform, utc_day(now - DEEPER_JUDGE_DAYS * 86400))).fetchone()
+    answered = fresh + missed
+    return "stopped" if answered >= DEEPER_STOP_MIN and missed > DEEPER_STOP_SHARE * answered else "on"
 
 
 def utc_day(seconds):
@@ -1194,40 +1324,33 @@ def take_report(db, platform, now, season, report, reader):
     missing = [game_id for game_id in ids if game_id not in held]
     new = db.executemany("INSERT OR IGNORE INTO wanted(platform, game_id) VALUES(?, ?)",
                          [(platform, game_id) for game_id in missing]).rowcount
+    where = (platform, report["puuid"])
+    if not report["failed"]:
+        # Its client keeps a copy of this list now (or had one): no deeper window of it goes to this install for a while.
+        db.execute("INSERT OR REPLACE INTO copies VALUES(?, ?, ?, ?)", where + (reader, now))
+    if report["block"] and report["begin"]:
+        take_window(db, platform, now, season, report, reader, held, missing, new)
+        return
     # A list with nothing in it counts as failed: everyone handed out has played at least the match that made them known.
     failed = report["failed"] or (report["block"] and not report["listed"])
+    # The client's saved copy: answered at once, with SAVED_COPY_PLACES or more listed or (as a collector from 0.3.11 on
+    # says) as a copy of other places. (A slow answer is fetched afresh whatever places it names: how a Tencent client
+    # names them is not measured.)
     saved = (report["block"] and not failed and report["took"] < SAVED_COPY_SECONDS
-             and report["listed"] >= SAVED_COPY_PLACES)
-    where = (platform, report["puuid"])
+             and (report["listed"] >= SAVED_COPY_PLACES or report["cached"]))
     row = db.execute("SELECT job, read_to, checked_at, fails, back, depth FROM players WHERE platform = ? AND puuid = ?",
                      where).fetchone()
     # A saved copy of a list nobody has read before is news all the same (a collector looks at its own list when it
-    # starts): it counts as a read of what it shows. Of a list read before it shows nothing new, and is no read.
-    fresh = not failed and (not saved or (row is not None and not row[2]))
+    # starts): it counts as a read of what it shows. Of a list read before it shows nothing new, and is no read. (A copy
+    # of other places than the ones asked for is never a read of them.)
+    fresh = not failed and (not saved or (row is not None and not row[2] and not report["cached"]))
     # What this read found, for the daily counts. Its matches played long enough ago that they should be held
     # by now are also counted by the day they were played.
     count_reads(db, platform, now, lists=1, failed=int(failed), saved=int(saved),
                 **({"seen": len(ids), "held": len(ids) - len(missing), "new": new,
                     "listed": report["listed"] if report["block"] else 0} if fresh else {}))
     if fresh:
-        settled = defaultdict(lambda: [0, 0])           # day played -> [matches seen, of which held]
-        # When a match not held was played is judged by its neighbours (see played_at). In a long list that is looked
-        # up for 20 of them, evenly spread, and the ones in between take the time of the match before them.
-        played, since_looked, look_every = None, 0, max(1, len(missing) // 20)
-        for game_id in ids:
-            if held.get(game_id):
-                played = held[game_id]
-            elif played is None or since_looked >= look_every:
-                played, since_looked = played_at(db, platform, game_id), 1
-            else:
-                since_looked += 1
-            if played and played <= (now - SETTLED_SECONDS) * 1000:
-                counts = settled[utc_day(played // 1000)]
-                counts[0] += 1
-                counts[1] += held.get(game_id) is not None
-        db.executemany("INSERT INTO seen_days(day, platform, played, seen, held) VALUES(?, ?, ?, ?, ?) ON CONFLICT"
-                       "(day, platform, played) DO UPDATE SET seen = seen + excluded.seen, held = held + excluded.held",
-                       [(utc_day(now), platform, played, seen, of_them) for played, (seen, of_them) in settled.items()])
+        count_seen(db, platform, now, ids, held, missing)
     if report["block"]:
         asked, listed, oldest = report["asked"], report["listed"], report["oldest"]
         # Back to the season's start: only when the oldest match listed says so. (Fewer matches than asked for may
@@ -1263,6 +1386,7 @@ def take_report(db, platform, now, season, report, reader):
 
     # How far back the list has been seen now, and how fast it fills.
     whole = not checked_at or (report["block"] and back == 0)       # this read was asked for everything since the season began
+    deeper = None
     pace, turned = None, report["next"] and checked_at              # turned: every place was newer than the last read
     if report["block"]:
         pace = max(1, (now - oldest // 1000) // listed) if listed and oldest else None
@@ -1271,8 +1395,13 @@ def take_report(db, platform, now, season, report, reader):
             back = 1                    # back to the season's start
         elif whole:
             # As far back as one request goes (2): the client listed what it gives (LIST_CAP at most, whatever was
-            # asked for), or fewer (the list's end). No request can see further back.
+            # asked for), or fewer (the list's end). No request from the top can see further back.
             back = 2
+        if (whole or (turned and asked >= LIST_CAP)) and not ended and listed >= asked and pace:
+            # It listed all it was asked for: the places after them are the list's next deeper window (see
+            # take_window), which a client that has not read this list yet can be asked for. (After a read whose
+            # places were all newer than the read before, the windows also show the matches in between.)
+            deeper = (listed, oldest, pace)
     elif whole and not report["next"]:
         back = 1                        # one page of 20, and it got to the season's start (or the list's end)
     if turned and not (report["block"] and asked >= LIST_CAP):
@@ -1295,6 +1424,111 @@ def take_report(db, platform, now, season, report, reader):
     db.execute("UPDATE players SET read_to = ?, checked_at = ?, due_at = ?, fails = 0, back = ?, depth = ?, "
                "pace = COALESCE(?, pace), reader = ?, reader_at = ? WHERE platform = ? AND puuid = ?",
                (max(read_to, report["newest"]), now, now + int(interval), back, depth, pace, reader, now) + where)
+    if whole or back == 0 or deeper:
+        # A read of everything since the season began starts the deeper windows again after it (the places further
+        # down have moved by the matches played since), or ends them; so does one whose places were all newer than the
+        # read before, and a list to be read in one request again.
+        begin, oldest, pace = deeper or (0, 0, 0)
+        games = db.execute("SELECT games FROM players WHERE platform = ? AND puuid = ?", where).fetchone()[0]
+        db.execute("UPDATE players SET deep = ?, deep_to = ?, deep_pace = ?, deep_key = ?, deep_due = ?, deep_fails = 0 "
+                   "WHERE platform = ? AND puuid = ?",
+                   (begin, oldest, pace, deep_key(oldest, pace, games) if begin else 0, now) + where)
+
+
+def count_seen(db, platform, now, ids, held, missing):
+    """Count a read's matches played long enough ago that they should be held by now (SETTLED_SECONDS) by the day they
+    were played, and how many of those are held (see seen_days). `held`: match -> when it was played (ms), for the held
+    ones; `missing`: the ones not held."""
+    settled = defaultdict(lambda: [0, 0])           # day played -> [matches seen, of which held]
+    # When a match not held was played is judged by its neighbours (see played_at). In a long list that is looked
+    # up for 20 of them, evenly spread, and the ones in between take the time of the match before them.
+    played, since_looked, look_every = None, 0, max(1, len(missing) // 20)
+    for game_id in ids:
+        if held.get(game_id):
+            played = held[game_id]
+        elif played is None or since_looked >= look_every:
+            played, since_looked = played_at(db, platform, game_id), 1
+        else:
+            since_looked += 1
+        if played and played <= (now - SETTLED_SECONDS) * 1000:
+            counts = settled[utc_day(played // 1000)]
+            counts[0] += 1
+            counts[1] += held.get(game_id) is not None
+    db.executemany("INSERT INTO seen_days(day, platform, played, seen, held) VALUES(?, ?, ?, ?, ?) ON CONFLICT"
+                   "(day, platform, played) DO UPDATE SET seen = seen + excluded.seen, held = held + excluded.held",
+                   [(utc_day(now), platform, played, seen, of_them) for played, (seen, of_them) in settled.items()])
+
+
+def count_deep(db, platform, now, begin, **counts):
+    """Add to today's row of deep_days for windows beginning at place `begin`."""
+    names = sorted(counts)
+    db.execute("INSERT INTO deep_days(day, platform, begin, %s) VALUES(?, ?, ?, %s) ON CONFLICT(day, platform, begin) "
+               "DO UPDATE SET %s" % (", ".join(names), ", ".join("?" * len(names)),
+                                     ", ".join("%s = %s + excluded.%s" % (name, name, name) for name in names)),
+               [utc_day(now), platform, begin] + [counts[name] for name in names])
+
+
+def take_window(db, platform, now, season, report, reader, held, missing, new):
+    """A collector from 0.3.11 on (the install `reader`) read a deeper window of a player's list: the places from
+    `begin` on, beyond what the list's first read in one request listed (see take_report). A client's first request
+    for a player may start at any place, and every later request for that player gets the copy it made then (measured
+    on OC1, 27 Nov 2026). So the window was handed to an install whose client holds no copy of this list (see
+    `copies`), and its answer is one of:
+      - the places asked for, further back than the read before: a read. The next window starts where it ended, until
+        one reaches back to the season's start (the list is then seen back to it: back 1) or lists fewer than asked
+        for, none at all included (the list's end), or would start beyond MAX_DEPTH;
+      - the client's copy of other places, answered at once ("cached", in under SAVED_COPY_SECONDS): its client had a
+        copy after all. No read, and nothing held against the list: another install is handed it;
+      - other places fetched afresh, or the places asked for but no further back than the read before: the client did
+        not start where it was asked to (or the list moved down by as many matches as were asked for since). No read;
+        it is tried again after a wait, like a failure.
+    The last two are counted apart (deep_days): if they are most of a server's answers, its windows stop going out
+    (see deeper_state). The matches any of them shows are wanted all the same."""
+    where = (platform, report["puuid"])
+    asked, listed, oldest, begin = report["asked"], report["listed"], report["oldest"], report["begin"]
+    row = db.execute("SELECT job, deep, deep_to, deep_pace, deep_fails, games FROM players WHERE platform = ? AND "
+                     "puuid = ?", where).fetchone()
+    failed = report["failed"]
+    copied = not failed and report["cached"] and report["took"] < SAVED_COPY_SECONDS
+    ignored = not failed and not copied and (report["cached"] or bool(
+        row and row[2] and listed and oldest >= row[2]))
+    fresh = not (failed or copied or ignored)
+    reached = bool(fresh and oldest and oldest <= season)
+    said = report["window"]             # the places the client said it gave
+    same_first = bool((copied or ignored) and report["cached"] and said and said[0] == begin)
+    found = {"fresh": 1, "new": new, "short": int(listed < asked), "listed": listed, "reached": int(reached),
+             "days_back": (now - oldest // 1000) // 86400 if oldest else 0,
+             "took_ms": int(report["took"] * 1000)} if fresh else {}
+    count_deep(db, platform, now, begin, failed=int(failed), copied=int(copied), ignored=int(ignored),
+               same_first=int(same_first), **found)
+    if fresh:
+        count_seen(db, platform, now, report["ids"], held, missing)
+    if row is None or row[0] is None or row[0] != report["job"] or row[1] != begin:
+        return                          # not the read currently handed out: out of date
+    _, _, deep_to, deep_pace, fails, games = row
+    db.execute("UPDATE players SET job = NULL, leased_until = 0 WHERE platform = ? AND puuid = ?", where)
+    if copied:
+        return                          # due as it was, to another install
+    if not fresh:
+        later = now + min(MAX_INTERVAL, RETRY_SECONDS * 2 ** min(fails, 10))
+        db.execute("UPDATE players SET deep_fails = deep_fails + 1, deep_due = ? WHERE platform = ? AND puuid = ?",
+                   (later,) + where)
+        return
+    following = begin + listed
+    if reached:
+        following = 0
+        db.execute("UPDATE players SET back = 1 WHERE platform = ? AND puuid = ?", where)
+    elif listed < asked or following > MAX_DEPTH:
+        following = 0                   # the list's end, or as deep as windows go
+    if listed and oldest:
+        # How fast the list filled in these places, for the next window: from the read before's oldest match, or
+        # (when that is not known) over every place down to here.
+        span, places = (deep_to - oldest, listed) if deep_to else (now * 1000 - oldest, begin + listed)
+        deep_pace = max(1, span // places // 1000)
+    db.execute("UPDATE players SET deep = ?, deep_to = ?, deep_pace = ?, deep_key = ?, deep_due = ?, deep_fails = 0 "
+               "WHERE platform = ? AND puuid = ?",
+               (following, oldest or deep_to, deep_pace, deep_key(oldest, deep_pace, games) if following else 0, now)
+               + where)
 
 
 @app.errorhandler(413)
@@ -1395,6 +1629,30 @@ def progress(db, platform, now):
             "worth_next": round(next_worth / taken, 1) if taken else None,
             "worth_left": round(sum(worth * players for worth, _, players in order)),
             "season_held": season_held(db, platform, now)}
+
+
+def deeper_progress(db, platform, now):
+    """Where the deeper windows of a server stand: whether they go out (see deeper_state), how many are waiting, and
+    what the next WORTH_NEXT of them in the order they are handed out should show, a window, and all of them (an
+    estimate: see worths). None where nothing is waiting."""
+    order = worths(db, platform, now)["deeper"]
+    waiting = sum(windows for _, _, windows in order)
+    next_worth, taken = 0.0, 0
+    for worth, _, windows in order:
+        number = min(windows, WORTH_NEXT - taken)
+        next_worth, taken = next_worth + worth * number, taken + number
+    return {"state": deeper_state(db, platform, now), "waiting": waiting,
+            "worth_next": round(next_worth / taken, 1) if taken else None,
+            "worth_left": round(sum(worth * windows for worth, _, windows in order))}
+
+
+def deep_windows(db, platform, since):
+    """The deeper windows of the days after `since`, by the place they began at: how they came back (see deep_days)."""
+    names = ("handed", "failed", "copied", "ignored", "same_first", "fresh", "new", "short", "listed", "reached",
+             "days_back", "took_ms")
+    return [dict(zip(("begin",) + names, row)) for row in db.execute(
+        "SELECT begin, %s FROM deep_days WHERE platform = ? AND day > ? GROUP BY begin ORDER BY begin" % ", ".join(
+            "SUM(%s)" % name for name in names), (platform, since))]
 
 
 def cmd_add_key(db, args):
@@ -1598,6 +1856,25 @@ def cmd_stats(db, _args):
             print("  lists read %s: %d (%d failed, %d answered from a saved copy) for %d asked with %d places; "
                   "%d reached the season's start; Arena matches they showed: %d, %d held already, %d not seen before"
                   % (day, lists, failed, saved, pages, places, back, seen, held, new))
+        deeper = deeper_progress(db, platform, now)
+        print("  deeper windows (the places of a list after what its first read listed): %s; %d waiting%s" % (
+            {"on": "on", "off": "off for every server (policy --deeper off)",
+             "stopped": "STOPPED on this server: most of those answered in the last %d days did not give the places "
+                        "asked for (more than %d%% of %d or more); they go out again once those days have passed" % (
+                            DEEPER_JUDGE_DAYS, 100 * DEEPER_STOP_SHARE, DEEPER_STOP_MIN)}[deeper["state"]],
+            deeper["waiting"], "; what they should show (an estimate): about %.1f Arena matches not held yet a window "
+            "for the next %d handed out, %d in all of them" % (deeper["worth_next"], WORTH_NEXT, deeper["worth_left"])
+            if deeper["worth_next"] is not None else ""))
+        for window in deep_windows(db, platform, utc_day(now - 3 * 86400)):
+            fresh = max(window["fresh"], 1)
+            print("  windows from place %d (3 days): %d handed out, %d failed, %d the client's copy of other places, %d "
+                  "not the places asked for (%d of those two said they began there), %d read; those listed %.0f matches "
+                  "each (%d fewer than asked: the list's end), back %.0f days (%d to the season's start), with %.1f new "
+                  "Arena matches each, %.1f s each" % (
+                      window["begin"], window["handed"], window["failed"], window["copied"], window["ignored"],
+                      window["same_first"], window["fresh"], window["listed"] / fresh, window["short"],
+                      window["days_back"] / fresh, window["reached"], window["new"] / fresh,
+                      window["took_ms"] / 1000 / fresh))
         for size in sizes(db, platform, utc_day(now - 3 * 86400), banded=True):
             fresh = max(size["fresh"], 1)
             print("  lists of %s places (3 days): %d handed out, %d failed, %d from the client's saved copy, %d fetched "
@@ -1622,7 +1899,13 @@ def cmd_stats(db, _args):
     print("Policy: %s, season starts %s UTC" % (
         {name: rules[name] for name in ("enabled", "delay", "fast", "fast_delay", "fast_flight", "message")},
         time.strftime("%Y-%m-%d", time.gmtime(rules["season_start"] / 1000))))
-    print("Collectors that read a list in one request are asked for up to %d matches of it (policy --block)" % block_limit(db))
+    print("Collectors that read a list in one request are asked for up to %d matches of it (policy --block); deeper "
+          "windows are %s (policy --deeper)" % (block_limit(db), "off" if deeper_off(db) else "on"))
+
+
+def deeper_off(db):
+    """Whether policy --deeper off has switched deeper windows off for every server."""
+    return dict(db.execute("SELECT name, value FROM settings WHERE name = 'deeper'")).get("deeper", "1") != "1"
 
 
 def cmd_policy(db, args):
@@ -1636,9 +1919,10 @@ def cmd_policy(db, args):
     with db:
         before, block = get_policy(db)["season_start"], block_limit(db)
         signups, fast = {"on": 1, "off": 0}.get(args.signups), {"on": 1, "off": 0}.get(args.fast)
+        deeper = {"on": 1, "off": 0}.get(args.deeper)
         for name, value in (("enabled", args.enabled), ("delay", args.delay), ("message", args.message),
                             ("season_start", season), ("signups", signups), ("fast", fast),
-                            ("fast_delay", args.fast_delay), ("fast_flight", args.fast_flight)):
+                            ("fast_delay", args.fast_delay), ("fast_flight", args.fast_flight), ("deeper", deeper)):
             if value is not None:
                 db.execute("INSERT OR REPLACE INTO settings VALUES(?, ?)", (name, str(value)))
         if args.block is not None and args.block != block:
@@ -1653,11 +1937,12 @@ def cmd_policy(db, args):
         if season is not None and season < before:
             # Lists were only read back to the old date. Every list read so far is due again at once, and is
             # asked for everything since the new date.
-            changed = db.execute("UPDATE players SET read_to = 0, back = 0, due_at = MIN(due_at, ?) WHERE checked_at > 0",
-                                 (int(clock()),)).rowcount
+            changed = db.execute("UPDATE players SET read_to = 0, back = 0, deep = 0, due_at = MIN(due_at, ?) "
+                                 "WHERE checked_at > 0", (int(clock()),)).rowcount
             print("The season now starts earlier: %d match lists will be read again back to the new date." % changed)
-    print("Policy: %s, new installs %s; up to %d matches of a list in one request" % (
-        get_policy(db), "can sign up" if signups_open(db) else "cannot sign up", block_limit(db)))
+    print("Policy: %s, new installs %s; up to %d matches of a list in one request; deeper windows %s" % (
+        get_policy(db), "can sign up" if signups_open(db) else "cannot sign up", block_limit(db),
+        "off" if deeper_off(db) else "on"))
 
 
 def cmd_export(db, args):
@@ -1781,9 +2066,12 @@ def relay_status(db, now):
     names = ("day", "pages", "places", "lists", "failed", "saved", "listed", "back", "seen", "held", "new")
     for row in db.execute("SELECT platform, %s FROM read_days WHERE day > ? ORDER BY day" % ", ".join(names), (since,)):
         reads[row[0]]["days"].append(dict(zip(names, row[1:])))
+    for (platform,) in db.execute("SELECT DISTINCT platform FROM deep_days WHERE day > ?", (since,)).fetchall():
+        reads[platform]                 # (a server with deeper windows read is shown even without other reads)
     for platform in list(reads):
         reads[platform]["sizes"] = sizes(db, platform, since)
         reads[platform]["progress"] = progress(db, platform, now)
+        reads[platform]["deeper"] = dict(deeper_progress(db, platform, now), windows=deep_windows(db, platform, since))
     for platform, played, seen, held in db.execute(
             "SELECT platform, played, SUM(seen), SUM(held) FROM seen_days WHERE day > ? GROUP BY platform, played "
             "ORDER BY played", (since,)):
@@ -1875,6 +2163,9 @@ def main(argv=None):
                                help="whether new installs can get their own key automatically")
     policy_parser.add_argument("--season-start", metavar="YYYY-MM-DD",
                                help="nothing from before this UTC date is asked for or kept")
+    policy_parser.add_argument("--deeper", choices=("on", "off"),
+                               help="whether collectors from 0.3.11 on are handed deeper windows of lists (the places "
+                                    "after what a list's first read listed); off: none, for every server")
     policy_parser.add_argument("--block", type=int, metavar="N",
                                help="the most matches of a list a collector is asked for in one request (default and "
                                     "most %d: no client lists more; %d: one page, as before 0.3.8)" % (LIST_CAP, PAGE))
