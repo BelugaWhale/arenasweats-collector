@@ -85,25 +85,26 @@ DEFAULT_BLOCK = 200              # client will give for that player: the client 
                                  # for one page of 20. Newer ones say the most they can ask for ("block") and are told
                                  # how many to ask for ("count"): never more than that, nor than the policy's block,
                                  # which is DEFAULT_BLOCK until changed with: policy --block N (20: one page for all).
+LIST_CAP = 200                   # A Tencent client never lists more than this many of a player's latest matches, whatever
+                                 # is asked for (measured 27 Nov 2026: asked 540-1000, every read fetched afresh listed 200
+                                 # at most), and its first request fixes its copy. So no list can be read further back than
+                                 # its latest 200 matches (all modes), and nobody is asked for more (policy --block too).
 TARGET_SEEN = 10                 # read a list again when about this many more Arena matches are expected in it
 MIN_INTERVAL = 3600              # ...but not more often than this
 MAX_INTERVAL = 30 * 86400        # ...and not less often than this (a list that showed no Arena match)
 SPARE = 1.5                      # a list read again for what is new at its top is asked for this many times the places
                                  # that should be enough
-SPARE_DEEP = 1.25                # a list read back to the season's start whose pace is known (all modes, from an earlier
-                                 # read) is asked for this many times the places since the season began, and a page more
-FIRST_QUANTILE = 0.75            # a list never read in one request is asked for as many places as reached back to the
-                                 # season's start for this share of the lists read of players in about as many held matches
-                                 # (see list_rates). Played on 2,143 lists of HN1 and HN10 read on 25-26 Nov 2026, with up
-                                 # to 1,000 allowed: 764 places a list, 1.25 reads, against 995 places for 20 a held match
-                                 # (asking for the middle: 800, 1.5 reads); 96% get there either way (see README.md).
-FIT_MIN = 30                     # ... judged from at least this many lists (else all of the server's, else all servers')
-FIT_SECONDS = 600                # ... and judged again this often
+ARENA_SHARE = 0.8                # at most this share of a list's matches is judged to be Arena (of the matches that reads of
+                                 # 200 listed on HN1 and HN10 on 25-27 Nov 2026, 74-85% were Arena: see `worths`)
+FIT_MIN = 30                     # how fast lists fill is judged from at least this many lists of a band (see list_rates)
+FIT_SECONDS = 600                # ... and judged again this often, with which lists are worth reading first (see worths)
 DEFAULT_RATE = 8.0               # matches a day (all modes) in a list, when no list has been read in one request anywhere:
-                                 # the middle of those 2,143 lists (HN1 6.6, HN10 9.9)
-COPY_SECONDS = 86400             # a list that is to be read further back is not handed to the install that read it last
-                                 # within this time: its client may answer from its saved copy, which goes no further
-                                 # (measured on OC1: still there minutes later; how long on the Chinese servers is not known)
+                                 # the middle of 2,143 lists of HN1 and HN10 read on 25-26 Nov 2026 (HN1 6.6, HN10 9.9)
+COPY_SECONDS = 86400             # a list is not handed for a read in one request to the install that read it last within
+                                 # this time: its client may answer from its saved copy (of a page of 20, if it read it as
+                                 # a collector up to 0.3.7), which goes no further (measured on OC1: still there minutes
+                                 # later; how long on the Chinese servers is not known)
+WORTH_NEXT = 1000                # stats: what the next this many lists to be read for the first time should show
 REGULAR = 20                     # stats: players in this many held matches or more are counted apart
 SAVED_COPY_SECONDS = 0.3         # a list of SAVED_COPY_PLACES or more matches answered faster than this came from the
 SAVED_COPY_PLACES = 10           # client's saved copy (measured: 0.02-0.15 s, against seconds for one fetched afresh)
@@ -179,18 +180,18 @@ CREATE TABLE IF NOT EXISTS players(
     resume_floor INTEGER NOT NULL DEFAULT 0,
     older_due INTEGER NOT NULL DEFAULT 0,
     back INTEGER NOT NULL DEFAULT 0,           -- 1: the list has been seen back to the season's start; 2: as far back as
-                                               -- it goes, or as one request may go (see take_report); 3: a read went as
-                                               -- far as it was asked to and the list goes on: to be read further back,
-                                               -- by another install; 0: not read in one request that far yet
+                                               -- it goes, or as one request goes (see take_report); 0: not read in one
+                                               -- request yet. (3, to be read further back, was until 27 Nov 2026: no
+                                               -- client lists more than LIST_CAP, so there is no further back.)
     depth INTEGER NOT NULL DEFAULT 0,          -- the most matches one request has listed of it (0: only ever a page of 20)
     pace INTEGER NOT NULL DEFAULT 0,           -- seconds between two matches in the list, all modes, at its last read (0: unknown)
-    want INTEGER NOT NULL DEFAULT 0,           -- back 3: the Arena matches expected in the part not read yet (see take_report)
+    want INTEGER NOT NULL DEFAULT 0,           -- no longer used (it was for back 3)
     reader INTEGER NOT NULL DEFAULT 0,         -- the install whose League client read the list last (it may keep a copy) ...
     reader_at INTEGER NOT NULL DEFAULT 0,      -- ... and when
     PRIMARY KEY(platform, puuid));
 -- The orders lists are handed out in (see `work`): lists read before, by when they are due again; and players
--- never read, by the held matches they are in. (The others, for lists to be read back to the season's start and for
--- what has been learned of their pace, are made in add_columns.) The three indexes dropped here are no longer used.
+-- never read, by the held matches they are in. (The others, for lists not read in one request yet and for what has
+-- been learned of their pace, are made in add_columns.) The three indexes dropped here are no longer used.
 DROP INDEX IF EXISTS players_due;
 DROP INDEX IF EXISTS players_older_part;
 DROP INDEX IF EXISTS players_unread;
@@ -336,26 +337,30 @@ def add_columns(db):
             if name not in have:
                 db.execute("ALTER TABLE players ADD COLUMN %s INTEGER NOT NULL DEFAULT 0" % name)
         if "want" not in have:
-            # Until this version a read that went as far as it was asked to and no further was left at that (2). The
-            # ones asked for less than collectors may ask for are now read further back (3); see take_report.
-            move_further(db, back_from=2, depth_below=block_limit(db), season=get_policy(db)["season_start"])
+            # Until then a read that went as far as it was asked to and no further was left at that (2). The ones
+            # asked for less than collectors may ask for are read again in one request.
+            read_again(db, depth_below=block_limit(db))
         if "took_ms" not in {row[1] for row in db.execute("PRAGMA table_info(size_days)")}:
             db.execute("ALTER TABLE size_days ADD COLUMN took_ms INTEGER NOT NULL DEFAULT 0")
         if "platform" not in {row[1] for row in db.execute("PRAGMA table_info(contributors)")}:
             db.execute("ALTER TABLE contributors ADD COLUMN platform TEXT NOT NULL DEFAULT ''")
         db.execute("CREATE INDEX IF NOT EXISTS players_back ON players(platform, games) WHERE back = 0")
         db.execute("CREATE INDEX IF NOT EXISTS players_top ON players(platform, due_at) WHERE back IN (1, 2)")
+        # (kept so that the version of 26 Nov can still run on this file; nothing here uses it now)
         db.execute("CREATE INDEX IF NOT EXISTS players_deeper ON players(platform, want) WHERE back = 3")
         db.execute("CREATE INDEX IF NOT EXISTS players_paced ON players(platform, games, pace) WHERE pace > 0")
+        # Lists the version of 26 Nov left to be read further back (3): there is no further back than LIST_CAP. The
+        # ones a request listed fewer of than that are read again in one request (by another install), the rest are
+        # as far back as one request goes. (Found through their own index: no pass over every player.)
+        db.execute("UPDATE players INDEXED BY players_deeper SET back = CASE WHEN depth < ? THEN 0 ELSE 2 END "
+                   "WHERE back = 3", (LIST_CAP,))
 
 
-def move_further(db, back_from, depth_below, season):
-    """Lists left at `back_from` that one request listed fewer than `depth_below` matches of are to be read further
-    back (3). How many Arena matches the part not read holds is judged from the held matches their players are in, as
-    if those were spread like the matches listed. Returns how many."""
-    return db.execute(
-        "UPDATE players SET back = 3, want = games * MAX(0, checked_at - pace * depth - ?) / MAX(pace * depth, 3600) "
-        "WHERE back = ? AND depth < ? AND pace > 0", (season // 1000, back_from, depth_below)).rowcount
+def read_again(db, depth_below):
+    """Lists read in one request as far as it went (2) that it listed fewer than `depth_below` matches of are to be
+    read in one request again (0), by another install (see back_fill): with more allowed now, that goes further back.
+    (Some of them are that short because the list ends there: a read for nothing each.) Returns how many."""
+    return db.execute("UPDATE players SET back = 0 WHERE back = 2 AND depth < ?", (depth_below,)).rowcount
 
 
 def add_outbox(db):
@@ -399,9 +404,9 @@ def get_policy(db):
 
 def block_limit(db):
     """The most matches of a list a collector is asked for in one request (see `work`). Changed with policy --block,
-    and in force from the next request for work."""
+    and in force from the next request for work; never more than LIST_CAP (a setting made before 27 Nov may say more)."""
     row = db.execute("SELECT value FROM settings WHERE name = 'block'").fetchone()
-    return int(row[0]) if row else DEFAULT_BLOCK
+    return min(int(row[0]), LIST_CAP) if row else DEFAULT_BLOCK
 
 
 # ---------------------------------------------------------------------------
@@ -896,12 +901,11 @@ def work():
     # ("block"), but no more than the policy allows. None: a collector up to 0.3.7, which reads one page of 20.
     # And how many lists it has room for now.
     block, lists = body.get("block"), body.get("lists")
-    ceiling = block_limit(db)
-    block = min(block, ceiling) if is_int(block, PAGE, 10 ** 6) else None
+    block = min(block, block_limit(db)) if is_int(block, PAGE, 10 ** 6) else None
     lists = min(lists, MAX_LISTS) if is_int(lists, 0, 10 ** 6) else PLAYERS_PER_ROUND
     deep = bool(block and block > PAGE)         # it can read a list further back than a page
-    # How fast lists fill on this server, for lists never read in one request (judged outside the write lock).
-    rates = list_rates(db, platform, now) if block else None
+    # Which lists never read in one request on this server are worth reading first (judged outside the write lock).
+    order = worths(db, platform, now)["order"] if deep else None
     fetch, handed = [], []
 
     def pick(sql, *values):
@@ -911,14 +915,14 @@ def work():
         """Give this collector these lists, each with a token its report must carry, for as long as their places fit in
         one answer. `top`: only what is new at the top of each list is wanted. Returns the lists handed out."""
         given = []
-        for puuid, read_to, checked_at, back, pace, games, _ in rows:
+        for puuid, read_to, checked_at, back, pace, games in rows:
             count, since = PAGE, max(read_to, season)
             if block and not top and back in (1, 2):
                 # Seen back to the season's start before (or as far as it goes): what came since, with places to spare.
                 count = (now - checked_at) / pace * SPARE + 5 if pace else PAGE
             elif block and not top:
-                # Not seen that far back yet: everything since the season began.
-                count, since = deep_places(pace, games, now, season, rates), season
+                # Not read in one request yet: all that one request gives (LIST_CAP at most), since the season began.
+                count, since = block, season
             count = min(block or PAGE, PAGE * max(1, -int(-count // PAGE)))      # whole pages of 20
             if handed and sum(item.get("count", PAGE) for item in handed) + count > PLACES_PER_ROUND:
                 break
@@ -932,24 +936,25 @@ def work():
         return given
 
     def back_fill(limit):
-        """The lists to read back to the season's start next, the most valuable first: the Arena matches expected in
-        the part of each that no read has listed yet. For a list never read in one request that is about as many as the
-        held matches its player is in (on HN1 on 26 Nov about half of the season's matches were held); for one read
-        further back before, what that read showed (see take_report). Further back only by a collector that can ask
-        for all the policy allows (others could not go deeper than the read before), and never by the install that
-        read the list last within COPY_SECONDS: its client may answer from its saved copy."""
-        copied = now - COPY_SECONDS
-        rows = pick(FIRST_READS, platform, now, now, g.contributor, copied, limit)
-        if block >= ceiling:
-            rows += pick(DEEPER_READS, platform, now, now, block, g.contributor, copied, limit)
-        return sorted(rows, key=lambda row: -row[-1])[:max(limit, 0)]
+        """Hand out up to `limit` lists never read in one request, the most valuable first: the ones whose latest
+        LIST_CAP matches should show the most Arena matches not held yet. That is judged by the held matches their
+        player is in (see worths), so they are looked up by that number, in the order of worth (one indexed look-up
+        each); players in a number not judged yet (it is judged again every FIT_SECONDS) come after, the ones in the
+        most held matches first. Never to the install that read the list last within COPY_SECONDS: its client may
+        answer from its saved copy."""
+        copied, enough = now - COPY_SECONDS, len(handed) + limit
+        for _, games, _ in order:
+            if len(handed) >= enough or sum(item["count"] for item in handed) + block > PLACES_PER_ROUND:
+                return
+            hand(pick(FIRST_READS_OF, platform, games, now, now, g.contributor, copied, enough - len(handed)))
+        hand(pick(FIRST_READS, platform, now, now, g.contributor, copied, enough - len(handed)))
 
     db.execute("BEGIN IMMEDIATE")       # so two collectors are never handed the same work
     with db:
         for report in reports:
             cleaned = clean_report(report, now)
             if cleaned:
-                take_report(db, platform, now, season, cleaned, g.contributor, ceiling)
+                take_report(db, platform, now, season, cleaned, g.contributor)
         db.execute("UPDATE contributors SET platform = ? WHERE id = ? AND platform != ?", (platform, g.contributor, platform))
         # A collector names its own account once, so that a server with no players yet has one to start from.
         start = body.get("start")
@@ -987,7 +992,7 @@ def work():
             # The top of the lists of the players in those event games, ahead of every other list. Each goes out
             # again after URGENT_LIST_SECONDS, whether its last read worked or not, until the game is held.
             urgent = hand(pick(
-                "SELECT p.puuid, p.read_to, p.checked_at, p.back, p.pace, p.games, 0 FROM urgent_players up "
+                "SELECT p.puuid, p.read_to, p.checked_at, p.back, p.pace, p.games FROM urgent_players up "
                 "JOIN urgent_games u ON u.platform = up.platform AND u.game_id = up.game_id "
                 "JOIN players p ON p.platform = up.platform AND p.puuid = up.puuid "
                 "WHERE up.platform = ? AND u.until > ? AND up.handed_at <= ? AND p.leased_until < ? "
@@ -1006,10 +1011,13 @@ def work():
             room = lists if len(fetch) < GAMES_PER_ROUND else 0
             due = DUE_TOP if deep else DUE_AGAIN
             hand(pick(due, platform, now, now, lists - (1 if room else 0) - len(handed)))
-            # 3. Lists not seen back to the season's start yet, the most valuable first (see back_fill). A collector up
-            #    to 0.3.7 cannot see further back than a page: it gets the players never read, the ones in the most held
+            # 3. Lists not read in one request yet, the most valuable first (see back_fill). A collector up to 0.3.7
+            #    cannot see further back than a page: it gets the players never read, the ones in the most held
             #    matches first, and of those the latest found.
-            hand(back_fill(room - len(handed)) if deep else pick(NEVER_READ, platform, now, now, room - len(handed)))
+            if deep:
+                back_fill(room - len(handed))
+            else:
+                hand(pick(NEVER_READ, platform, now, now, room - len(handed)))
             # 4. With places left: more of the lists that are due again.
             hand(pick(due, platform, now, now, room - len(handed)))
             if handed:
@@ -1021,20 +1029,19 @@ def work():
                     "lease": LEASE_SECONDS, "policy": rules})
 
 
-# Each names its index, so a missing one is an error at once and never a slow search of every player. The last column
-# is what back_fill orders by.
+# Each names its index, so a missing one is an error at once and never a slow search of every player.
 COLUMNS = "puuid, read_to, checked_at, back, pace, games"
-DUE_AGAIN = ("SELECT " + COLUMNS + ", 0 FROM players INDEXED BY players_again WHERE platform = ? AND checked_at > 0 "
+DUE_AGAIN = ("SELECT " + COLUMNS + " FROM players INDEXED BY players_again WHERE platform = ? AND checked_at > 0 "
              "AND due_at <= ? AND leased_until < ? ORDER BY due_at LIMIT ?")
-DUE_TOP = ("SELECT " + COLUMNS + ", 0 FROM players INDEXED BY players_top WHERE platform = ? AND back IN (1, 2) "
+DUE_TOP = ("SELECT " + COLUMNS + " FROM players INDEXED BY players_top WHERE platform = ? AND back IN (1, 2) "
            "AND due_at <= ? AND leased_until < ? ORDER BY due_at LIMIT ?")
-FIRST_READS = ("SELECT " + COLUMNS + ", games FROM players INDEXED BY players_back WHERE platform = ? AND back = 0 "
+FIRST_READS_OF = ("SELECT " + COLUMNS + " FROM players INDEXED BY players_back WHERE platform = ? AND back = 0 "
+                  "AND games = ? AND (fails = 0 OR due_at <= ?) AND leased_until < ? AND NOT (reader = ? AND reader_at > ?) "
+                  "ORDER BY rowid DESC LIMIT ?")
+FIRST_READS = ("SELECT " + COLUMNS + " FROM players INDEXED BY players_back WHERE platform = ? AND back = 0 "
                "AND (fails = 0 OR due_at <= ?) AND leased_until < ? AND NOT (reader = ? AND reader_at > ?) "
                "ORDER BY games DESC, rowid DESC LIMIT ?")
-DEEPER_READS = ("SELECT " + COLUMNS + ", want FROM players INDEXED BY players_deeper WHERE platform = ? AND back = 3 "
-                "AND (fails = 0 OR due_at <= ?) AND leased_until < ? AND depth < ? AND NOT (reader = ? AND reader_at > ?) "
-                "ORDER BY want DESC, rowid DESC LIMIT ?")
-NEVER_READ = ("SELECT " + COLUMNS + ", 0 FROM players INDEXED BY players_never WHERE platform = ? AND checked_at = 0 "
+NEVER_READ = ("SELECT " + COLUMNS + " FROM players INDEXED BY players_never WHERE platform = ? AND checked_at = 0 "
               "AND due_at <= ? AND leased_until < ? ORDER BY games DESC, rowid DESC LIMIT ?")
 
 
@@ -1043,41 +1050,94 @@ def band(games):
     return min(max(games, 1).bit_length(), 10)
 
 
-def deep_places(pace, games, now, season, rates):
-    """How many places of a list to ask for to see it back to the season's start (before whole pages and limits). How
-    many that takes is known once a read has told how fast the list fills (its pace); before that, it is judged by
-    what similar players' lists held (see list_rates)."""
-    days = (now - season // 1000) / 86400
-    return days * 86400 / pace * SPARE_DEEP + PAGE if pace else days * rates[band(games)]
+fits = {}       # (what, database, server) -> (when judged, what list_rates or worths gives)
 
 
-rate_fits = {}      # (database, server) -> (when judged, {band: matches a day}); see list_rates
+def fitted(what, platform, now, judge):
+    """What `judge()` gives, judged again every FIT_SECONDS (per worker)."""
+    key = (what, os.path.abspath(db_path()), platform)
+    if key not in fits or now - fits[key][0] >= FIT_SECONDS:
+        fits[key] = (now, judge())
+    return fits[key][1]
 
 
 def list_rates(db, platform, now):
     """How many matches a day (all modes) to expect in the list of a player never read in one request on this server,
-    by band of held matches (see band): the FIRST_QUANTILE-th of the paces that the lists read in one request there
-    showed, of players in the same band; with fewer than FIT_MIN of them, of all the server's lists; with fewer than
-    that, of all servers'; with none, DEFAULT_RATE. Judged again every FIT_SECONDS. (Players are banded by the held
-    matches they are in now, which their own read has added to: a little more than before it.)"""
-    key = (os.path.abspath(db_path()), platform)
-    if key in rate_fits and now - rate_fits[key][0] < FIT_SECONDS:
-        return rate_fits[key][1]
-    here, everywhere = defaultdict(list), []
-    for server, games, pace in db.execute("SELECT platform, games, pace FROM players INDEXED BY players_paced "
-                                          "WHERE pace > 0"):
-        everywhere.append(86400 / pace)
-        if server == platform:
-            here[band(games)].append(86400 / pace)
-            here[0].append(86400 / pace)
+    by band of held matches (see band): the middle of the paces that the lists read in one request there showed, of
+    players in the same band; for a band with fewer than FIT_MIN of them, the nearest band's that has as many (lighter
+    players' lists reach further back: on HN1 on 27 Nov 200 matches went back 50 days for players in 32-63 held matches,
+    39 for 64-127, 35 for 128-255, 18 for 256-511, 12 for more); with no such band, of all the server's lists, else all
+    servers', else DEFAULT_RATE. (Players are banded by the held matches they are in now, which their own read has
+    added to: a little more than before it.)"""
+    def judge():
+        here, everywhere = defaultdict(list), []
+        for server, games, pace in db.execute("SELECT platform, games, pace FROM players INDEXED BY players_paced "
+                                              "WHERE pace > 0"):
+            everywhere.append(86400 / pace)
+            if server == platform:
+                here[band(games)].append(86400 / pace)
+                here[0].append(86400 / pace)
+        middle = lambda rates: sorted(rates)[len(rates) // 2]
+        known = {number: middle(here[number]) for number in range(1, 11) if len(here[number]) >= FIT_MIN}
+        whole = (middle(here[0]) if len(here[0]) >= FIT_MIN else
+                 middle(everywhere) if len(everywhere) >= FIT_MIN else DEFAULT_RATE)
+        return {number: known[min(known, key=lambda other: (abs(other - number), other))] if known else whole
+                for number in range(1, 11)}
+    return fitted("rates", platform, now, judge)
 
-    def quantile(rates):
-        return sorted(rates)[int(FIRST_QUANTILE * len(rates))]
-    whole = (quantile(here[0]) if len(here[0]) >= FIT_MIN else
-             quantile(everywhere) if len(everywhere) >= FIT_MIN else DEFAULT_RATE)
-    rates = {number: quantile(here[number]) if len(here[number]) >= FIT_MIN else whole for number in range(1, 11)}
-    rate_fits[key] = (now, rates)
-    return rates
+
+def held_shares(db, platform, now, season):
+    """For each day (UTC) of the season so far, the first first, the share of its matches held, as this week's list
+    reads judged it (see seen_days): a day they showed fewer than SEEN_MIN matches of, or one too recent to judge, takes
+    the share of the nearest judged day before it, else after it; with no day judged, 0."""
+    first, days = season // 86400000, int(now // 86400) - season // 86400000 + 1
+    judged = {}
+    for played, seen, held in db.execute("SELECT played, SUM(seen), SUM(held) FROM seen_days WHERE platform = ? AND "
+                                         "day > ? GROUP BY played", (platform, utc_day(now - 7 * 86400))):
+        if seen >= SEEN_MIN and 0 <= date_ms(played) // 86400000 - first < days:
+            judged[date_ms(played) // 86400000 - first] = held / seen
+    shares, last = [], judged[min(judged)] if judged else 0.0
+    for day in range(days):
+        last = judged.get(day, last)
+        shares.append(last)
+    return shares
+
+
+def latest_days(values, days, now):
+    """The sum of `values` (one a day, the season's first day first, today last) over the latest `days` days: today
+    counts for as much of it as has gone."""
+    total, left, weight = 0.0, days, (now % 86400) / 86400
+    for value in reversed(values):
+        if left <= 0:
+            break
+        total, left, weight = total + min(left, weight) * value, left - weight, 1.0
+    return total
+
+
+def worths(db, platform, now):
+    """Which lists never read in one request on this server to read first. A read shows a list's latest LIST_CAP
+    matches at most, so what it can find is the Arena matches not held yet among those: for a player in `games` held
+    matches, with the matches a day (all modes) of their band (see list_rates), the read reaches back LIST_CAP / that
+    many days (to the season's start at most); their Arena matches a day are judged as `games` spread over the season
+    as it is held (see held_shares), but at most ARENA_SHARE of all their matches; and of the days it reaches back, each
+    counts for the share of it not held. Checked on the reads of 25-27 Nov 2026 (HN1, HN10), whose players' paces are
+    known: that judges their new Arena matches at 6-41 a read where 5-39 were found (and the share of the day not held
+    is what moves it: a heavy player's 200 matches reach back 12-18 days, which were 91-100% held on 27 Nov).
+    Returns {"order": [(worth, games, players)], the most worth first; "held_days": the season's days as held}, judged
+    again every FIT_SECONDS: one pass over the index of these players (about 0.1 s for 350,000)."""
+    def judge():
+        season = get_policy(db)["season_start"]
+        shares, rates = held_shares(db, platform, now, season), list_rates(db, platform, now)
+        held_days = latest_days(shares, len(shares), now)
+        missing = [1 - share for share in shares]
+        order = []
+        for games, players in db.execute("SELECT games, COUNT(*) FROM players INDEXED BY players_back WHERE platform = ? "
+                                         "AND back = 0 GROUP BY games", (platform,)):
+            rate = rates[band(games)]
+            arena = min(games / max(held_days, 1.0), ARENA_SHARE * rate)
+            order.append((arena * latest_days(missing, LIST_CAP / rate, now), games, players))
+        return {"order": sorted(order, reverse=True), "held_days": held_days}
+    return fitted("worths", platform, now, judge)
 
 
 def utc_day(seconds):
@@ -1112,9 +1172,9 @@ def count_size(db, platform, now, asked, **counts):
                [utc_day(now), platform, asked] + [counts[name] for name in names])
 
 
-def take_report(db, platform, now, season, report, reader, ceiling):
+def take_report(db, platform, now, season, report, reader):
     """A collector (the install `reader`) read one player's match list: as many places from its top as it was told to
-    ask for. `ceiling`: the most the policy lets a collector ask for.
+    ask for.
 
     The matches not held yet become wanted, whoever reports them. The list's own progress is only
     taken from the report of the read currently handed out (its token must match): a report that
@@ -1201,27 +1261,23 @@ def take_report(db, platform, now, season, report, reader, ceiling):
         return
 
     # How far back the list has been seen now, and how fast it fills.
-    whole = not checked_at or (report["block"] and back in (0, 3))  # this read was asked for everything since the season began
-    pace, turned, want = None, report["next"] and checked_at, 0     # turned: every place was newer than the last read
+    whole = not checked_at or (report["block"] and back == 0)       # this read was asked for everything since the season began
+    pace, turned = None, report["next"] and checked_at              # turned: every place was newer than the last read
     if report["block"]:
         pace = max(1, (now - oldest // 1000) // listed) if listed and oldest else None
         depth, turned = max(depth, listed), not whole and not ended and listed >= asked and oldest > read_to
         if ended:
             back = 1                    # back to the season's start
-        elif whole and (listed < asked or asked >= ceiling):
-            # As far back as it goes (2): the client listed fewer than asked for (the list's end, or all that client
-            # gives), or all that a collector may ask for (it is read further back when the policy allows more).
-            back = 2
         elif whole:
-            # It goes on further back than this read was asked to go (see `hand` for how far that is). It is read further
-            # back (3), as far as its pace says, by another install (see back_fill): worth about as many Arena matches as
-            # this read showed, for every day not read yet as for every day it listed.
-            back = 3
-            want = len(ids) * (oldest // 1000 - season // 1000) // max(now - oldest // 1000, 3600)
+            # As far back as one request goes (2): the client listed what it gives (LIST_CAP at most, whatever was
+            # asked for), or fewer (the list's end). No request can see further back.
+            back = 2
     elif whole and not report["next"]:
         back = 1                        # one page of 20, and it got to the season's start (or the list's end)
-    if turned:
-        back = 0                        # matches were missed in between: to be read back again
+    if turned and not (report["block"] and asked >= LIST_CAP):
+        # Matches were missed in between: to be read in one request again (from another install, see back_fill), which
+        # goes further back than this read did. (After a read of LIST_CAP no read could reach them.)
+        back = 0
     if back == 1 and row[4] != 1:
         count_reads(db, platform, now, back=1)
 
@@ -1236,8 +1292,8 @@ def take_report(db, platform, now, season, report, reader, ceiling):
         elapsed = now - max(checked_at, season // 1000)
     interval = min(MAX_INTERVAL, max(MIN_INTERVAL, max(60, elapsed) * TARGET_SEEN / max(len(ids), 0.5)))
     db.execute("UPDATE players SET read_to = ?, checked_at = ?, due_at = ?, fails = 0, back = ?, depth = ?, "
-               "pace = COALESCE(?, pace), want = ?, reader = ?, reader_at = ? WHERE platform = ? AND puuid = ?",
-               (max(read_to, report["newest"]), now, now + int(interval), back, depth, pace, want, reader, now) + where)
+               "pace = COALESCE(?, pace), reader = ?, reader_at = ? WHERE platform = ? AND puuid = ?",
+               (max(read_to, report["newest"]), now, now + int(interval), back, depth, pace, reader, now) + where)
 
 
 @app.errorhandler(413)
@@ -1302,33 +1358,24 @@ def season_held(db, platform, now):
 
 
 def progress(db, platform, now):
-    """How far the server's lists are from being read back to the season's start: lists that got there, that are as
-    far back as they go (or as one request may go), that are to be read further back, and that no read in one request
-    has seen back yet (of those, how many belong to players in REGULAR or more held matches). Then how many places
-    collectors would be asked for to read them back (as `hand` would ask now; reads that fall short and are read
-    again come on top), what a listed place took the clients in the last 3 days, and so how many hours of client
-    time that is, and how many days at the hours lists took in those 3 days. None where nothing was measured."""
-    season, ceiling = get_policy(db)["season_start"], block_limit(db)
+    """How far the server's lists are from being read: lists seen back to the season's start, lists as far back as
+    one request goes (a client lists LIST_CAP at most), and lists not read in one request yet (of those, how many
+    belong to players in REGULAR or more held matches). Then how many places collectors would be asked for to read
+    those once each (as `hand` would ask now), what a listed place took the clients in the last 3 days, and so how many
+    hours of client time that is, and how many days at the hours lists took in those 3 days; and the Arena matches not
+    held yet that the next WORTH_NEXT of those lists in the order they are handed out should show, a list, and all of
+    them together (an estimate: see worths). None where nothing was measured."""
+    ceiling = block_limit(db)
     counts = dict(db.execute("SELECT back, COUNT(*) FROM players INDEXED BY players_top WHERE platform = ? "
                              "AND back IN (1, 2) GROUP BY back", (platform,)))
-    rates = list_rates(db, platform, now)
-    places = {"all": 0, "regulars": 0}
-    not_back = regulars = 0
-    for games, count in db.execute("SELECT games, COUNT(*) FROM players INDEXED BY players_back WHERE platform = ? "
-                                   "AND back = 0 GROUP BY games", (platform,)):
-        asked = count * min(ceiling, deep_places(0, games, now, season, rates))
-        places["all"] += asked
-        not_back += count
-        if games >= REGULAR:
-            places["regulars"] += asked
-            regulars += count
-    further = 0
-    for (pace,) in db.execute("SELECT pace FROM players INDEXED BY players_deeper WHERE platform = ? AND back = 3",
-                              (platform,)):
-        asked = min(ceiling, deep_places(pace, 0, now, season, rates))
-        places["all"] += asked
-        places["regulars"] += asked
-        further += 1
+    order = worths(db, platform, now)["order"]
+    not_back = sum(players for _, _, players in order)
+    regulars = sum(players for _, games, players in order if games >= REGULAR)
+    places = {"all": not_back * ceiling, "regulars": regulars * ceiling}
+    next_worth, taken = 0.0, 0
+    for worth, _, players in order:
+        number = min(players, WORTH_NEXT - taken)
+        next_worth, taken = next_worth + worth * number, taken + number
     # The days timed (reads are timed from this version on), today as far as it has gone.
     timed = db.execute("SELECT day, SUM(took_ms), SUM(listed) FROM size_days WHERE platform = ? AND day >= ? "
                        "GROUP BY day HAVING SUM(took_ms) > 0", (platform, utc_day(now - 2 * 86400))).fetchall()
@@ -1337,13 +1384,15 @@ def progress(db, platform, now):
     a_place = took_ms / 1000 / listed if took_ms and listed else None
     a_day = took_ms / 3600 / 1000 / days if took_ms else None
     hours = {name: round(number * a_place / 3600, 1) if a_place else None for name, number in places.items()}
-    return {"reached": counts.get(1, 0), "as_far": counts.get(2, 0), "further": further,
+    return {"reached": counts.get(1, 0), "as_far": counts.get(2, 0),
             "not_back": not_back, "not_back_regulars": regulars,
             "places_left": round(places["all"]), "places_left_regulars": round(places["regulars"]),
             "seconds_a_place": round(a_place, 4) if a_place else None,
             "hours_left": hours["all"], "hours_left_regulars": hours["regulars"],
             "list_hours_a_day": round(a_day, 1) if a_day else None,
             "days_left_regulars": round(hours["regulars"] / a_day, 1) if a_day and hours["regulars"] is not None else None,
+            "worth_next": round(next_worth / taken, 1) if taken else None,
+            "worth_left": round(sum(worth * players for worth, _, players in order)),
             "season_held": season_held(db, platform, now)}
 
 
@@ -1525,20 +1574,20 @@ def cmd_stats(db, _args):
             one("SELECT COUNT(*) FROM players WHERE platform = ? AND checked_at = 0"),
             one("SELECT COUNT(*) FROM players WHERE platform = ? AND checked_at > 0 AND due_at <= ?", now)))
         state = progress(db, platform, now)
-        print("  back to the season's start: %d lists got there, %d are as far back as they go (or as one request may "
-              "go), %d are to be read further back, %d are not read back yet (%d of them of players in %d or more held "
-              "matches)" % (state["reached"], state["as_far"], state["further"], state["not_back"],
-                            state["not_back_regulars"], REGULAR))
+        print("  lists read in one request: %d back to the season's start, %d as far back as one request goes (a client "
+              "lists %d at most); %d not read in one request yet (%d of them of players in %d or more held matches)" % (
+                  state["reached"], state["as_far"], LIST_CAP, state["not_back"], state["not_back_regulars"], REGULAR))
         if state["seconds_a_place"]:
-            print("  to read them back: about %.0f client hours at %.3f s a listed match, as first asked for; %.0f for "
-                  "those players and the ones to be read further back, %.1f days at the %.1f client hours a day lists "
-                  "took in the last 3 days" % (state["hours_left"], state["seconds_a_place"],
-                                               state["hours_left_regulars"], state["days_left_regulars"],
-                                               state["list_hours_a_day"]))
+            print("  to read those once each: about %.0f client hours at %.3f s a listed match; %.0f for those players, "
+                  "%.1f days at the %.1f client hours a day lists took in the last 3 days" % (
+                      state["hours_left"], state["seconds_a_place"], state["hours_left_regulars"],
+                      state["days_left_regulars"], state["list_hours_a_day"]))
         else:
-            print("  to read them back: %d listed matches as first asked for, %d for those players and the ones to be "
-                  "read further back (no list read in the last 3 days was timed)" % (
-                      state["places_left"], state["places_left_regulars"]))
+            print("  to read those once each: %d listed matches at most, %d for those players (no list read in the "
+                  "last 3 days was timed)" % (state["places_left"], state["places_left_regulars"]))
+        if state["worth_next"] is not None:
+            print("  what they should show (an estimate): about %.1f Arena matches not held yet a list for the next %d "
+                  "handed out, %d in all of them" % (state["worth_next"], WORTH_NEXT, state["worth_left"]))
         held = state["season_held"]
         print("  the season held: about %s, the days played averaged, judged by the list reads of the last 7 days "
               "(it leans high)" % ("%.0f%%" % (100 * held) if held is not None else "? (none)"))
@@ -1576,8 +1625,8 @@ def cmd_stats(db, _args):
 
 
 def cmd_policy(db, args):
-    if args.block is not None and not PAGE <= args.block <= MAX_INDEX:
-        raise ValueError("--block must be between %d and %d" % (PAGE, MAX_INDEX))
+    if args.block is not None and not PAGE <= args.block <= LIST_CAP:
+        raise ValueError("--block must be between %d and %d (no client lists more)" % (PAGE, LIST_CAP))
     season = date_ms(args.season_start) if args.season_start else None
     if args.fast_delay is not None and not 0 <= args.fast_delay <= 60:
         raise ValueError("--fast-delay must be between 0 and 60 seconds")
@@ -1593,18 +1642,13 @@ def cmd_policy(db, args):
                 db.execute("INSERT OR REPLACE INTO settings VALUES(?, ?)", (name, str(value)))
         if args.block is not None and args.block != block:
             # In force from the next request for work. Lists whose reads failed are tried again at once, with the
-            # new number. With more allowed, the lists that one request could not see back to the season's start
-            # are read further back; with less, the ones to be read further back that one request has listed as
-            # much of as is now allowed are left at that.
+            # new number. With more allowed, the lists that one request listed fewer of than that are read in one
+            # request again, which goes further back.
             db.execute("INSERT OR REPLACE INTO settings VALUES('block', ?)", (str(args.block),))
             db.execute("UPDATE players SET fails = 0 WHERE fails > 0 AND back != 1")
-            if args.block > block:
-                again = move_further(db, back_from=2, depth_below=args.block, season=before)
-            else:
-                again = 0
-                db.execute("UPDATE players SET back = 2 WHERE back = 3 AND depth >= ?", (args.block,))
+            again = read_again(db, depth_below=args.block) if args.block > block else 0
             print("Collectors are now asked for up to %d matches of a list in one request%s." % (
-                args.block, "; %d match lists will be read further back" % again if again else ""))
+                args.block, "; %d match lists will be read again in one request" % again if again else ""))
         if season is not None and season < before:
             # Lists were only read back to the old date. Every list read so far is due again at once, and is
             # asked for everything since the new date.
@@ -1831,8 +1875,8 @@ def main(argv=None):
     policy_parser.add_argument("--season-start", metavar="YYYY-MM-DD",
                                help="nothing from before this UTC date is asked for or kept")
     policy_parser.add_argument("--block", type=int, metavar="N",
-                               help="the most matches of a list a collector is asked for in one request (default %d; "
-                                    "%d: one page, as before 0.3.8)" % (DEFAULT_BLOCK, PAGE))
+                               help="the most matches of a list a collector is asked for in one request (default and "
+                                    "most %d: no client lists more; %d: one page, as before 0.3.8)" % (LIST_CAP, PAGE))
     relay_parser = commands.add_parser("relay", help="for the rankings server's SSH key: export N | ack | status | urgent")
     relay_parser.add_argument("request", nargs="*")
     export_parser = commands.add_parser("export", help="write the held matches to a .jsonl.gz file")
