@@ -35,11 +35,11 @@ Live at `https://arenasweats.lol/collector/` on the website server.
   - **A Tencent client lists 200 at most.** Measured on 27 Nov 2026 from the live endpoint:
     asked for 540-1,000, every read fetched afresh listed 200 at most (HN1 asked for 740: 131
     reads, 26,200 listed; HN10 asked for 1,000: 97 reads, 19,400; TJ100 asked for 540: 39
-    reads, 7,592). With the first request fixing the client's copy, no list can be read
-    further back than its latest 200 matches (all modes), by anybody. So nobody is asked
-    for more (`LIST_CAP`), and no list is handed out again to be read further back (the
-    `back` 3 of 26 Nov is gone; the lists left at it became 2, or 0 when their read listed
-    fewer than 200).
+    reads, 7,592). With the first request fixing the client's copy, no request from the top
+    of a list reads further back than its latest 200 matches (all modes). So nobody is asked
+    for more (`LIST_CAP`), and no list is handed out again to be read further back from the
+    top (the `back` 3 of 26 Nov is gone; the lists left at it became 2, or 0 when their read
+    listed fewer than 200). Further back, see the deeper windows below.
   - A collector from 0.3.8 on says the most it can ask for in one request (`block`: 200;
     1,000 from 0.3.9) and how many lists it has room for (`lists`). Each list it is handed
     says how many matches to ask for (`count`). A collector up to 0.3.7 is handed one page
@@ -66,9 +66,52 @@ Live at `https://arenasweats.lol/collector/` on the website server.
     saved copy (10 matches or more in under 0.3 s) is no read at all: it is tried again
     after 10 minutes, then 20, 40 and so on (and that install keeps away from it for a day).
   - While a client keeps its copy of a list it cannot fetch that list again, not even for
-    what is new; only another collector can. How long it keeps it is not known.
+    what is new; only another collector can. How long it keeps it is not known (at least 7
+    minutes on OC1; a copy of 25 Nov was gone on 27 Nov, after League had restarted).
     `size_days` (below) shows what clients give, how long they take and how often a copy
     answers.
+- **Deeper windows: the places of a list after its latest 200.** Measured on one OC1 client
+  (27 Nov 2026), the first request for a player may start at any place: a first request for
+  places 200-399 gave that player's matches 200-399 (July to September), 400-599 gave
+  February to July, 100-299 September to November; asked for 0-399 it gave 200. The answer
+  names the places it holds (`gameIndexBegin`, `gameIndexEnd`: those of the request that
+  made the copy, 0-399 there). Every later request for that player got that same copy
+  (asked for 0-199 after 200-399: 200-399 again). **Whether a Tencent client starts where it
+  is asked to has not been measured**; the counts below show it once windows go out.
+  - A first read in one request that listed all it was asked for (200) and did not reach
+    the season's start gives the list a deeper window: the next 200 places (200-399). Its
+    read gives the next (400-599), and so on, until one reaches the season's start (the list
+    is then seen back to it, `back` 1), lists fewer than asked for (the list's end) or would
+    start past place 2,000 (`MAX_DEPTH`). A read from the top whose places were all newer
+    than the read before (200 asked for) starts them again after it, as the places further
+    down have moved by the matches played since; so does a first read done again.
+  - Only collectors from 0.3.11 on are handed windows: they say so (`"windows": 1`) and read
+    from the place they are told (`begin`); 0.3.10 and earlier read from the top whatever the
+    place, and are handed what they were before.
+  - A window never goes to an install whose League client holds a copy of that list: every
+    install that reported a read of it, or an answer from its copy, in the last day
+    (`COPY_SECONDS`; the `copies` table), nor to its last reader. So with few installs on a
+    server a list's next window can wait a day for one whose client has not read it.
+  - Windows are ranked with first reads, by what they should show (`worths`, below), in step
+    3; lists due again still go first.
+  - The collector says which places its client said its answer holds (`window`) and whether
+    they are other places than the ones asked for (`cached`): the client's copy from an
+    earlier request (another first place, or more places). Its Arena matches are wanted all
+    the same. The endpoint takes an answer as:
+    - a read: the places asked for, and further back than the read before;
+    - the client's copy of other places, answered at once: no read, nothing held against the
+      list, and another install is handed it;
+    - not the places asked for: other places fetched afresh (the client did not start where
+      it was asked to), or the places asked for but no further back than the read before. No
+      read; it is tried again after 10 minutes, 20, 40 and so on, like a failure.
+  - **Windows stop by themselves** on a server where, of the windows answered in the last 2
+    days (UTC, today too), at least 20 and more than half were the client's copy or not the
+    places asked for (`DEEPER_STOP_MIN`, `DEEPER_STOP_SHARE`, `DEEPER_JUDGE_DAYS`). Once
+    those days have passed with none answered, windows go out again, and the next answers
+    tell again. `policy --deeper off` stops them on every server at once (and `on` brings
+    them back), with no release.
+  - A top read the collector flags as a copy counts as one only when it was answered at once
+    (in under 0.3 s): a slow answer was fetched afresh, whatever places it names.
 - **Whose list to read next:**
   0. ArenaSweats Events games that the rankings server is waiting for go out before anything
      else, until they are held here, every 5 minutes (one may not have ended yet), however
@@ -82,9 +125,10 @@ Live at `https://arenasweats.lol/collector/` on the website server.
      and while there is a full load of matches to fetch, only these lists go out. For a
      collector from 0.3.8 on these are the lists read in one request before; the others are
      read in step 3, which shows what is new at their top as well.
-  3. Then lists not read in one request yet (never read, or only as a page of 20), the ones
-     whose latest 200 matches should show the most Arena matches not held yet first
-     (`worths`, judged again every 10 minutes for each server):
+  3. Then lists not read in one request yet (never read, or only as a page of 20), and deeper
+     windows for collectors from 0.3.11 on, the ones that should show the most Arena matches
+     not held yet first (`worths`, judged again every 10 minutes for each server). For a list
+     not read in one request yet, what its latest 200 matches should show:
      - how far back 200 matches reach: 200 over the matches a day of the lists read in one
        request of players in about as many held matches (1, 2-3, 4-7, ... 512 or more; the
        middle of 30 or more, else the nearest such band's, else the server's, all servers',
@@ -100,8 +144,20 @@ Live at `https://arenasweats.lol/collector/` on the website server.
        listed on HN1 and HN10 on 25-27 Nov, 74-85% were Arena).
      Players are looked up by their held matches, in that order, one index look-up each;
      players in a number of held matches not judged yet come after, the ones in the most
-     first. A collector up to 0.3.7 cannot see further back than a page and gets the
-     players never read, the ones in the most held matches first.
+     first. A deeper window is judged the same way: 200 matches back from the oldest match
+     its list has shown so far (`deep_to`; for the lists read before 28 Nov, judged from the
+     list's pace), at the pace of the deepest part read, each day for its share not held,
+     times the player's Arena matches a day as above. Windows alike (the same day, matches a
+     day 1, 2-3, 4-7, ..., band of held matches: `deep_key`) are judged together and looked up
+     together. Played on a copy of the live players table of 27 Nov (5,808 windows waiting on
+     HN1 and HN10 after the change-over), the next 1,000 windows should show about 83 (HN1)
+     and 84 (HN10) Arena matches not held yet each, against 38 and 25 for the next 1,000
+     first reads; all 2,938 of HN1's about 47 each (139,000 in all). That rests on the share
+     of early October held (12-18% on HN1), on 80% of a list being Arena, and on the clients
+     giving the places asked for. The first reads judged this way were checked at 6-41 a read
+     where 5-39 were found; windows have not been checked: expect fewer.
+     A collector up to 0.3.7 cannot see further back than a page and gets the players never
+     read, the ones in the most held matches first.
      Until 27 Nov the order was the most held matches first. Under the cap of 200 those are
      the worst first reads: they play the most, so their 200 reach back only 12-17 days,
      which are held already. On 27 Nov such reads found 4.6 (HN1) and 6.2 (HN10) new Arena
@@ -120,6 +176,17 @@ Live at `https://arenasweats.lol/collector/` on the website server.
      cannot tell whether its client answered from a saved copy: that is not counted as a
      read, and the list is tried again after as long again as since its last read.
 - **What the reads found is counted.**
+  - `deep_days`, per server, day and the place windows began at: windows handed out, failed,
+    answered with the client's copy of other places (`copied`), not the places asked for
+    (`ignored`; of those two, `same_first`: the ones whose answer named the place asked for
+    as its first, so only its last place differed: if those are many, the client names its
+    places otherwise than OC1's does), and read (`fresh`); of those read, the new Arena
+    matches they showed, how many listed fewer than asked for (`short`: the list's end), the
+    matches listed, how many reached the season's start, how many days back they went and
+    how long the client took. `stats` prints three days of it in one line a first place, with
+    whether windows go out on that server and how many are waiting; `relay status` gives seven
+    days under `reads`, `deeper` (`state`: on, off or stopped; `waiting`; `worth_next`,
+    `worth_left` as for first reads; `windows`: one entry a first place).
   - `size_days`, per server, day and number of matches asked for (collectors from 0.3.8
     on): lists handed out, failed, answered from a saved copy, fetched afresh; and of the
     ones fetched afresh how many listed fewer than asked, how many matches they listed, how
@@ -395,6 +462,7 @@ python server/ingest.py policy --fast-delay 1 # fast mode keeps at least 1 s bet
 python server/ingest.py policy --fast-flight 2 # fast mode has at most 2 requests on their way at once (default 4, 1 = one at a time)
 python server/ingest.py policy --signups off  # new installs can no longer get a key
 python server/ingest.py policy --block 100    # collectors are asked for at most 100 matches of a list at once (20: a page)
+python server/ingest.py policy --deeper off   # no deeper windows of lists for anybody (on: again, unless stopped per server)
 python server/ingest.py policy --on --delay 3 --message "thanks!"
 python server/ingest.py stats                 # per server: matches held, still to fetch, players to read
 python server/ingest.py pace                  # the newest pace numbers installs sent (pace NAME --last 50: one install's)
